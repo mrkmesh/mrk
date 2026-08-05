@@ -1,0 +1,20 @@
+[Unit]
+Description=MRK continuous public endpoint verifier
+After=mrk-node.service nginx.service
+Requires=mrk-node.service
+
+[Service]
+Type=simple
+User=mrk
+Group=mrk
+ExecStart=/usr/local/bin/mrk --data-dir /var/lib/mrk node probe --target-node-id 1 --watch --interval-seconds 60
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mrk
+
+[Install]
+WantedBy=multi-user.target

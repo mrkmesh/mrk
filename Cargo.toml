@@ -1,0 +1,33 @@
+[package]
+name = "mrk"
+version = "0.1.0"
+edition = "2024"
+description = "MRK MSL and WSS infrastructure command line tool"
+license = "MIT"
+
+[lib]
+name = "mrk"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mrk"
+path = "src/bin/mrk.rs"
+
+[dependencies]
+base64 = "0.22.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.4", features = ["derive", "env"] }
+dirs = "6.0.0"
+libc = "0.2.189"
+redb = "4.1.0"
+ring = "0.17.14"
+rpassword = "7.5.4"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+url = "2.5.8"
+webpki-roots = "1.0.9"
+
+[dev-dependencies]
