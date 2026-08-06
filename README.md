@@ -1,7 +1,7 @@
 # MRK CLI MVP
 
 > [!IMPORTANT]
-> **Pre-release compatibility notice — remove this block at the first official release (`TODO(release): remove-pre-release-compatibility-notice`).** The protocol, persisted Ledger schema, operation format, and default parameters may change without migration support before release. Test and staging deployments must reinitialize their Ledger data after an incompatible change instead of expecting older state to be upgraded. The current fresh-Ledger defaults include a 300-second Epoch and a 100 MRK Epoch mint budget. Compatibility guarantees begin only with the official release.
+> **Pre-release compatibility notice — remove this block at the first official release (`TODO(release): remove-pre-release-compatibility-notice`).** The protocol, persisted Ledger schema, operation format, and default parameters may change without migration support before release. Test and staging deployments must reinitialize their Ledger data after an incompatible change instead of expecting older state to be upgraded. The current fresh-Ledger defaults include a 1,800-second Epoch and a 500 MRK Epoch mint budget. Compatibility guarantees begin only with the official release.
 
 This repository contains the executable MRK command-line implementation. It has one binary with two command namespaces:
 

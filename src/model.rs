@@ -12,11 +12,11 @@ pub const TRANSFER_FEE: u128 = MRK_SCALE / 1_000;
 pub const DEFAULT_OPERATION_VALIDITY_SECONDS: i64 = 600;
 
 fn default_epoch_mint_amount() -> u128 {
-    100 * MRK_SCALE
+    500 * MRK_SCALE
 }
 
 fn default_epoch_seconds() -> i64 {
-    300
+    1_800
 }
 
 fn default_reward_immediate_bps() -> u32 {
@@ -865,13 +865,13 @@ mod tests {
     use super::{LedgerSettings, LedgerState};
 
     #[test]
-    fn epoch_defaults_to_five_minutes_and_one_hundred_mrk() {
+    fn epoch_defaults_to_thirty_minutes_and_five_hundred_mrk() {
         let settings = LedgerSettings::default();
         let ledger = LedgerState::default();
-        assert_eq!(settings.epoch_seconds, 300);
-        assert_eq!(ledger.epoch_seconds_snapshot, 300);
-        assert_eq!(settings.epoch_mint_amount, 100 * super::MRK_SCALE);
-        assert_eq!(ledger.epoch_mint_amount_snapshot, 100 * super::MRK_SCALE);
+        assert_eq!(settings.epoch_seconds, 1_800);
+        assert_eq!(ledger.epoch_seconds_snapshot, 1_800);
+        assert_eq!(settings.epoch_mint_amount, 500 * super::MRK_SCALE);
+        assert_eq!(ledger.epoch_mint_amount_snapshot, 500 * super::MRK_SCALE);
         assert_eq!(settings.reward_immediate_bps, 1_000);
         assert_eq!(ledger.reward_immediate_bps_snapshot, 1_000);
         assert_eq!(settings.reward_vesting_seconds, 180 * 86_400);

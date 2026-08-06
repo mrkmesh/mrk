@@ -92,7 +92,7 @@ fn node_reward_transfer_and_private_network_flow() {
 
     let (_, claimed) =
         service::claim_node_rewards(&paths, "node1", password, epoch_start + 61).unwrap();
-    let expected_epoch_reward = 100 * MRK_SCALE;
+    let expected_epoch_reward = 500 * MRK_SCALE;
     assert_eq!(claimed, expected_epoch_reward / 10);
     let rewards = service::node_rewards(&paths, "node1").unwrap();
     assert_eq!(rewards.vesting_reward, expected_epoch_reward * 9 / 10);

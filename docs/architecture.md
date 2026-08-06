@@ -516,7 +516,7 @@ tests/
 
 实现 Indexer、节点自动选择、报价快照、备用 Relay、公网 IP 槽位、Heartbeat、随机 Probe、Node Seconds、Epoch 固定发行预算、奖励自动形成 Service Bond 和可观测性。
 
-验收：零 MRK 的第三方能够无需审批运行节点并按合格在线时长获得 MRK；同一 IPv4 或 IPv6 `/64` 下运行多个进程仍只有一个奖励资格；每 Epoch 默认只铸造固定 100 MRK，新增活跃 Node 只改变权重份额、不增加预算；上层应用不需要理解账本内部状态机即可通过 SDK 使用转发服务。
+验收：零 MRK 的第三方能够无需审批运行节点并按合格在线时长获得 MRK；同一 IPv4 或 IPv6 `/64` 下运行多个进程仍只有一个奖励资格；每 Epoch 默认只铸造固定 500 MRK，新增活跃 Node 只改变权重份额、不增加预算；上层应用不需要理解账本内部状态机即可通过 SDK 使用转发服务。
 
 ### 阶段 D：多 Validator 与节点治理
 
@@ -532,7 +532,7 @@ tests/
 4. 单消息、单连接队列、通道数和计费窗口的默认上限。
 5. Relay 是否必须看不到业务明文；如果必须，端到端加密协议属于上层 SDK 扩展或 VPN 应用职责，不能只依赖 WSS。
 
-这些参数不阻塞当前 CLI。CLI 默认 300 秒 Epoch、每 Epoch 固定铸造 100 MRK 并由合格活跃 Node 按权重瓜分、除 Node 1 外 7 天新 Node 考察期、60 秒 Availability Slot、启动期 Node 1 一票绝对信任、去中心化阶段 Primary 5 选 3与默认 5% Auditor 3 选 2、7 天 IP 重用冷却、Ed25519 + `mrk1` 地址、`0.001 MRK` 转账费和 10 分钟操作有效期。`epoch-seconds`、`epoch-mint-amount`、`warmup-seconds`、Slot、验证节点数、法定票数及审计参数只能通过 Critical 治理修改；Epoch 时长和铸币量从下一个 Epoch 快照生效，考察期修改只作用于新注册的非 Genesis Node。
+这些参数不阻塞当前 CLI。CLI 默认 1,800 秒 Epoch、每 Epoch 固定铸造 500 MRK 并由合格活跃 Node 按权重瓜分、除 Node 1 外 7 天新 Node 考察期、60 秒 Availability Slot、启动期 Node 1 一票绝对信任、去中心化阶段 Primary 5 选 3与默认 5% Auditor 3 选 2、7 天 IP 重用冷却、Ed25519 + `mrk1` 地址、`0.001 MRK` 转账费和 10 分钟操作有效期。`epoch-seconds`、`epoch-mint-amount`、`warmup-seconds`、Slot、验证节点数、法定票数及审计参数只能通过 Critical 治理修改；Epoch 时长和铸币量从下一个 Epoch 快照生效，考察期修改只作用于新注册的非 Genesis Node。
 
 ## 13. 最小成功指标
 

@@ -10126,7 +10126,7 @@ mod tests {
         );
         settle_elapsed_epochs_for_block(&mut ledger, now + 60).unwrap();
         let node = &ledger.nodes[&1];
-        let expected = 100 * crate::amount::MRK_SCALE;
+        let expected = 500 * crate::amount::MRK_SCALE;
         let liquid_reward = expected - 10;
         let immediate = liquid_reward * 1_000 / BPS_DENOMINATOR;
         let vesting = liquid_reward - immediate;
@@ -10162,7 +10162,7 @@ mod tests {
         ledger.nodes.insert(2, node_two);
         settle_elapsed_epochs_for_block(&mut ledger, now + 120).unwrap();
         let first_schedule_release = vesting * 60 / (180 * 86_400);
-        let second_budget = 100 * crate::amount::MRK_SCALE;
+        let second_budget = 500 * crate::amount::MRK_SCALE;
         let node_two_reward = second_budget / 3;
         let node_one_reward = second_budget - node_two_reward;
         assert_eq!(

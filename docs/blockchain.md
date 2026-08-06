@@ -3,7 +3,7 @@
 状态：方案草案（MVP）  
 配套文档：[WSS 私网转发架构](./architecture.md)
 
-> **预发布兼容性说明——正式发布时删除本段（`TODO(release): remove-pre-release-compatibility-notice`）。** 正式发布前，协议规则、持久化 Ledger Schema、Operation 格式和默认参数均可能发生不兼容修改，测试与预发布部署必须在不兼容变更后重新初始化 Ledger，不提供旧状态迁移保证。当前新建 Ledger 默认使用 300 秒 Epoch 和每 Epoch 100 MRK 铸币预算。兼容性承诺从正式发布版本开始。
+> **预发布兼容性说明——正式发布时删除本段（`TODO(release): remove-pre-release-compatibility-notice`）。** 正式发布前，协议规则、持久化 Ledger Schema、Operation 格式和默认参数均可能发生不兼容修改，测试与预发布部署必须在不兼容变更后重新初始化 Ledger，不提供旧状态迁移保证。当前新建 Ledger 默认使用 1,800 秒 Epoch 和每 Epoch 500 MRK 铸币预算。兼容性承诺从正式发布版本开始。
 
 ## 1. 协议目标
 
@@ -198,17 +198,17 @@ Node 1 Owner Key 不适用协议内恢复或替代密钥。丢失时协议不恢
 
 ### 6.1 固定 Epoch 铸币预算
 
-MVP 使用 300 秒 Epoch，每个 Epoch 的默认铸币预算固定为 `100 MRK`，不随活跃 Node 数量变化：
+MVP 使用 1,800 秒 Epoch，每个 Epoch 的默认铸币预算固定为 `500 MRK`，不随活跃 Node 数量变化：
 
 ```text
-EPOCH_SECONDS = 300
-EPOCH_MINT_AMOUNT = 100 MRK
+EPOCH_SECONDS = 1800
+EPOCH_MINT_AMOUNT = 500 MRK
 epoch_node_budget = min(EPOCH_MINT_AMOUNT, pool_remaining)
 ```
 
 只要本 Epoch 至少存在一个具有合格在线秒数的 Node，完整预算就由所有合格活跃 Node 按权重瓜分；整数除法产生的最小单位余数按“小数余数从大到小、Node ID 从小到大”确定性分配，因此实际新增 `lifetime_minted` 恰好等于该 Epoch 预算。没有合格 Node 时不铸币，额度继续留在统一节点发行池。池余额不足时只发行剩余余额。
 
-`epoch-mint-amount` 与 `epoch-seconds` 都是 Critical 治理参数。提案执行后只写入下一 Epoch 的配置；已经开始的 Epoch 始终使用起始时的铸币量和时长快照，不允许被提前结束、延长或追溯修改。默认值分别为 `100 MRK` 和 `300` 秒。改变 Epoch 时长会改变年度发行速度，因此不能用 Standard 提案修改。
+`epoch-mint-amount` 与 `epoch-seconds` 都是 Critical 治理参数。提案执行后只写入下一 Epoch 的配置；已经开始的 Epoch 始终使用起始时的铸币量和时长快照，不允许被提前结束、延长或追溯修改。默认值分别为 `500 MRK` 和 `1,800` 秒。改变 Epoch 时长会改变年度发行速度，因此不能用 Standard 提案修改。
 
 每个节点的 Epoch 奖励先补足 Service Bond，再将剩余 Liquid 奖励按当前 Epoch 快照拆分：`reward-immediate-bps` 默认 `1,000`，立即进入 `claimable_reward`；其余部分建立独立释放批次，按 `reward-vesting-seconds` 默认 `15,552,000` 秒（180 天）线性释放。只有最终确认区块的时间戳跨越 Epoch 边界时才结算释放；查询是纯只读操作，领取也只能转移此前已最终确认进入 `claimable_reward` 的金额，二者均不得按本机时间推进 Epoch。边界结算使用经过秒数计算最小单位整数结果，因此无需每秒写入账本。多个 Epoch 批次可以重叠，领取已释放部分不改变剩余批次。
 
@@ -474,8 +474,8 @@ mrk node --node <node-name> governance propose-set \
 
 | 参数 | 默认值 | 合法值与约束 | 最低提案类型 | 特殊生效语义 |
 | --- | ---: | --- | --- | --- |
-| `epoch-seconds` | `300` | `60..=31,536,000` 秒 | Critical | 当前 Epoch 不变，从下一个 Epoch 快照生效 |
-| `epoch-mint-amount` | `100MRK` | `> 0` 且 `<= MAX_SUPPLY` | Critical | 当前 Epoch 不变，从下一个 Epoch 快照生效 |
+| `epoch-seconds` | `1,800` | `60..=31,536,000` 秒 | Critical | 当前 Epoch 不变，从下一个 Epoch 快照生效 |
+| `epoch-mint-amount` | `500MRK` | `> 0` 且 `<= MAX_SUPPLY` | Critical | 当前 Epoch 不变，从下一个 Epoch 快照生效 |
 | `reward-immediate-bps` | `1,000` | `0..=10,000` bps | Critical | 当前 Epoch 不变，从下一个 Epoch 快照生效；只影响新奖励批次 |
 | `reward-vesting-seconds` | `15,552,000` | `1..=315,360,000` 秒 | Critical | 当前 Epoch 不变，从下一个 Epoch 快照生效；已建立批次期限不变 |
 | `validator-weight-bps` | `12,500` | `10,000..=20,000` bps，即 `1.00x..=2.00x` | Critical | 无 |
@@ -664,7 +664,7 @@ MSL 不使用 Gas。每种有成本或可被滥用的财务/治理操作使用�
 - 注册 Relay 不需要预持 MRK，也不需要任何人审批；
 - 同一公网 IPv4 或 IPv6 `/64` 同一时间最多一个 Node 获得发行、治理和 Validator 资格；
 - 新节点先运行并赚取 MRK，再由奖励自动形成 Service Bond；
-- 每 Epoch 默认固定铸造 100 MRK，由合格活跃 Node 按权重完整瓜分，活跃 Node 数量不得改变预算；
+- 每 Epoch 默认固定铸造 500 MRK，由合格活跃 Node 按权重完整瓜分，活跃 Node 数量不得改变预算；
 - Active Validator 只有签名率达到 95% 才获得 1.25× 权重，且加成不得提高 Epoch 总预算；
 - 自报流量、用户数、连接数和钱包数量不会增加发行；
 - Relay 不能领取超过付款方签名累计金额和 Escrow 预留金额的 MRK；
