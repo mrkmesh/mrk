@@ -412,7 +412,7 @@ burned          += fixed_transfer_fee
 
 - `from` 由 `SignedOperation.signer` 唯一确定，payload 不允许另行指定付款方；
 - 只能转移可支配 MRK，Service/Validator/Governance Bond 和 Escrow 余额不可转账；
-- 金额以 18 位精度的整数最小单位编码，CLI 不得使用浮点数计算；
+- 金额以 8 位精度的整数最小单位编码，CLI 不得使用浮点数计算；
 - 地址使用带 `mrk` 网络前缀和校验和的文本编码，错误网络或错误校验和必须在签名前拒绝；
 - 转账不包含链上 memo，避免永久公开业务和个人信息；
 - `operation_id = hash(canonical_signed_operation)`，重复提交同一操作只返回原结果；

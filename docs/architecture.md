@@ -478,7 +478,7 @@ Relay 流量采用押币后的累计交付结算。Network Owner 先从 Network 
 
 ```text
 src/
-  amount.rs       # MRK 18 位精度解析、格式化和供应上限
+  amount.rs       # MRK 8 位精度解析、格式化和供应上限
   crypto.rs       # Ed25519、地址、签名和加密 Keystore
   model.rs        # MSL、账户、私网和 Node 状态模型
   storage.rs      # 原子本地状态与文件锁
