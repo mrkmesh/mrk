@@ -3039,6 +3039,10 @@ fn execute_public_rpc(paths: &DataPaths, request: RpcRequest) -> Result<serde_js
             let authorization_id = rpc_str(&request.params, "authorization_id")?;
             serde_json::to_value(service::relay_authorization_view(paths, authorization_id)?)?
         }
+        "payment.status" => {
+            let identifier = rpc_str(&request.params, "identifier")?;
+            serde_json::to_value(service::payment_authorization_status(paths, identifier)?)?
+        }
         "treasury.status" => serde_json::to_value(service::treasury_status(paths, now)?)?,
         "treasury.history" => {
             let limit = request

@@ -1596,6 +1596,9 @@ pub fn prepare_payment_authorization(
             "payment maximum amount must be greater than zero",
         ));
     }
+    if request.network.escrow_balance < max_amount {
+        return Err(Error::msg("insufficient Network Escrow"));
+    }
     let session_id = hex_lower(&random_bytes::<32>()?);
     let authorization_valid_until = request
         .now
@@ -2148,6 +2151,15 @@ pub fn submit_consensus_operation(
     match submit_consensus_operation_strict(paths, envelope.clone(), now) {
         Ok(operation_id_value) => Ok(operation_id_value),
         Err(application_error) => {
+            if envelope.operation.unsigned.module == "TrafficPayment"
+                && envelope.operation.unsigned.action == "Authorize"
+                && matches!(
+                    &application_error,
+                    Error::Message(message) if message == "insufficient Network Escrow"
+                )
+            {
+                return Err(application_error);
+            }
             stage_consensus_candidate(paths, envelope, now).map_err(|_| application_error)
         }
     }
@@ -3220,14 +3232,78 @@ pub struct RelayAuthorizationView {
     pub finalized: bool,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct PaymentAuthorizationStatusView {
+    pub authorization_id: String,
+    pub session_id: String,
+    pub status: OperationStatus,
+    pub block_height: Option<u64>,
+    pub authorization: Option<PaymentAuthorizationRecord>,
+}
+
+pub fn payment_authorization_status(
+    paths: &DataPaths,
+    authorization_id_or_session_id: &str,
+) -> Result<PaymentAuthorizationStatusView> {
+    let ledger = paths.read_ledger()?;
+    let authorization = ledger
+        .payment_authorizations
+        .get(authorization_id_or_session_id)
+        .or_else(|| {
+            ledger
+                .payment_authorizations
+                .values()
+                .find(|authorization| authorization.session_id == authorization_id_or_session_id)
+        });
+    if let Some(authorization) = authorization {
+        let operation = ledger.operations.get(&authorization.authorization_id);
+        return Ok(PaymentAuthorizationStatusView {
+            authorization_id: authorization.authorization_id.clone(),
+            session_id: authorization.session_id.clone(),
+            status: operation
+                .map(|operation| operation.status.clone())
+                .unwrap_or(OperationStatus::Finalized),
+            block_height: operation.and_then(|operation| operation.block_height),
+            authorization: Some(authorization.clone()),
+        });
+    }
+
+    let operation = ledger
+        .operations
+        .get(authorization_id_or_session_id)
+        .filter(|operation| operation.kind == "TrafficPayment.Authorize")
+        .or_else(|| {
+            ledger.operations.values().find(|operation| {
+                operation.kind == "TrafficPayment.Authorize"
+                    && operation.payload.get("session_id").and_then(Value::as_str)
+                        == Some(authorization_id_or_session_id)
+            })
+        })
+        .ok_or_else(|| Error::msg("payment authorization was not found"))?;
+    let session_id = payload_str(&operation.payload, "session_id")?.to_owned();
+    Ok(PaymentAuthorizationStatusView {
+        authorization_id: operation.operation_id.clone(),
+        session_id,
+        status: operation.status.clone(),
+        block_height: operation.block_height,
+        authorization: None,
+    })
+}
+
 pub fn relay_authorization_view(
     paths: &DataPaths,
-    authorization_id: &str,
+    authorization_id_or_session_id: &str,
 ) -> Result<RelayAuthorizationView> {
     let ledger = paths.read_ledger()?;
     let authorization = ledger
         .payment_authorizations
-        .get(authorization_id)
+        .get(authorization_id_or_session_id)
+        .or_else(|| {
+            ledger
+                .payment_authorizations
+                .values()
+                .find(|authorization| authorization.session_id == authorization_id_or_session_id)
+        })
         .cloned()
         .ok_or_else(|| Error::msg("payment authorization was not found"))?;
     let network = ledger
@@ -3244,7 +3320,7 @@ pub fn relay_authorization_view(
     };
     let finalized = ledger
         .operations
-        .get(authorization_id)
+        .get(&authorization.authorization_id)
         .is_some_and(|record| matches!(record.status, OperationStatus::Finalized));
     Ok(RelayAuthorizationView {
         ledger_id: ledger.ledger_id,

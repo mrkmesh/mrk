@@ -270,7 +270,8 @@ enum PaymentCommand {
         account: String,
     },
     Status {
-        authorization_id: String,
+        #[arg(value_name = "AUTHORIZATION_ID_OR_SESSION_ID")]
+        identifier: String,
     },
     Refund {
         authorization_id: String,
@@ -640,16 +641,26 @@ fn run() -> Result<()> {
                         "operation": operation,
                     }),
                 )?;
+                let authorization_id = json_str(&result, "operation_id")?.to_owned();
+                let status = json_str(&result, "status")?.to_owned();
                 print_value(
                     cli.output,
-                    &serde_json::json!({"submission": result, "session_id": session_id}),
-                    || format!("Payment authorization submitted\nSession: {session_id}\n{result}"),
+                    &serde_json::json!({
+                        "authorization_id": authorization_id,
+                        "session_id": session_id,
+                        "submission": result,
+                    }),
+                    || {
+                        format!(
+                            "Payment authorization submitted\nAuthorization: {authorization_id}\nSession: {session_id}\nStatus: {status}"
+                        )
+                    },
                 )?;
             }
-            PaymentCommand::Status { authorization_id } => {
+            PaymentCommand::Status { identifier } => {
                 let value = rpc.call(
-                    "payment.get",
-                    serde_json::json!({ "authorization_id": authorization_id }),
+                    "payment.status",
+                    serde_json::json!({ "identifier": identifier }),
                 )?;
                 print_rpc_value(cli.output, &value)?;
             }

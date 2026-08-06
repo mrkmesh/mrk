@@ -407,7 +407,7 @@ mrk member revoke --network team --serial 42
 mrk payment authorize --network team --node-id 7 \
   --sender client-a --receiver client-b \
   --max-amount 10MRK --valid-minutes 1440
-mrk payment status <AUTHORIZATION_ID>
+mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>
 ```
 
 成员侧把不透明字节流接到 stdin/stdout。接收方省略 `--peer` 并接受第一个入站通道；发起方指定目标随机 `member_id`：

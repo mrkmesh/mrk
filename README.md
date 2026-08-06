@@ -142,9 +142,12 @@ After authentication and channel acceptance, stdin bytes are sent as opaque Rela
 Paid Relay sessions use a finalized `PaymentAuthorization` that reserves Network Escrow without paying the Node up front. Each direction pauses new DATA after 64 MiB or two minutes, whichever occurs first, while control frames remain live. The sender signs a cumulative checkpoint and the receiver countersigns the matching delivered prefix; only this dual-signed receipt can release the proportional `price_per_gib` amount to the Node. Receipts are exchanged off chain and only the latest cumulative pair is needed for settlement. Unreceipted funds return after the authorization and seven-day claim window expire; traffic settlement never mints MRK.
 
 ```bash
-mrk payment status <AUTHORIZATION_ID>
+mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>
 mrk payment refund <AUTHORIZATION_ID> --account default
 ```
+
+`payment authorize` prints both identifiers. Use the authorization ID for `pipe` and `refund`;
+`payment status` also accepts the session ID.
 
 Production clients require TLS 1.3 `wss://` with a publicly trusted certificate. Private deployments may add a PEM trust anchor with `--tls-ca /path/to/ca.pem`; hostname and certificate-purpose validation remain enabled. Loopback development may use `ws://127.0.0.1/... --allow-insecure-local`; plaintext WebSocket to non-loopback hosts is rejected.
 

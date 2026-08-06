@@ -50,6 +50,29 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let owner = service::account_keyfile(&paths, "node:node1").unwrap();
     let network = service::network_by_alias(&paths, "team").unwrap();
     let nonce = paths.read_ledger().unwrap().accounts[&owner.address].nonce + 1;
+    let mut unfunded_network = network.clone();
+    unfunded_network.escrow_balance = 0;
+    let unfunded_error = service::prepare_payment_authorization(
+        &owner,
+        password,
+        service::PaymentAuthorizationSigningRequest {
+            ledger_id: &paths.read_ledger().unwrap().ledger_id,
+            network: &unfunded_network,
+            node_id: node.node_id,
+            sender_member_name: "alice",
+            receiver_member_name: "bob",
+            max_amount_text: "1MRK",
+            valid_minutes: 60,
+            nonce,
+            now: now + 5,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        unfunded_error
+            .to_string()
+            .contains("insufficient Network Escrow")
+    );
     let (session_id, authorization_operation) = service::prepare_payment_authorization(
         &owner,
         password,
@@ -68,6 +91,47 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     .unwrap();
     let authorization_id =
         mrk::crypto::sha256_id("op", &serde_json::to_vec(&authorization_operation).unwrap());
+    paths
+        .with_ledger_mut(|ledger| {
+            ledger
+                .networks
+                .get_mut(&network.commitment)
+                .unwrap()
+                .escrow_balance = 0;
+            Ok(())
+        })
+        .unwrap();
+    let unfunded_submission = service::submit_consensus_operation(
+        &paths,
+        mrk::consensus::PendingOperationEnvelope {
+            public_key: owner.public_key.clone(),
+            operation: authorization_operation.clone(),
+        },
+        now + 5,
+    )
+    .unwrap_err();
+    assert!(
+        unfunded_submission
+            .to_string()
+            .contains("insufficient Network Escrow")
+    );
+    assert!(
+        !paths
+            .read_ledger()
+            .unwrap()
+            .operations
+            .contains_key(&authorization_id)
+    );
+    paths
+        .with_ledger_mut(|ledger| {
+            ledger
+                .networks
+                .get_mut(&network.commitment)
+                .unwrap()
+                .escrow_balance = network.escrow_balance;
+            Ok(())
+        })
+        .unwrap();
     service::submit_signed_network_operation(
         &paths,
         &owner.public_key,
@@ -75,6 +139,38 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         now + 5,
     )
     .unwrap();
+    let pending_authorization = paths
+        .with_ledger_mut(|ledger| {
+            Ok(ledger
+                .payment_authorizations
+                .remove(&authorization_id)
+                .unwrap())
+        })
+        .unwrap();
+    for identifier in [&authorization_id, &session_id] {
+        let status = service::payment_authorization_status(&paths, identifier).unwrap();
+        assert_eq!(status.authorization_id, authorization_id);
+        assert_eq!(status.session_id, session_id);
+        assert!(matches!(
+            status.status,
+            mrk::model::OperationStatus::Pending
+        ));
+        assert!(status.authorization.is_none());
+    }
+    paths
+        .with_ledger_mut(|ledger| {
+            ledger
+                .payment_authorizations
+                .insert(authorization_id.clone(), pending_authorization);
+            Ok(())
+        })
+        .unwrap();
+    let pending_view = service::relay_authorization_view(&paths, &session_id).unwrap();
+    assert_eq!(
+        pending_view.authorization.authorization_id,
+        authorization_id
+    );
+    assert!(!pending_view.finalized);
     assert!(
         service::validate_relay_open(
             &paths,
@@ -89,6 +185,17 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         "Relay must not serve a merely pending authorization"
     );
     service::produce_node1_block(&paths, "node1", password, false, now + 6).unwrap();
+    let finalized_status = service::payment_authorization_status(&paths, &session_id).unwrap();
+    assert!(matches!(
+        finalized_status.status,
+        mrk::model::OperationStatus::Finalized
+    ));
+    assert!(finalized_status.authorization.is_some());
+    assert!(
+        service::relay_authorization_view(&paths, &session_id)
+            .unwrap()
+            .finalized
+    );
     service::validate_relay_open(
         &paths,
         &authorization_id,
