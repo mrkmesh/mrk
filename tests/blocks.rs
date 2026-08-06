@@ -1,6 +1,6 @@
 use chrono::Utc;
 use mrk::{
-    model::{NodeStatus, OperationStatus},
+    model::{IpSlotRecord, NodeStatus, OperationStatus},
     service,
     storage::DataPaths,
 };
@@ -19,6 +19,99 @@ fn register(
 ) -> mrk::model::NodeRecord {
     service::init_node(paths, name, password).unwrap();
     service::register_node(paths, name, password, endpoint, "0.02MRK", now).unwrap()
+}
+
+#[test]
+fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
+    let root = temp_root("ip-slot-lifecycle");
+    let paths = DataPaths::new(Some(root.clone())).unwrap();
+    let password = "ip-slot-integration-password";
+    let now = Utc::now().timestamp();
+    paths
+        .with_ledger_mut(|ledger| {
+            ledger.settings.warmup_seconds = 0;
+            ledger.settings.ip_reuse_cooldown_seconds = 10;
+            Ok(())
+        })
+        .unwrap();
+
+    register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
+    service::produce_node1_block(&paths, "node1", password, false, now + 1).unwrap();
+
+    let conflicting = register(&paths, "node2", password, "wss://1.1.1.1/v1/relay", now + 2);
+    assert_eq!(conflicting.node_id, 2);
+    service::produce_node1_block(&paths, "node1", password, false, now + 3).unwrap();
+    let ledger = paths.read_ledger().unwrap();
+    assert!(ledger.nodes.contains_key(&2));
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].node_id, 1);
+
+    let request = service::availability_probe_request(&paths, "node1", password, 2, now).unwrap();
+    let response =
+        service::node_probe_response(&paths, "node2", password, &request.challenge).unwrap();
+    let attestation = service::submit_node_probe_attestation(
+        &paths,
+        "node1",
+        password,
+        service::AvailabilityAttestationRequest {
+            epoch: request.epoch,
+            slot: request.slot,
+            role: request.role,
+            ticket_signature: request.ticket_signature,
+            response,
+            now,
+        },
+    )
+    .unwrap();
+    assert_eq!(attestation.credited_seconds, 0);
+    assert_eq!(
+        service::node_record(&paths, "node2").unwrap().status,
+        NodeStatus::WarmingUp
+    );
+
+    service::drain_node(&paths, "node1", password, now + 5).unwrap();
+    assert_eq!(
+        service::node_record(&paths, "node1").unwrap().status,
+        NodeStatus::Draining
+    );
+    service::produce_node1_block(&paths, "node1", password, false, now + 6).unwrap();
+    let ledger = paths.read_ledger().unwrap();
+    assert_eq!(ledger.nodes[&1].status, NodeStatus::Exited);
+    assert_eq!(
+        ledger.finalized_checkpoint.as_ref().unwrap().nodes[&1].status,
+        NodeStatus::Exited
+    );
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, Some(now + 6));
+
+    service::update_reward_ip(
+        &paths,
+        "node2",
+        password,
+        "wss://1.1.1.1/v1/relay",
+        now + 10,
+    )
+    .unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, now + 11).unwrap();
+    let ledger = paths.read_ledger().unwrap();
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].node_id, 1);
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, Some(now + 6));
+
+    service::update_reward_ip(
+        &paths,
+        "node2",
+        password,
+        "wss://1.1.1.1/v1/relay",
+        now + 15,
+    )
+    .unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, now + 16).unwrap();
+    let ledger = paths.read_ledger().unwrap();
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].node_id, 2);
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].bound_at, now + 16);
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, None);
+    assert_eq!(ledger.nodes[&2].status, NodeStatus::WarmingUp);
+    assert!(service::verify_blockchain(&paths).unwrap().ok);
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -423,12 +516,21 @@ fn node1_produces_until_four_validators_and_restores_below_twenty_nodes() {
                 node.owner_public_key = format!("owner-key{node_id}");
                 node.relay_public_key = format!("relay-key{node_id}");
                 node.reward_address = format!("reward{node_id}");
-                node.reward_ip = format!("9.9.9.{node_id}");
-                node.ip_slot = format!("v4:9.9.9.{node_id}");
+                node.reward_ip = format!("11.0.0.{node_id}");
+                node.ip_slot = format!("v4:11.0.0.{node_id}");
                 node.status = NodeStatus::Active;
                 node.last_heartbeat = Some(now);
                 node.last_probe_success = Some(now);
+                let ip_slot = node.ip_slot.clone();
                 ledger.nodes.insert(node_id, node);
+                ledger.ip_slots.insert(
+                    ip_slot,
+                    IpSlotRecord {
+                        node_id,
+                        bound_at: now,
+                        released_at: None,
+                    },
+                );
             }
             ledger.next_node_id = 21;
             Ok(())

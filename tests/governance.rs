@@ -1,5 +1,9 @@
 use chrono::Utc;
-use mrk::{model::NodeStatus, service, storage::DataPaths};
+use mrk::{
+    model::{IpSlotRecord, NodeStatus},
+    service,
+    storage::DataPaths,
+};
 
 fn temp_root(label: &str) -> std::path::PathBuf {
     let random = mrk::crypto::random_bytes::<8>().unwrap();
@@ -78,7 +82,16 @@ fn node1_direct_governance_switches_at_twenty_eligible_nodes_and_restores() {
                 node.status = NodeStatus::Active;
                 node.last_heartbeat = Some(now);
                 node.last_probe_success = Some(now);
+                let ip_slot = node.ip_slot.clone();
                 ledger.nodes.insert(node_id, node);
+                ledger.ip_slots.insert(
+                    ip_slot,
+                    IpSlotRecord {
+                        node_id,
+                        bound_at: now,
+                        released_at: None,
+                    },
+                );
             }
             ledger.next_node_id = 20;
             Ok(())
@@ -110,7 +123,16 @@ fn node1_direct_governance_switches_at_twenty_eligible_nodes_and_restores() {
             node.status = NodeStatus::Active;
             node.last_heartbeat = Some(now + 2);
             node.last_probe_success = Some(now + 2);
+            let ip_slot = node.ip_slot.clone();
             ledger.nodes.insert(20, node);
+            ledger.ip_slots.insert(
+                ip_slot,
+                IpSlotRecord {
+                    node_id: 20,
+                    bound_at: now + 2,
+                    released_at: None,
+                },
+            );
             ledger.next_node_id = 21;
             Ok(())
         })

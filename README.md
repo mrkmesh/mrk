@@ -163,6 +163,7 @@ mrk node bootstrap \
 mrk node register \
   --endpoint wss://relay.example.com/v1/relay \
   --price-per-gib 0.02MRK
+mrk node update-reward-ip --endpoint wss://new-relay.example.com/v1/relay
 
 mrk node status
 mrk node backup

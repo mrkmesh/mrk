@@ -226,7 +226,7 @@ Availability 有显式且受状态根保护的两阶段信任模型。Active Val
 
 去中心化阶段的 Probe Challenge 和检查时刻来自验证者 Owner Key 对 Ledger、Epoch、Slot、目标、验证者及 `PRIMARY/AUDIT` 角色的签名 Ticket。目标在收到网络请求前不能预测 Ticket。默认 5% Slot 在至少 9 个 Active Validator 时额外选择与目标及 Primary 集合互不重叠的 3 个 Auditor，并要求 2 票；被审计 Slot 只有同时达到 Primary 和 Audit 法定票数才记账。网络失败本身不可形成确定性罚没证据，只有双签等密码学冲突可处罚本金。
 
-上述状态结构、Ticket 域和 `mrk-probe-v1` Payload 属于尚未正式发布的协议版本 1。发布前可直接调整协议及磁盘格式，不提供早期开发数据的兼容或静默迁移；已有测试数据应重建，或通过显式可信 Bootstrap 替换。
+上述状态结构、Ticket 域和 `mrk-probe-v1` Payload 属于尚未正式发布的协议版本 1。IP Slot 所有权、Reward IP 更新以及退出释放均属于 v1 发布前的确定性区块状态转换。发布前可直接调整协议及磁盘格式，不提供早期开发数据的兼容或静默迁移；已有测试数据应重建，或通过显式可信 Bootstrap 替换。
 
 注册和开始运行不要求预先持有 MRK。节点最初获得的在线时长奖励优先形成 Service Bond；Bond 只能约束有客观证据的违规，不能证明节点一定快速或稳定。
 
@@ -430,6 +430,7 @@ mrk node bootstrap --peer wss://seed.example.com/v1/rpc \
   --checkpoint-root state_<64-lowercase-hex>
 mrk node register --endpoint wss://relay.example.com/v1/relay \
   --price-per-gib 0.02MRK
+mrk node update-reward-ip --endpoint wss://new-relay.example.com/v1/relay
 mrk node status
 mrk node backup
 mrk node backup-verify ~/.mrk/backups/mrk-HEIGHT-TIME.json --expected-state-root state_...

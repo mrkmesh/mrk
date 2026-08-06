@@ -163,19 +163,41 @@ fn node_reward_transfer_and_private_network_flow() {
         password,
         "wss://1.1.1.1/v1/relay",
         "0.02MRK",
-        now + 1,
+        now + 100,
+    )
+    .unwrap();
+    assert_eq!(duplicate.node_id, 2);
+    assert_eq!(
+        paths
+            .read_ledger()
+            .unwrap()
+            .ip_slots
+            .get("v4:1.1.1.1")
+            .unwrap()
+            .node_id,
+        1
     );
-    assert!(duplicate.is_err());
+    service::produce_node1_block(&paths, "node1", password, false, now + 101).unwrap();
 
     let stale = service::node_tick(&paths, "node1", now + 400).unwrap();
     assert!(matches!(stale.status, mrk::model::NodeStatus::Active));
     assert_eq!(stale.total_eligible_seconds, credited_seconds);
     service::drain_node(&paths, "node1", password, now + 401).unwrap();
-    service::mark_node_exited(&paths, "node1", now + 402).unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, now + 402).unwrap();
     assert!(matches!(
         service::node_record(&paths, "node1").unwrap().status,
         mrk::model::NodeStatus::Exited
     ));
+    assert_eq!(
+        paths
+            .read_ledger()
+            .unwrap()
+            .ip_slots
+            .get("v4:1.1.1.1")
+            .unwrap()
+            .released_at,
+        Some(now + 402)
+    );
 
     std::fs::remove_dir_all(root).unwrap();
 }

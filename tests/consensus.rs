@@ -1,7 +1,10 @@
 use chrono::Utc;
 use mrk::{
     crypto::{decrypt_key, sign_bytes},
-    model::{BlockConsensusMode, ConsensusVote, ConsensusVoteType, NodeStatus, OperationStatus},
+    model::{
+        BlockConsensusMode, ConsensusVote, ConsensusVoteType, IpSlotRecord, NodeStatus,
+        OperationStatus,
+    },
     service,
     storage::DataPaths,
 };
@@ -97,7 +100,16 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
                 node.validator_candidate_since = None;
                 node.last_heartbeat = Some(now);
                 node.last_probe_success = Some(now);
+                let ip_slot = node.ip_slot.clone();
                 ledger.nodes.insert(node_id, node);
+                ledger.ip_slots.insert(
+                    ip_slot,
+                    IpSlotRecord {
+                        node_id,
+                        bound_at: now,
+                        released_at: None,
+                    },
+                );
             }
             ledger.next_node_id = 21;
             Ok(())

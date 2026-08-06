@@ -11,7 +11,7 @@ use chrono::Utc;
 use mrk::{
     amount::MRK_SCALE,
     consensus::ConsensusWireMessage,
-    model::NodeStatus,
+    model::{IpSlotRecord, NodeStatus},
     relay_client::{self, RelayConnection},
     service,
     storage::DataPaths,
@@ -435,7 +435,16 @@ fn validator_authenticates_and_reads_status_over_consensus_websocket() {
                 node.validator_candidate_since = None;
                 node.last_heartbeat = Some(now);
                 node.last_probe_success = Some(now);
+                let ip_slot = node.ip_slot.clone();
                 ledger.nodes.insert(node_id, node);
+                ledger.ip_slots.insert(
+                    ip_slot,
+                    IpSlotRecord {
+                        node_id,
+                        bound_at: now,
+                        released_at: None,
+                    },
+                );
             }
             ledger.next_node_id = 21;
             Ok(())
@@ -576,7 +585,16 @@ fn four_independent_validators_gossip_operation_and_finalize() {
                 node.validator = false;
                 node.validator_bond = 0;
                 node.validator_candidate_since = None;
+                let ip_slot = node.ip_slot.clone();
                 ledger.nodes.insert(node_id, node);
+                ledger.ip_slots.insert(
+                    ip_slot,
+                    IpSlotRecord {
+                        node_id,
+                        bound_at: now,
+                        released_at: None,
+                    },
+                );
             }
             ledger.next_node_id = 21;
             for (index, port) in ports.iter().enumerate() {

@@ -200,6 +200,10 @@ pub(crate) enum DaemonCommand {
         #[arg(long)]
         price_per_gib: String,
     },
+    UpdateRewardIp {
+        #[arg(long)]
+        endpoint: String,
+    },
     Run {
         #[arg(long, default_value = "0.0.0.0:8787")]
         listen: SocketAddr,
@@ -1197,6 +1201,30 @@ fn execute_daemon_command(
                     node.node_id, node.status, node.endpoint, node.ip_slot
                 )
             })?;
+        }
+        DaemonCommand::UpdateRewardIp { endpoint } => {
+            let password = read_password("Node Owner password: ")?;
+            let (operation_id, node) = service::update_reward_ip(
+                paths,
+                &cli.node,
+                &password,
+                &endpoint,
+                Utc::now().timestamp(),
+            )?;
+            print_value(
+                cli.output,
+                &serde_json::json!({
+                    "operation_id": operation_id,
+                    "status": "PENDING",
+                    "node": node,
+                }),
+                || {
+                    format!(
+                        "SUBMITTED\nOperation: {operation_id}\nStatus: {}\nEndpoint: {}\nIP slot: {}",
+                        node.status, node.endpoint, node.ip_slot
+                    )
+                },
+            )?;
         }
         DaemonCommand::Bootstrap {
             peer,
@@ -2284,12 +2312,11 @@ fn run_node_server(
         }
 
         let node = service::node_tick(paths, name, Utc::now().timestamp())?;
-        if matches!(node.status, NodeStatus::Draining) {
-            service::mark_node_exited(paths, name, Utc::now().timestamp())?;
+        if matches!(node.status, NodeStatus::Exited) {
             println!("Node drained and exited.");
             return Ok(());
         }
-        if matches!(node.status, NodeStatus::Exited | NodeStatus::Suspended) {
+        if matches!(node.status, NodeStatus::Suspended) {
             return Err(Error::msg(format!(
                 "node cannot run while status is {}",
                 node.status

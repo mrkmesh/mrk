@@ -434,7 +434,7 @@ mod tests {
         let settlement = |sequence, bytes, submission_operation_id| PendingTrafficSettlement {
             sender_checkpoint: SenderCheckpoint {
                 ledger_id: "ledger".to_owned(),
-                protocol_version: 1,
+                protocol_version: crate::model::PROTOCOL_VERSION,
                 node_id: 1,
                 authorization_id: "authorization".to_owned(),
                 session_id: "session".to_owned(),
@@ -448,7 +448,7 @@ mod tests {
             },
             receiver_receipt: ReceiverReceipt {
                 ledger_id: "ledger".to_owned(),
-                protocol_version: 1,
+                protocol_version: crate::model::PROTOCOL_VERSION,
                 node_id: 1,
                 authorization_id: "authorization".to_owned(),
                 session_id: "session".to_owned(),

@@ -2186,7 +2186,10 @@ fn stage_consensus_candidate(
                     | "FinalizeProposal"
                     | "ExecuteProposal"
             )
-            | ("NodeRegistry", "RegisterNode" | "DrainNode")
+            | (
+                "NodeRegistry",
+                "RegisterNode" | "UpdateRewardIp" | "DrainNode"
+            )
             | ("NodeEmissionController", "ClaimNodeReward")
             | (
                 "StakeVault",
@@ -2410,14 +2413,9 @@ fn submit_signed_node_operation(
                 if address_from_public_key(&reward_bytes) != reward_address {
                     return Err(Error::msg("Reward public key does not match address"));
                 }
-                let ip_slot = payload_str(payload, "ip_slot")?.to_owned();
-                if ledger
-                    .ip_slots
-                    .get(&ip_slot)
-                    .is_some_and(|slot| slot.released_at.is_none())
-                {
-                    return Err(Error::msg("public IP slot is already occupied"));
-                }
+                let reward_ip = payload_str(payload, "reward_ip")?.to_owned();
+                let ip_slot =
+                    validate_reward_ip_slot(&reward_ip, payload_str(payload, "ip_slot")?)?;
                 let price_per_gib = parse_payload_u128(payload, "price_per_gib_base_units")?;
                 let registered_at = payload["registered_at"].as_i64().unwrap_or(executed_at);
                 let (status, warmup_until, active_since) =
@@ -2430,7 +2428,7 @@ fn submit_signed_node_operation(
                     relay_public_key: payload_str(payload, "relay_public_key")?.to_owned(),
                     reward_address: reward_address.clone(),
                     endpoint: payload_str(payload, "endpoint")?.to_owned(),
-                    reward_ip: payload_str(payload, "reward_ip")?.to_owned(),
+                    reward_ip,
                     ip_slot: ip_slot.clone(),
                     price_per_gib,
                     status,
@@ -2474,15 +2472,27 @@ fn submit_signed_node_operation(
                     return Err(Error::msg("Genesis authority is missing"));
                 }
                 ledger.nodes.insert(node_id, record);
-                ledger.ip_slots.insert(
-                    ip_slot,
-                    IpSlotRecord {
-                        node_id,
-                        bound_at: registered_at,
-                        released_at: None,
-                    },
-                );
+                bind_ip_slot_if_available(ledger, &ip_slot, node_id, now);
                 ledger.next_node_id += 1;
+            }
+            ("NodeRegistry", "UpdateRewardIp") => {
+                let node_id = payload["node_id"]
+                    .as_u64()
+                    .ok_or_else(|| Error::msg("Node ID is invalid"))?;
+                ensure_replicated_node_owner(
+                    ledger,
+                    node_id,
+                    &operation.unsigned.signer,
+                    public_key,
+                )?;
+                apply_reward_ip_update(
+                    ledger,
+                    node_id,
+                    payload_str(payload, "endpoint")?,
+                    payload_str(payload, "reward_ip")?,
+                    payload_str(payload, "ip_slot")?,
+                    now,
+                )?;
             }
             ("NodeRegistry", "DrainNode") => {
                 let node_id = payload["node_id"]
@@ -2831,28 +2841,40 @@ fn apply_availability_attestation(
         .epoch_started_at
         .checked_add(ledger.epoch_seconds_snapshot)
         .ok_or_else(|| Error::msg("availability Epoch boundary overflow"))?;
+    let (warmup_until, target_ip_slot, target_status) = ledger
+        .nodes
+        .get(&target_node_id)
+        .map(|node| (node.warmup_until, node.ip_slot.clone(), node.status))
+        .ok_or_else(|| Error::msg("availability target Node is missing"))?;
+    let eligible_start = slot_start.max(ledger.epoch_started_at).max(warmup_until);
+    let eligible_end = slot_end.min(epoch_end);
+    let serviceable = !matches!(
+        target_status,
+        NodeStatus::Draining | NodeStatus::Exited | NodeStatus::Suspended
+    );
+    let owns_ip_slot = serviceable
+        && bind_ip_slot_if_available(
+            ledger,
+            &target_ip_slot,
+            target_node_id,
+            latest_probe_timestamp,
+        )
+        && node_owns_ip_slot_at(ledger, target_node_id, latest_probe_timestamp);
     let node = ledger
         .nodes
         .get_mut(&target_node_id)
         .ok_or_else(|| Error::msg("availability target Node is missing"))?;
-    let eligible_start = slot_start
-        .max(ledger.epoch_started_at)
-        .max(node.warmup_until);
-    let eligible_end = slot_end.min(epoch_end);
-    let serviceable = !matches!(
-        node.status,
-        NodeStatus::Draining | NodeStatus::Exited | NodeStatus::Suspended
-    );
     let credited_seconds = if first_credit
         && !ledger.governance.emission_paused
         && serviceable
+        && owns_ip_slot
         && eligible_end > eligible_start
     {
         (eligible_end - eligible_start) as u64
     } else {
         0
     };
-    if first_credit && serviceable {
+    if first_credit && serviceable && owns_ip_slot {
         node.last_probe_success = Some(latest_probe_timestamp);
         node.probe_success_count = node.probe_success_count.saturating_add(1);
         if eligible_end > eligible_start {
@@ -3910,17 +3932,6 @@ pub fn register_node(
     let node = paths.with_ledger_mut(|ledger| {
         ensure_account(ledger, &owner_file)?;
         ensure_account(ledger, &reward_file)?;
-        if let Some(existing) = ledger.ip_slots.get(&ip_slot) {
-            let reusable = existing.released_at.is_some_and(|released| {
-                now - released >= ledger.settings.ip_reuse_cooldown_seconds
-            });
-            if !reusable {
-                return Err(Error::msg(format!(
-                    "public IP slot '{ip_slot}' is already bound to node {}",
-                    existing.node_id
-                )));
-            }
-        }
         let node_id = ledger.next_node_id;
         ledger.next_node_id += 1;
         let nonce = ledger.accounts[&owner_file.address].nonce + 1;
@@ -3999,20 +4010,69 @@ pub fn register_node(
             ));
         }
         ledger.nodes.insert(node_id, record.clone());
-        ledger.ip_slots.insert(
-            ip_slot.clone(),
-            IpSlotRecord {
-                node_id,
-                bound_at: now,
-                released_at: None,
-            },
-        );
+        bind_ip_slot_if_available(ledger, &ip_slot, node_id, now);
         finalize_operation(ledger, &signed, &operation_id, now)?;
         Ok(record)
     })?;
     config.node_id = Some(node.node_id);
     paths.write_node_config(&config)?;
     Ok(node)
+}
+
+pub fn update_reward_ip(
+    paths: &DataPaths,
+    name: &str,
+    password: &str,
+    endpoint: &str,
+    now: i64,
+) -> Result<(String, NodeRecord)> {
+    let config = paths.read_node_config(name)?;
+    let node_id = config
+        .node_id
+        .ok_or_else(|| Error::msg("node is not registered"))?;
+    let reward_ip = resolve_endpoint_public_ip(endpoint)?;
+    let new_ip_slot = ip_slot(reward_ip);
+    let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
+    let owner_key = decrypt_key(&owner_file, password)?;
+    paths.with_ledger_mut(|ledger| {
+        let node = ledger
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| Error::msg("registered node is missing from the ledger"))?;
+        if node.owner_address != owner_file.address
+            || node.owner_public_key != owner_file.public_key
+        {
+            return Err(Error::msg("Node Owner key does not match the registry"));
+        }
+        let nonce = ledger.accounts[&owner_file.address].nonce + 1;
+        let payload = json!({
+            "node_id": node_id,
+            "endpoint": endpoint,
+            "reward_ip": reward_ip.to_string(),
+            "ip_slot": new_ip_slot,
+        });
+        let signed = sign_operation(
+            ledger,
+            (&owner_file, &owner_key),
+            "NodeRegistry",
+            "UpdateRewardIp",
+            nonce,
+            now + DEFAULT_OPERATION_VALIDITY_SECONDS,
+            payload,
+        )?;
+        let operation_id = operation_id(&signed)?;
+        verify_operation(&signed, &owner_file.public_key)?;
+        apply_reward_ip_update(
+            ledger,
+            node_id,
+            endpoint,
+            &reward_ip.to_string(),
+            &new_ip_slot,
+            now,
+        )?;
+        finalize_operation(ledger, &signed, &operation_id, now)?;
+        Ok((operation_id, ledger.nodes[&node_id].clone()))
+    })
 }
 
 fn initial_node_lifecycle(
@@ -4170,28 +4230,6 @@ pub fn drain_node(paths: &DataPaths, name: &str, password: &str, now: i64) -> Re
         ledger.nodes.get_mut(&node_id).expect("node").status = NodeStatus::Draining;
         finalize_operation(ledger, &signed, &operation_id, now)?;
         Ok(operation_id)
-    })
-}
-
-pub fn mark_node_exited(paths: &DataPaths, name: &str, now: i64) -> Result<()> {
-    let config = paths.read_node_config(name)?;
-    let node_id = config
-        .node_id
-        .ok_or_else(|| Error::msg("node is not registered"))?;
-    paths.with_ledger_mut(|ledger| {
-        let node = ledger
-            .nodes
-            .get_mut(&node_id)
-            .ok_or_else(|| Error::msg("registered node is missing from the ledger"))?;
-        if !matches!(node.status, NodeStatus::Draining) {
-            return Ok(());
-        }
-        node.status = NodeStatus::Exited;
-        node.last_heartbeat = None;
-        if let Some(slot) = ledger.ip_slots.get_mut(&node.ip_slot) {
-            slot.released_at = Some(now);
-        }
-        Ok(())
     })
 }
 
@@ -6086,6 +6124,7 @@ fn prepare_block_operations(
         operation.status = OperationStatus::Finalized;
         operation.block_height = Some(height);
     }
+    finalize_draining_nodes(&mut simulated, timestamp);
     simulated.pending_operation_ids.clear();
     Ok((simulated, operation_ids.to_vec()))
 }
@@ -6192,6 +6231,7 @@ fn replay_block_operations(
         operation.status = OperationStatus::Finalized;
         operation.block_height = Some(height);
     }
+    finalize_draining_nodes(&mut state, timestamp);
     state.pending_operation_ids.clear();
     Ok((state, accepted))
 }
@@ -8471,6 +8511,7 @@ fn governance_eligible_node_ids(ledger: &LedgerState, now: i64) -> Vec<u64> {
                     && now.saturating_sub(timestamp) <= ledger.settings.probe_validity_seconds
             });
             (matches!(node.status, NodeStatus::Active)
+                && node_owns_ip_slot_at(ledger, *node_id, now)
                 && node.service_bond >= ledger.settings.min_service_bond
                 && node.total_eligible_seconds >= ledger.settings.governance_min_service_seconds
                 && probe_fresh)
@@ -8959,6 +9000,149 @@ pub fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn validate_reward_ip_slot(reward_ip: &str, declared_slot: &str) -> Result<String> {
+    let reward_ip =
+        IpAddr::from_str(reward_ip).map_err(|_| Error::msg("registered reward IP is invalid"))?;
+    if !is_public_ip(reward_ip) {
+        return Err(Error::msg(
+            "registered reward IP must be a globally routable public address",
+        ));
+    }
+    let expected_slot = ip_slot(reward_ip);
+    if declared_slot != expected_slot {
+        return Err(Error::msg("registered IP slot does not match reward IP"));
+    }
+    Ok(expected_slot)
+}
+
+fn ip_slot_is_available(ledger: &LedgerState, slot_name: &str, at: i64) -> bool {
+    ledger.ip_slots.get(slot_name).is_none_or(|slot| {
+        slot.released_at.is_some_and(|released_at| {
+            at >= released_at
+                && at.saturating_sub(released_at) >= ledger.settings.ip_reuse_cooldown_seconds
+        })
+    })
+}
+
+fn bind_ip_slot_if_available(
+    ledger: &mut LedgerState,
+    slot_name: &str,
+    node_id: u64,
+    bound_at: i64,
+) -> bool {
+    if ledger
+        .ip_slots
+        .get(slot_name)
+        .is_some_and(|slot| slot.node_id == node_id && slot.released_at.is_none())
+    {
+        return true;
+    }
+    if !ip_slot_is_available(ledger, slot_name, bound_at) {
+        return false;
+    }
+    ledger.ip_slots.insert(
+        slot_name.to_owned(),
+        IpSlotRecord {
+            node_id,
+            bound_at,
+            released_at: None,
+        },
+    );
+    true
+}
+
+fn node_owns_ip_slot_at(ledger: &LedgerState, node_id: u64, observed_at: i64) -> bool {
+    let Some(node) = ledger.nodes.get(&node_id) else {
+        return false;
+    };
+    ledger.ip_slots.get(&node.ip_slot).is_some_and(|slot| {
+        slot.node_id == node_id && slot.released_at.is_none() && slot.bound_at <= observed_at
+    })
+}
+
+fn release_node_ip_slot(ledger: &mut LedgerState, node_id: u64, released_at: i64) {
+    let Some(slot_name) = ledger.nodes.get(&node_id).map(|node| node.ip_slot.clone()) else {
+        return;
+    };
+    if let Some(slot) = ledger.ip_slots.get_mut(&slot_name)
+        && slot.node_id == node_id
+        && slot.released_at.is_none()
+    {
+        slot.released_at = Some(released_at);
+    }
+}
+
+fn apply_reward_ip_update(
+    ledger: &mut LedgerState,
+    node_id: u64,
+    endpoint: &str,
+    reward_ip: &str,
+    declared_slot: &str,
+    updated_at: i64,
+) -> Result<()> {
+    parse_wss_endpoint(endpoint)?;
+    let new_slot = validate_reward_ip_slot(reward_ip, declared_slot)?;
+    let warmup_until = updated_at
+        .checked_add(ledger.settings.warmup_seconds)
+        .ok_or_else(|| Error::msg("Node reward IP warmup timestamp overflow"))?;
+    let (old_slot, status) = ledger
+        .nodes
+        .get(&node_id)
+        .map(|node| (node.ip_slot.clone(), node.status))
+        .ok_or_else(|| Error::msg("registered node is missing from the ledger"))?;
+    if matches!(
+        status,
+        NodeStatus::Draining | NodeStatus::Exited | NodeStatus::Suspended
+    ) {
+        return Err(Error::msg(
+            "reward IP cannot be updated while the node is draining, exited, or suspended",
+        ));
+    }
+
+    if old_slot != new_slot {
+        release_node_ip_slot(ledger, node_id, updated_at);
+    }
+    let node = ledger.nodes.get_mut(&node_id).expect("Node exists");
+    node.endpoint = endpoint.to_owned();
+    node.reward_ip = reward_ip.to_owned();
+    node.ip_slot = new_slot.clone();
+    node.status = NodeStatus::WarmingUp;
+    node.warmup_until = warmup_until;
+    node.active_since = None;
+    node.last_probe_success = None;
+
+    let retained_binding = old_slot == new_slot
+        && ledger
+            .ip_slots
+            .get(&new_slot)
+            .is_some_and(|slot| slot.node_id == node_id && slot.released_at.is_none());
+    if retained_binding {
+        ledger.ip_slots.get_mut(&new_slot).unwrap().bound_at = updated_at;
+    } else {
+        bind_ip_slot_if_available(ledger, &new_slot, node_id, updated_at);
+    }
+    Ok(())
+}
+
+fn finalize_draining_nodes(ledger: &mut LedgerState, finalized_at: i64) {
+    let draining = ledger
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| {
+            matches!(node.status, NodeStatus::Draining).then_some(*node_id)
+        })
+        .collect::<Vec<_>>();
+    for node_id in draining {
+        release_node_ip_slot(ledger, node_id, finalized_at);
+        let node = ledger
+            .nodes
+            .get_mut(&node_id)
+            .expect("draining Node exists");
+        node.status = NodeStatus::Exited;
+        node.last_heartbeat = None;
+    }
+}
+
 /// Applies deterministic Epoch transitions while constructing or replaying a block post-state.
 /// Callers outside block execution must never advance economic state from their local clock.
 fn settle_elapsed_epochs_for_block(ledger: &mut LedgerState, block_timestamp: i64) -> Result<()> {
@@ -9183,6 +9367,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn conflicting_ip_slot_has_only_one_governance_eligible_owner() {
+        let mut ledger = LedgerState::default();
+        ledger.settings.min_service_bond = 0;
+        ledger.settings.governance_min_service_seconds = 0;
+        let mut owner = availability_test_node(1);
+        owner.last_probe_success = Some(100);
+        let mut conflicting = availability_test_node(2);
+        conflicting.reward_ip = owner.reward_ip.clone();
+        conflicting.ip_slot = owner.ip_slot.clone();
+        conflicting.last_probe_success = Some(100);
+        let slot = owner.ip_slot.clone();
+        ledger.nodes.insert(1, owner);
+        ledger.nodes.insert(2, conflicting);
+        assert!(bind_ip_slot_if_available(&mut ledger, &slot, 1, 0));
+        assert!(!bind_ip_slot_if_available(&mut ledger, &slot, 2, 100));
+        assert_eq!(governance_eligible_node_ids(&ledger, 100), vec![1]);
+    }
+
     fn availability_test_node(node_id: u64) -> NodeRecord {
         NodeRecord {
             node_id,
@@ -9235,7 +9438,9 @@ mod tests {
             let mut node = availability_test_node(node_id);
             node.validator_bond = ledger.settings.validator_bond;
             node.validator_candidate_since = Some(0);
+            let slot = node.ip_slot.clone();
             ledger.nodes.insert(node_id, node);
+            assert!(bind_ip_slot_if_available(&mut ledger, &slot, node_id, 0));
         }
         let trusted = availability_verifier_set(&ledger, 1, 0);
         assert_eq!(trusted.mode, AvailabilityMode::Node1Trusted);
@@ -9289,7 +9494,9 @@ mod tests {
             node.validator = false;
             node.validator_bond = ledger.settings.validator_bond;
             node.validator_candidate_since = Some(0);
+            let slot = node.ip_slot.clone();
             ledger.nodes.insert(node_id, node);
+            assert!(bind_ip_slot_if_available(&mut ledger, &slot, node_id, 0));
         }
 
         refresh_validator_committee(&mut ledger, 0).unwrap();

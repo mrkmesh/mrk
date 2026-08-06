@@ -3,7 +3,7 @@ use mrk::{
     amount::MRK_SCALE,
     model::{
         GovernanceProposalAction, GovernanceProposalKind, GovernanceProposalStatus,
-        GovernanceVoteChoice, GovernanceVoteRecord, NodeStatus,
+        GovernanceVoteChoice, GovernanceVoteRecord, IpSlotRecord, NodeStatus,
     },
     service,
     storage::DataPaths,
@@ -76,7 +76,16 @@ fn critical_governance_uses_snapshot_power_timelock_and_cancels_below_twenty() {
                 node.last_heartbeat = Some(now);
                 node.last_probe_success = Some(now);
                 node.total_eligible_seconds = 180 * 86_400;
+                let ip_slot = node.ip_slot.clone();
                 ledger.nodes.insert(node_id, node);
+                ledger.ip_slots.insert(
+                    ip_slot,
+                    IpSlotRecord {
+                        node_id,
+                        bound_at: now,
+                        released_at: None,
+                    },
+                );
             }
             ledger.next_node_id = 21;
             let reward = ledger.nodes[&1].reward_address.clone();

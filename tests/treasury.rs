@@ -3,7 +3,7 @@ use mrk::{
     amount::{GENESIS_TREASURY_ALLOCATION, MRK_SCALE, NODE_EMISSION_ALLOCATION},
     model::{
         GovernanceProposalAction, GovernanceProposalKind, GovernanceProposalStatus,
-        GovernanceVoteChoice, GovernanceVoteRecord, NodeStatus,
+        GovernanceVoteChoice, GovernanceVoteRecord, IpSlotRecord, NodeStatus,
     },
     service,
     storage::DataPaths,
@@ -95,7 +95,16 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
                 node.last_heartbeat = Some(now);
                 node.last_probe_success = Some(now);
                 node.total_eligible_seconds = 180 * 86_400;
+                let ip_slot = node.ip_slot.clone();
                 ledger.nodes.insert(node_id, node);
+                ledger.ip_slots.insert(
+                    ip_slot,
+                    IpSlotRecord {
+                        node_id,
+                        bound_at: now,
+                        released_at: None,
+                    },
+                );
             }
             ledger.next_node_id = 21;
             for node_id in 1..=4 {

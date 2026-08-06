@@ -861,6 +861,6 @@ mod tests {
             ledger.availability_mode,
             super::AvailabilityMode::Node1Trusted
         );
-        assert_eq!(ledger.version, 1);
+        assert_eq!(ledger.version, super::PROTOCOL_VERSION);
     }
 }
