@@ -148,6 +148,9 @@ impl DataPaths {
         write
             .open_table(PENDING_TRAFFIC_TABLE)
             .map_err(redb_error)?;
+        write
+            .open_table(BOOTSTRAP_CHECKPOINT_TABLE)
+            .map_err(redb_error)?;
         write.commit().map_err(redb_error)?;
         Ok(state)
     }
@@ -179,6 +182,50 @@ impl DataPaths {
 
     pub fn read_ledger(&self) -> Result<LedgerState> {
         self.load_or_init_ledger()
+    }
+
+    pub fn store_bootstrap_checkpoint(
+        &self,
+        height: u64,
+        checkpoint: &LedgerState,
+        retained_limit: usize,
+    ) -> Result<()> {
+        let bytes = serde_json::to_vec(checkpoint)?;
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        {
+            let mut table = write
+                .open_table(BOOTSTRAP_CHECKPOINT_TABLE)
+                .map_err(redb_error)?;
+            table.insert(height, bytes.as_slice()).map_err(redb_error)?;
+            let heights = table
+                .iter()
+                .map_err(redb_error)?
+                .map(|entry| entry.map(|(height, _)| height.value()).map_err(redb_error))
+                .collect::<Result<Vec<_>>>()?;
+            for stale_height in heights
+                .iter()
+                .take(heights.len().saturating_sub(retained_limit.max(1)))
+            {
+                table.remove(*stale_height).map_err(redb_error)?;
+            }
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(())
+    }
+
+    pub fn bootstrap_checkpoint(&self, height: u64) -> Result<Option<LedgerState>> {
+        let db = self.open_chain_db()?;
+        let read = db.begin_read().map_err(redb_error)?;
+        let table = read
+            .open_table(BOOTSTRAP_CHECKPOINT_TABLE)
+            .map_err(redb_error)?;
+        let checkpoint = table
+            .get(height)
+            .map_err(redb_error)?
+            .map(|bytes| serde_json::from_slice(bytes.value()))
+            .transpose()?;
+        Ok(checkpoint)
     }
 
     pub fn store_pending_traffic_settlement(
@@ -305,6 +352,8 @@ const LEDGER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ledger"
 const LEDGER_STATE_KEY: &str = "state/v1";
 const PENDING_TRAFFIC_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("pending_traffic_settlements/v1");
+const BOOTSTRAP_CHECKPOINT_TABLE: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("bootstrap_checkpoints/v1");
 
 fn pending_traffic_key(
     authorization_id: &str,

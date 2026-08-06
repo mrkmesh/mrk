@@ -855,6 +855,8 @@ pub struct LocalNodeConfig {
     #[serde(default)]
     pub trusted_checkpoint_root: Option<String>,
     #[serde(default)]
+    pub trusted_checkpoint_height: Option<u64>,
+    #[serde(default)]
     pub bootstrap_allow_insecure_local: bool,
     #[serde(default)]
     pub bootstrap_tls_ca: Option<String>,

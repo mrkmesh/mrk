@@ -174,6 +174,8 @@ pub(crate) enum DaemonCommand {
         #[arg(long)]
         peer: String,
         #[arg(long)]
+        checkpoint_height: u64,
+        #[arg(long)]
         checkpoint_root: String,
         #[arg(long)]
         allow_insecure_local: bool,
@@ -1231,6 +1233,7 @@ fn execute_daemon_command(
         }
         DaemonCommand::Bootstrap {
             peer,
+            checkpoint_height,
             checkpoint_root,
             allow_insecure_local,
             tls_ca,
@@ -1238,18 +1241,21 @@ fn execute_daemon_command(
             let value = relay_client::run_rpc_call(
                 &peer,
                 "chain.bootstrap",
-                serde_json::json!({}),
+                serde_json::json!({ "height": checkpoint_height }),
                 allow_insecure_local,
                 tls_ca.as_deref(),
             )?;
             let snapshot: service::BootstrapSnapshot = serde_json::from_value(value)?;
             let report = service::install_bootstrap_snapshot(
                 paths,
-                &cli.node,
-                &peer,
-                &checkpoint_root,
-                allow_insecure_local,
-                tls_ca.as_deref(),
+                service::BootstrapInstallRequest {
+                    name: &cli.node,
+                    peer: &peer,
+                    expected_height: checkpoint_height,
+                    expected_state_root: &checkpoint_root,
+                    allow_insecure_local,
+                    tls_ca: tls_ca.as_deref(),
+                },
                 snapshot,
             )?;
             print_value(cli.output, &report, || {
@@ -2203,6 +2209,9 @@ fn run_node_server(
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
     decrypt_key(&owner_file, password)?;
     service::ensure_runtime_compatibility(paths, name)?;
+    if paths.read_ledger()?.finalized_checkpoint.is_some() {
+        service::bootstrap_snapshot(paths)?;
+    }
     let (admin_listener, _admin_guard) = bind_admin_socket(paths, name)?;
     let mut public_listener = None;
     let mut availability_worker_started = false;
@@ -2959,7 +2968,18 @@ fn execute_public_rpc(paths: &DataPaths, request: RpcRequest) -> Result<serde_js
             })
         }
         "chain.status" => serde_json::to_value(service::block_status(paths, now)?)?,
-        "chain.bootstrap" => serde_json::to_value(service::bootstrap_snapshot(paths)?)?,
+        "chain.bootstrap" => {
+            let snapshot = match request.params.get("height") {
+                Some(height) => {
+                    let height = height
+                        .as_u64()
+                        .ok_or_else(|| Error::msg("RPC parameter 'height' must be a u64"))?;
+                    service::bootstrap_snapshot_at(paths, height)?
+                }
+                None => service::bootstrap_snapshot(paths)?,
+            };
+            serde_json::to_value(snapshot)?
+        }
         "chain.catch_up" => {
             let from_height = rpc_u64(&request.params, "from_height")?;
             serde_json::to_value(service::consensus_catch_up_chunk(

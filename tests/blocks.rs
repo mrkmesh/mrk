@@ -229,16 +229,43 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
     register(&source, "node1", password, "wss://1.1.1.1/v1/relay", now);
     service::produce_node1_block(&source, "node1", password, false, now + 1).unwrap();
     service::init_node(&target, "joining", password).unwrap();
-    let snapshot = service::bootstrap_snapshot(&source).unwrap();
+    let first_snapshot = service::bootstrap_snapshot(&source).unwrap();
+    service::produce_node1_block(&source, "node1", password, true, now + 2).unwrap();
+    let latest_snapshot = service::bootstrap_snapshot(&source).unwrap();
+    assert_eq!(latest_snapshot.height, 2);
+    drop(source);
+    let source = DataPaths::new(Some(source_root.clone())).unwrap();
+    let snapshot = service::bootstrap_snapshot_at(&source, 1).unwrap();
+    assert_eq!(snapshot.state_root, first_snapshot.state_root);
 
     assert!(
         service::install_bootstrap_snapshot(
             &target,
-            "joining",
-            "wss://1.1.1.1/v1/rpc",
-            &format!("state_{}", "0".repeat(64)),
-            false,
-            None,
+            service::BootstrapInstallRequest {
+                name: "joining",
+                peer: "wss://1.1.1.1/v1/rpc",
+                expected_height: snapshot.height + 1,
+                expected_state_root: &snapshot.state_root,
+                allow_insecure_local: false,
+                tls_ca: None,
+            },
+            snapshot.clone(),
+        )
+        .is_err()
+    );
+    assert!(target.read_ledger().unwrap().genesis_authority.is_none());
+
+    assert!(
+        service::install_bootstrap_snapshot(
+            &target,
+            service::BootstrapInstallRequest {
+                name: "joining",
+                peer: "wss://1.1.1.1/v1/rpc",
+                expected_height: snapshot.height,
+                expected_state_root: &format!("state_{}", "0".repeat(64)),
+                allow_insecure_local: false,
+                tls_ca: None,
+            },
             snapshot.clone(),
         )
         .is_err()
@@ -248,11 +275,14 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
     let trusted_root = snapshot.state_root.clone();
     let report = service::install_bootstrap_snapshot(
         &target,
-        "joining",
-        "1.1.1.1",
-        &trusted_root,
-        false,
-        None,
+        service::BootstrapInstallRequest {
+            name: "joining",
+            peer: "1.1.1.1",
+            expected_height: snapshot.height,
+            expected_state_root: &trusted_root,
+            allow_insecure_local: false,
+            tls_ca: None,
+        },
         snapshot,
     )
     .unwrap();
@@ -266,14 +296,33 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
             .as_deref(),
         Some("wss://1.1.1.1/v1/rpc")
     );
+    assert_eq!(
+        target
+            .read_node_config("joining")
+            .unwrap()
+            .trusted_checkpoint_height,
+        Some(1)
+    );
     let verified = service::verify_blockchain(&target).unwrap();
     assert!(verified.ok, "{}", verified.detail);
+
+    let catch_up =
+        service::consensus_catch_up_chunk(&source, 1, mrk::consensus::MAX_CATCH_UP_BLOCKS).unwrap();
+    assert_eq!(catch_up.blocks.len(), 1);
+    let caught_up_height = service::apply_consensus_catch_up(
+        &target,
+        catch_up.blocks,
+        catch_up.operations,
+        *catch_up.finalized_checkpoint.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(caught_up_height, 2);
 
     let backup_path = target_root.join("backups").join("checkpoint.json");
     let backup_report = service::backup_ledger(&target, Some(&backup_path), now + 3).unwrap();
     let backup: service::LedgerBackup =
         serde_json::from_slice(&std::fs::read(&backup_path).unwrap()).unwrap();
-    assert_eq!(backup_report.height, 1);
+    assert_eq!(backup_report.height, 2);
     assert_eq!(
         backup.checksum,
         mrk::crypto::sha256_full_id("backup", &serde_json::to_vec(&backup.payload).unwrap())
@@ -298,8 +347,8 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
     let restored =
         service::restore_ledger_backup(&target, "joining", &backup_path, &backup_report.state_root)
             .unwrap();
-    assert_eq!(restored.height, 1);
-    assert_eq!(service::verify_blockchain(&target).unwrap().height, 1);
+    assert_eq!(restored.height, 2);
+    assert_eq!(service::verify_blockchain(&target).unwrap().height, 2);
 
     std::fs::remove_dir_all(source_root).unwrap();
     std::fs::remove_dir_all(target_root).unwrap();

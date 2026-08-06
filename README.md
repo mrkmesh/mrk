@@ -163,6 +163,7 @@ mrk node run --listen 0.0.0.0:8787
 # Joining nodes only; obtain the state_... root through an independent trusted channel.
 mrk node bootstrap \
   --peer seed.example.com \
+  --checkpoint-height 12345 \
   --checkpoint-root state_<64-lowercase-hex>
 
 mrk node register \
@@ -181,7 +182,7 @@ mrk node drain
 mrk node withdraw-service-bond
 ```
 
-`mrk node run` starts the Unix administration Socket before registration. Genesis Node 1 registers on its empty chain. Every later Node first runs `mrk node bootstrap`, then `mrk node register`. A downloaded snapshot is accepted only when its full SHA-256 state root matches the operator-supplied root. Obtain that root from an independent trusted release, quorum announcement, or comparison with multiple operators—not from the peer serving the snapshot. The daemon remembers the peer, forwards its signed registration operation, and continuously downloads and verifies finalized catch-up blocks. It enables its public WSS listener after registration succeeds. All later `mrk node` commands also use that Socket. Public `mrk` queries use
+`mrk node run` starts the Unix administration Socket before registration. Genesis Node 1 registers on its empty chain. Every later Node first runs `mrk node bootstrap`, then `mrk node register`. A downloaded snapshot is accepted only when both its height and full SHA-256 state root match the operator-supplied checkpoint. Obtain that pair from an independent trusted release, quorum announcement, or comparison with multiple operators—not from the peer serving the snapshot. Peers retain the newest 256 finalized checkpoint snapshots, so a pinned checkpoint remains downloadable while the chain advances; the joining Node catches up from that fixed height after installation. The daemon remembers the peer, forwards its signed registration operation, and continuously downloads and verifies finalized catch-up blocks. It enables its public WSS listener after registration succeeds. All later `mrk node` commands also use that Socket. Public `mrk` queries use
 `--rpc-endpoint relay.example.com` (or `MRK_RPC_ENDPOINT`).
 
 The public Node registry and the connectable Relay set are separate queries:

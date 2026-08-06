@@ -432,6 +432,7 @@ mrk pipe --network team --member client-a \
 mrk node init --lite
 mrk node run --listen 0.0.0.0:8787
 mrk node bootstrap --peer seed.example.com \
+  --checkpoint-height 12345 \
   --checkpoint-root state_<64-lowercase-hex>
 mrk node register --endpoint relay.example.com \
   --price-per-gib 0.02MRK

@@ -376,6 +376,7 @@ pub struct BlockVerificationReport {
 pub const LITE_RETAIN_BLOCKS: usize = 65_536;
 pub const LITE_RETAIN_OPERATIONS: usize = 262_144;
 pub const LITE_RETAIN_ACCOUNT_OPERATIONS: usize = 1_024;
+pub const BOOTSTRAP_CHECKPOINT_RETENTION: usize = 256;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct HistoryPruneReport {
@@ -483,10 +484,10 @@ pub fn apply_consensus_catch_up(
     operations: Vec<OperationRecord>,
     finalized_checkpoint: LedgerState,
 ) -> Result<u64> {
-    paths.with_ledger_mut(|ledger| {
-        if blocks.is_empty() {
-            return Ok(chain_height(ledger));
-        }
+    if blocks.is_empty() {
+        return Ok(chain_height(&paths.read_ledger()?));
+    }
+    let height = paths.with_ledger_mut(|ledger| {
         let local_height = chain_height(ledger);
         let local_tip_hash = chain_tip_hash(ledger)
             .unwrap_or(GENESIS_PREVIOUS_BLOCK_HASH)
@@ -603,7 +604,9 @@ pub fn apply_consensus_catch_up(
         *ledger = candidate;
         update_finalized_checkpoint(ledger);
         Ok(new_height)
-    })
+    })?;
+    persist_latest_bootstrap_checkpoint(paths)?;
+    Ok(height)
 }
 
 pub fn prune_lite_history(paths: &DataPaths, name: &str) -> Result<HistoryPruneReport> {
@@ -3796,6 +3799,7 @@ pub fn init_node_with_storage_mode(
         storage_mode,
         bootstrap_peer: None,
         trusted_checkpoint_root: None,
+        trusted_checkpoint_height: None,
         bootstrap_allow_insecure_local: false,
         bootstrap_tls_ca: None,
     };
@@ -3813,7 +3817,7 @@ pub fn init_node_with_storage_mode(
     Ok(config)
 }
 
-pub fn bootstrap_snapshot(paths: &DataPaths) -> Result<BootstrapSnapshot> {
+fn latest_bootstrap_snapshot(paths: &DataPaths) -> Result<BootstrapSnapshot> {
     let ledger = paths.read_ledger()?;
     let checkpoint = ledger
         .finalized_checkpoint
@@ -3834,31 +3838,88 @@ pub fn bootstrap_snapshot(paths: &DataPaths) -> Result<BootstrapSnapshot> {
     })
 }
 
+pub fn bootstrap_snapshot(paths: &DataPaths) -> Result<BootstrapSnapshot> {
+    let snapshot = latest_bootstrap_snapshot(paths)?;
+    paths.store_bootstrap_checkpoint(
+        snapshot.height,
+        &snapshot.checkpoint,
+        BOOTSTRAP_CHECKPOINT_RETENTION,
+    )?;
+    Ok(snapshot)
+}
+
+pub fn bootstrap_snapshot_at(paths: &DataPaths, height: u64) -> Result<BootstrapSnapshot> {
+    let latest = latest_bootstrap_snapshot(paths)?;
+    if height == latest.height {
+        paths.store_bootstrap_checkpoint(
+            latest.height,
+            &latest.checkpoint,
+            BOOTSTRAP_CHECKPOINT_RETENTION,
+        )?;
+        return Ok(latest);
+    }
+    if height > latest.height {
+        return Err(Error::msg(format!(
+            "bootstrap checkpoint height {height} is ahead of the finalized height {}",
+            latest.height
+        )));
+    }
+    let mut checkpoint = paths.bootstrap_checkpoint(height)?.ok_or_else(|| {
+        Error::msg(format!(
+            "bootstrap checkpoint at height {height} is not retained; choose a checkpoint published within the last {BOOTSTRAP_CHECKPOINT_RETENTION} finalized blocks"
+        ))
+    })?;
+    checkpoint.finalized_checkpoint = None;
+    if chain_height(&checkpoint) != height {
+        return Err(Error::msg(
+            "retained bootstrap checkpoint has inconsistent height metadata",
+        ));
+    }
+    Ok(BootstrapSnapshot {
+        ledger_id: checkpoint.ledger_id.clone(),
+        height,
+        state_root: ledger_state_root(&checkpoint)?,
+        checkpoint,
+    })
+}
+
+pub struct BootstrapInstallRequest<'a> {
+    pub name: &'a str,
+    pub peer: &'a str,
+    pub expected_height: u64,
+    pub expected_state_root: &'a str,
+    pub allow_insecure_local: bool,
+    pub tls_ca: Option<&'a std::path::Path>,
+}
+
 pub fn install_bootstrap_snapshot(
     paths: &DataPaths,
-    name: &str,
-    peer: &str,
-    expected_state_root: &str,
-    allow_insecure_local: bool,
-    tls_ca: Option<&std::path::Path>,
+    request: BootstrapInstallRequest<'_>,
     snapshot: BootstrapSnapshot,
 ) -> Result<BootstrapInstallReport> {
-    let peer = normalize_websocket_url(peer, RPC_PATH)?;
+    let peer = normalize_websocket_url(request.peer, RPC_PATH)?;
     if peer.path() != RPC_PATH {
         return Err(Error::msg(format!(
             "bootstrap peer path must be {RPC_PATH}"
         )));
     }
     let peer = peer.to_string();
-    if !expected_state_root.starts_with("state_") || expected_state_root.len() != 70 {
+    if !request.expected_state_root.starts_with("state_") || request.expected_state_root.len() != 70
+    {
         return Err(Error::msg(
             "trusted checkpoint root must be a full state_ SHA-256 identifier",
         ));
     }
-    if snapshot.state_root != expected_state_root {
+    if snapshot.height != request.expected_height {
         return Err(Error::msg(format!(
-            "downloaded checkpoint root {} does not match trusted root {expected_state_root}",
-            snapshot.state_root
+            "downloaded checkpoint height {} does not match trusted height {}",
+            snapshot.height, request.expected_height
+        )));
+    }
+    if snapshot.state_root != request.expected_state_root {
+        return Err(Error::msg(format!(
+            "downloaded checkpoint root {} does not match trusted root {}",
+            snapshot.state_root, request.expected_state_root
         )));
     }
     let mut checkpoint = snapshot.checkpoint;
@@ -3884,13 +3945,18 @@ pub fn install_bootstrap_snapshot(
             "bootstrap requires an initialized Node with an otherwise empty local chain",
         ));
     }
-    let original_config = paths.read_node_config(name)?;
+    let original_config = paths.read_node_config(request.name)?;
     if original_config.node_id.is_some() {
         return Err(Error::msg(
             "registered Node cannot replace its chain by bootstrap",
         ));
     }
     let finalized = checkpoint.clone();
+    paths.store_bootstrap_checkpoint(
+        snapshot.height,
+        &finalized,
+        BOOTSTRAP_CHECKPOINT_RETENTION,
+    )?;
     checkpoint.finalized_checkpoint = Some(Box::new(finalized));
     paths.with_ledger_mut(|ledger| {
         *ledger = checkpoint;
@@ -3898,9 +3964,12 @@ pub fn install_bootstrap_snapshot(
     })?;
     let mut config = original_config.clone();
     config.bootstrap_peer = Some(peer.clone());
-    config.trusted_checkpoint_root = Some(expected_state_root.to_owned());
-    config.bootstrap_allow_insecure_local = allow_insecure_local;
-    config.bootstrap_tls_ca = tls_ca.map(|path| path.to_string_lossy().into_owned());
+    config.trusted_checkpoint_root = Some(request.expected_state_root.to_owned());
+    config.trusted_checkpoint_height = Some(request.expected_height);
+    config.bootstrap_allow_insecure_local = request.allow_insecure_local;
+    config.bootstrap_tls_ca = request
+        .tls_ca
+        .map(|path| path.to_string_lossy().into_owned());
     if let Err(error) = paths.write_node_config(&config) {
         paths.with_ledger_mut(|ledger| {
             *ledger = local;
@@ -5766,7 +5835,7 @@ pub fn submit_consensus_vote(
     vote: ConsensusVote,
     now: i64,
 ) -> Result<ConsensusSubmissionView> {
-    paths.with_ledger_mut(|ledger| {
+    let submission = paths.with_ledger_mut(|ledger| {
         ensure_multi_validator_mode(ledger, now)?;
         if (now - vote.timestamp).abs() > 60 {
             return Err(Error::msg("consensus vote timestamp is stale"));
@@ -5867,7 +5936,11 @@ pub fn submit_consensus_vote(
             double_sign_detected: false,
             finalized_block,
         })
-    })
+    })?;
+    if submission.finalized_block.is_some() {
+        persist_latest_bootstrap_checkpoint(paths)?;
+    }
+    Ok(submission)
 }
 
 pub fn propose_consensus_block(
@@ -6710,7 +6783,7 @@ pub fn produce_node1_block(
         .ok_or_else(|| Error::msg("node is not registered"))?;
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
     let owner_key = decrypt_key(&owner_file, password)?;
-    paths.with_ledger_mut(|ledger| {
+    let block = paths.with_ledger_mut(|ledger| {
         let genesis = ensure_genesis_authority(ledger)?;
         if node_id != genesis.node_id
             || config.owner_address != genesis.owner_address
@@ -6792,7 +6865,9 @@ pub fn produce_node1_block(
         update_finalized_checkpoint(&mut committed);
         *ledger = committed;
         Ok(block)
-    })
+    })?;
+    persist_latest_bootstrap_checkpoint(paths)?;
+    Ok(block)
 }
 
 pub fn produce_node1_block_if_due(
@@ -7182,6 +7257,15 @@ fn update_finalized_checkpoint(ledger: &mut LedgerState) {
             .retain(|operation_id| checkpoint.operations.contains_key(operation_id));
     }
     ledger.finalized_checkpoint = Some(Box::new(checkpoint));
+}
+
+fn persist_latest_bootstrap_checkpoint(paths: &DataPaths) -> Result<()> {
+    let snapshot = latest_bootstrap_snapshot(paths)?;
+    paths.store_bootstrap_checkpoint(
+        snapshot.height,
+        &snapshot.checkpoint,
+        BOOTSTRAP_CHECKPOINT_RETENTION,
+    )
 }
 
 fn block_signing_payload(block: &BlockRecord) -> BlockSigningPayload {
