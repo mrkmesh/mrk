@@ -98,7 +98,7 @@ fn node_reward_transfer_and_private_network_flow() {
     assert_eq!(rewards.vesting_reward, expected_epoch_reward * 9 / 10);
     assert_eq!(rewards.vesting_schedule_count, 1);
     let reward_balance = service::balance(&paths, &node_config.reward_address).unwrap();
-    assert_eq!(reward_balance.liquid, claimed);
+    assert_eq!(reward_balance.balance, claimed);
     service::produce_node1_block(&paths, "node1", password, false, epoch_start + 62).unwrap();
 
     let transfer = service::transfer(
@@ -112,7 +112,7 @@ fn node_reward_transfer_and_private_network_flow() {
     .unwrap();
     assert_eq!(transfer.amount, MRK_SCALE / 20);
     assert_eq!(
-        service::balance(&paths, &bob.address).unwrap().liquid,
+        service::balance(&paths, &bob.address).unwrap().balance,
         MRK_SCALE / 20
     );
 
@@ -215,7 +215,7 @@ fn externally_signed_transfer_is_verified_and_committed_by_database_owner() {
                 .accounts
                 .entry(alice.address.clone())
                 .or_default()
-                .liquid = 10 * MRK_SCALE;
+                .balance = 10 * MRK_SCALE;
             Ok(())
         })
         .unwrap();
@@ -237,7 +237,7 @@ fn externally_signed_transfer_is_verified_and_committed_by_database_owner() {
             .unwrap();
     assert_eq!(receipt.amount, 2 * MRK_SCALE);
     assert_eq!(
-        service::balance(&paths, &bob.address).unwrap().liquid,
+        service::balance(&paths, &bob.address).unwrap().balance,
         2 * MRK_SCALE
     );
 }
@@ -256,7 +256,7 @@ fn consensus_replays_signed_operation_identically_across_databases() {
             .with_ledger_mut(|ledger| {
                 let account = ledger.accounts.entry(alice.address.clone()).or_default();
                 account.public_key = Some(alice.public_key.clone());
-                account.liquid = 10 * MRK_SCALE;
+                account.balance = 10 * MRK_SCALE;
                 Ok(())
             })
             .unwrap();
@@ -288,12 +288,12 @@ fn consensus_replays_signed_operation_identically_across_databases() {
         second_ledger.pending_operation_ids
     );
     assert_eq!(
-        first_ledger.accounts[&alice.address].liquid,
-        second_ledger.accounts[&alice.address].liquid
+        first_ledger.accounts[&alice.address].balance,
+        second_ledger.accounts[&alice.address].balance
     );
     assert_eq!(
-        first_ledger.accounts[&bob.address].liquid,
-        second_ledger.accounts[&bob.address].liquid
+        first_ledger.accounts[&bob.address].balance,
+        second_ledger.accounts[&bob.address].balance
     );
 
     std::fs::remove_dir_all(first_root).unwrap();

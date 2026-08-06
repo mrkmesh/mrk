@@ -74,7 +74,7 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
                     .accounts
                     .get_mut(&node.reward_address)
                     .unwrap()
-                    .liquid = 10;
+                    .balance = 10;
             }
             Ok(())
         })

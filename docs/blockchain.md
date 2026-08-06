@@ -66,7 +66,7 @@ mint(reason = eligible_node_uptime)
 
 | 角色 | 权利 | 责任 |
 | --- | --- | --- |
-| Account | 持有和转移 Liquid MRK | 保护账户密钥 |
+| Account | 持有和转移可支配 MRK | 保护账户密钥 |
 | Network Owner | 创建私网、签发成员凭证、预留付款预算 | 管理私网安全和余额 |
 | Node | 运行一个 Relay、领取在线时长发行、参与节点治理 | 保持服务可用、接受锁定和处罚 |
 | Validator | 进入最多 31 席委员会，重放 MSL 批次并投 PREVOTE/PRECOMMIT | 保存批次、验证状态根、不签署冲突状态 |
@@ -165,14 +165,14 @@ MVP 固定 `IP_REUSE_COOLDOWN = 7 days`。
 
 ### 5.3 无启动质押
 
-新 Node 不需要预先持有 MRK，也不以质押作为开始运行 Relay 的前提。节点最初获得的在线时长奖励优先形成协议要求的自有 Service Bond；达到最低 Bond 后，后续奖励才进入 Liquid MRK。
+新 Node 不需要预先持有 MRK，也不以质押作为开始运行 Relay 的前提。节点最初获得的在线时长奖励优先形成协议要求的自有 Service Bond；达到最低 Bond 后，后续奖励才进入即时领取和线性释放流程。
 
 ```text
 REQUIRED_SERVICE_BOND = 500 MRK
 
 node_uptime_reward
   -> until 500 MRK Service Bond: 100% Service Bond
-  -> after REQUIRED_SERVICE_BOND: 10% immediately claimable Liquid MRK
+  -> after REQUIRED_SERVICE_BOND: 10% immediately claimable MRK
   -> after REQUIRED_SERVICE_BOND: 90% linearly vested over 180 days
 ```
 
@@ -180,7 +180,7 @@ MVP 要求的 Service Bond 为 500 MRK。Node 的 `DrainNode` 操作终局时进
 
 恶意停机使用终局 Availability 证明而非本机 Heartbeat 判断。具有历史成功证明的 `WARMING_UP`、`ACTIVE` 或 `DRAINING` Node，如果从 `last_probe_success` 起连续 `offline-slash-seconds` 没有新的终局成功证明，默认 7 天，则在下一终局区块中被强制置为 `EXITED` 并释放 IP Slot；全部 Service Bond 和尚未归属的线性释放余额原子转入 Treasury，Bond 不产生解锁时间，已归属的 `claimable_reward` 仍保留。该区块会记录罚没时间、Service Bond 数额和线性奖励数额。Reward IP 更新保留旧证明作为罚没计时基准，直到新地址取得首个成功证明，避免通过反复换 IP 重置离线时钟。若全网无法产生终局区块，状态机无法单独推进时间或执行罚没；恢复终局后由首个达到阈值的区块执行。
 
-奖励先补足 Service Bond；剩余 Liquid 部分使用当前 Epoch 的 `reward-immediate-bps` 与 `reward-vesting-seconds` 快照拆分。默认立即释放 `1,000 bps = 10%`，其余 90% 从该 Epoch 结算边界开始，在 180 天内线性释放。
+奖励先补足 Service Bond；扣除 Bond 后的部分使用当前 Epoch 的 `reward-immediate-bps` 与 `reward-vesting-seconds` 快照拆分。默认立即释放 `1,000 bps = 10%`，其余 90% 从该 Epoch 结算边界开始，在 180 天内线性释放。
 
 ### 5.4 Node 1
 
@@ -210,7 +210,7 @@ epoch_node_budget = min(EPOCH_MINT_AMOUNT, pool_remaining)
 
 `epoch-mint-amount` 与 `epoch-seconds` 都是 Critical 治理参数。提案执行后只写入下一 Epoch 的配置；已经开始的 Epoch 始终使用起始时的铸币量和时长快照，不允许被提前结束、延长或追溯修改。默认值分别为 `500 MRK` 和 `1,800` 秒。改变 Epoch 时长会改变年度发行速度，因此不能用 Standard 提案修改。
 
-每个节点的 Epoch 奖励先补足 Service Bond，再将剩余 Liquid 奖励按当前 Epoch 快照拆分：`reward-immediate-bps` 默认 `1,000`，立即进入 `claimable_reward`；其余部分建立独立释放批次，按 `reward-vesting-seconds` 默认 `15,552,000` 秒（180 天）线性释放。只有最终确认区块的时间戳跨越 Epoch 边界时才结算释放；查询是纯只读操作，领取也只能转移此前已最终确认进入 `claimable_reward` 的金额，二者均不得按本机时间推进 Epoch。边界结算使用经过秒数计算最小单位整数结果，因此无需每秒写入账本。多个 Epoch 批次可以重叠，领取已释放部分不改变剩余批次。
+每个节点的 Epoch 奖励先补足 Service Bond，再将扣除 Bond 后的奖励按当前 Epoch 快照拆分：`reward-immediate-bps` 默认 `1,000`，立即进入 `claimable_reward`；其余部分建立独立释放批次，按 `reward-vesting-seconds` 默认 `15,552,000` 秒（180 天）线性释放。只有最终确认区块的时间戳跨越 Epoch 边界时才结算释放；查询是纯只读操作，领取也只能转移此前已最终确认进入 `claimable_reward` 的金额，二者均不得按本机时间推进 Epoch。边界结算使用经过秒数计算最小单位整数结果，因此无需每秒写入账本。多个 Epoch 批次可以重叠，领取已释放部分不改变剩余批次。
 
 对节点 `n`：
 
@@ -282,7 +282,7 @@ Operation 正文、账户 Operation ID 索引和上述裁剪元数据属于本�
 
 ### 7.1 资金来源
 
-用户必须使用 Liquid MRK 为私网付款授权预留余额。用户获得 MRK 的方式只有：
+用户必须使用可支配 MRK 为私网付款授权预留余额。用户获得 MRK 的方式只有：
 
 - 自己运行合格节点并按在线时长获得；
 - 从已有 MRK 持有人处接收或购买。
@@ -388,9 +388,9 @@ flowchart LR
 
 Treasury 初始持有 Genesis 固定铸造的 5 亿 MRK，之后还可以接收流量协议费、固定操作费中未销毁部分或罚没所得的既有 MRK；Treasury 支出不允许调用铸币入口。
 
-### 7.4 Liquid MRK 直接转账
+### 7.4 可支配 MRK 直接转账
 
-账户可以把未锁定的 Liquid MRK 直接转给任意 MSL 地址。转账使用普通 `SignedOperation`，payload 固定为：
+账户可以把可支配 MRK 直接转给任意 MSL 地址。转账使用普通 `SignedOperation`，payload 固定为：
 
 ```text
 MRKTransfer {
@@ -402,16 +402,16 @@ MRKTransfer {
 MSL 执行转账时必须原子检查并完成：
 
 ```text
-available_liquid_balance >= amount + fixed_transfer_fee
-sender_liquid  -= amount + fixed_transfer_fee
-receiver_liquid += amount
+spendable_balance >= amount + fixed_transfer_fee
+sender_balance   -= amount + fixed_transfer_fee
+receiver_balance += amount
 burned          += fixed_transfer_fee
 ```
 
 规则：
 
 - `from` 由 `SignedOperation.signer` 唯一确定，payload 不允许另行指定付款方；
-- 只能转移 Liquid MRK，Service/Validator/Governance Bond 和 Escrow 余额不可转账；
+- 只能转移可支配 MRK，Service/Validator/Governance Bond 和 Escrow 余额不可转账；
 - 金额以 18 位精度的整数最小单位编码，CLI 不得使用浮点数计算；
 - 地址使用带 `mrk` 网络前缀和校验和的文本编码，错误网络或错误校验和必须在签名前拒绝；
 - 转账不包含链上 memo，避免永久公开业务和个人信息；
@@ -590,7 +590,7 @@ SettlementBatch {
 
 ### 9.4 多 Validator 最终确认
 
-达到 20 个 Governance-Eligible Node 且至少存在 4 个 Active Validator 后启用等权委员会确认。正常 Node 不自动成为 Validator，必须主动从 Reward Liquid 锁定 `50,000 MRK` Validator Bond 才进入候选池。零至三个 Active Validator 时始终由 Node 1 出块：
+达到 20 个 Governance-Eligible Node 且至少存在 4 个 Active Validator 后启用等权委员会确认。正常 Node 不自动成为 Validator，必须主动从 Reward Key 对应的可支配余额锁定 `50,000 MRK` Validator Bond 才进入候选池。零至三个 Active Validator 时始终由 Node 1 出块：
 
 - Active Validator 最多 31 个，每个 Node 最多一个席位；候选不超过 31 时全部入选；
 - 候选超过 31 时按确定性服务顺序轮换，每个 Epoch 最多替换 10 席，至少保留 21 席；
@@ -668,7 +668,7 @@ MSL 不使用 Gas。每种有成本或可被滥用的财务/治理操作使用�
 - Active Validator 只有签名率达到 95% 才获得 1.25× 权重，且加成不得提高 Epoch 总预算；
 - 自报流量、用户数、连接数和钱包数量不会增加发行；
 - Relay 不能领取超过付款方签名累计金额和 Escrow 预留金额的 MRK；
-- Liquid MRK 转账必须由付款账户签名、使用严格递增 nonce，并原子扣除金额和固定费用；
+- 可支配 MRK 转账必须由付款账户签名、使用严格递增 nonce，并原子扣除金额和固定费用；
 - 同一签名转账重复提交不得重复扣款，最终确认后不可回滚；
 - 流量收入是已有 MRK 转移，不属于发行；
 - 少于 20 个 Governance-Eligible Node 时 Node 1 单独治理，达到 20 个时切换节点治理，之后低于 20 个时恢复；

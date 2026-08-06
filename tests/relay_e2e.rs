@@ -114,7 +114,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
     let owner = service::account_keyfile(&paths, "owner").unwrap();
     paths
         .with_ledger_mut(|ledger| {
-            ledger.accounts.get_mut(&owner.address).unwrap().liquid = 10 * MRK_SCALE;
+            ledger.accounts.get_mut(&owner.address).unwrap().balance = 10 * MRK_SCALE;
             Ok(())
         })
         .unwrap();
@@ -410,7 +410,7 @@ fn validator_authenticates_and_reads_status_over_consensus_websocket() {
                     .accounts
                     .get_mut(&node.reward_address)
                     .unwrap()
-                    .liquid = 10;
+                    .balance = 10;
             }
             Ok(())
         })
@@ -556,7 +556,7 @@ fn four_independent_validators_gossip_operation_and_finalize() {
                     .accounts
                     .get_mut(&node.reward_address)
                     .unwrap()
-                    .liquid = 2 * MRK_SCALE;
+                    .balance = 2 * MRK_SCALE;
             }
             Ok(())
         })
@@ -702,7 +702,7 @@ fn four_independent_validators_gossip_operation_and_finalize() {
         assert_eq!(
             service::balance(&node_paths, &recipient.address)
                 .unwrap()
-                .liquid,
+                .balance,
             MRK_SCALE
         );
         hashes.push(service::block_by_height(&node_paths, 1).unwrap().block_hash);

@@ -353,10 +353,10 @@ fn run() -> Result<()> {
                 let total = amount_value
                     .checked_add(TRANSFER_FEE)
                     .ok_or_else(|| Error::msg("transfer total overflow"))?;
-                let available = json_u128(&balance, "liquid")?;
+                let available = json_u128(&balance, "balance")?;
                 if available < total {
                     return Err(Error::msg(format!(
-                        "insufficient Liquid MRK: available {}, required {}",
+                        "insufficient spendable MRK: available {}, required {}",
                         format_mrk(available),
                         format_mrk(total)
                     )));

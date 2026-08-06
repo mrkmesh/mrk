@@ -64,8 +64,8 @@ const TREASURY_MATURE_SERVICE_SECONDS: u64 = 180 * 86_400;
 #[derive(Clone, Debug, Serialize)]
 pub struct BalanceView {
     pub address: String,
-    pub liquid: u128,
-    pub liquid_display: String,
+    pub balance: u128,
+    pub balance_display: String,
     pub nonce: u64,
 }
 
@@ -1069,8 +1069,8 @@ pub fn balance(paths: &DataPaths, address: &str) -> Result<BalanceView> {
     let state = ledger.accounts.get(address).cloned().unwrap_or_default();
     Ok(BalanceView {
         address: address.to_owned(),
-        liquid: state.liquid,
-        liquid_display: format_mrk(state.liquid),
+        balance: state.balance,
+        balance_display: format_mrk(state.balance),
         nonce: state.nonce,
     })
 }
@@ -1157,10 +1157,10 @@ pub fn preview_transfer(
         .get(&keyfile.address)
         .cloned()
         .unwrap_or_default();
-    if sender.liquid < total {
+    if sender.balance < total {
         return Err(Error::msg(format!(
-            "insufficient Liquid MRK: available {}, required {}",
-            format_mrk(sender.liquid),
+            "insufficient spendable MRK: available {}, required {}",
+            format_mrk(sender.balance),
             format_mrk(total)
         )));
     }
@@ -1201,7 +1201,7 @@ pub fn transfer(
                 "account nonce changed; preview the transfer again",
             ));
         }
-        if current.liquid < preview.total {
+        if current.balance < preview.total {
             return Err(Error::msg(
                 "account balance changed; preview the transfer again",
             ));
@@ -1238,16 +1238,16 @@ pub fn transfer(
                 .accounts
                 .get_mut(&preview.from)
                 .expect("sender exists");
-            sender.liquid -= preview.total;
+            sender.balance -= preview.total;
         }
         ledger
             .accounts
             .entry(preview.to.clone())
             .or_default()
-            .liquid = ledger
+            .balance = ledger
             .accounts
             .get(&preview.to)
-            .map(|account| account.liquid)
+            .map(|account| account.balance)
             .unwrap_or_default()
             .checked_add(preview.amount)
             .ok_or_else(|| Error::msg("recipient balance overflow"))?;
@@ -1418,14 +1418,14 @@ pub fn submit_signed_transfer(
         if operation.unsigned.account_nonce != sender.nonce + 1 {
             return Err(Error::msg("operation nonce is not the next account nonce"));
         }
-        if sender.liquid < total {
-            return Err(Error::msg("insufficient Liquid MRK"));
+        if sender.balance < total {
+            return Err(Error::msg("insufficient spendable MRK"));
         }
-        sender.liquid -= total;
-        ledger.accounts.entry(to.clone()).or_default().liquid = ledger
+        sender.balance -= total;
+        ledger.accounts.entry(to.clone()).or_default().balance = ledger
             .accounts
             .get(&to)
-            .map(|account| account.liquid)
+            .map(|account| account.balance)
             .unwrap_or_default()
             .checked_add(amount)
             .ok_or_else(|| Error::msg("recipient balance overflow"))?;
@@ -1791,14 +1791,14 @@ pub fn submit_signed_network_operation(
                 if ledger.networks[&commitment].owner_address != operation.unsigned.signer {
                     return Err(Error::msg("only the Network Owner can fund this network"));
                 }
-                if ledger.accounts[&operation.unsigned.signer].liquid < amount {
-                    return Err(Error::msg("insufficient Liquid MRK"));
+                if ledger.accounts[&operation.unsigned.signer].balance < amount {
+                    return Err(Error::msg("insufficient spendable MRK"));
                 }
                 ledger
                     .accounts
                     .get_mut(&operation.unsigned.signer)
                     .expect("signer account")
-                    .liquid -= amount;
+                    .balance -= amount;
                 ledger
                     .networks
                     .get_mut(&commitment)
@@ -2558,8 +2558,8 @@ fn submit_signed_node_operation(
                 node.service_bond = 0;
                 node.service_bond_unlock_at = None;
                 let account = ledger.accounts.entry(reward_address.clone()).or_default();
-                account.liquid = account
-                    .liquid
+                account.balance = account
+                    .balance
                     .checked_add(amount)
                     .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
                 add_history(ledger, &reward_address, &operation_id_value);
@@ -2585,7 +2585,7 @@ fn submit_signed_node_operation(
                     .accounts
                     .entry(reward_address.clone())
                     .or_default()
-                    .liquid += amount;
+                    .balance += amount;
                 add_history(ledger, &reward_address, &operation_id_value);
             }
             ("StakeVault", "BondValidator") => {
@@ -2600,14 +2600,14 @@ fn submit_signed_node_operation(
                 if node.reward_address != operation.unsigned.signer {
                     return Err(Error::msg("Validator Bond signer is not Reward account"));
                 }
-                if ledger.accounts[&operation.unsigned.signer].liquid < amount {
+                if ledger.accounts[&operation.unsigned.signer].balance < amount {
                     return Err(Error::msg("insufficient Validator Bond balance"));
                 }
                 ledger
                     .accounts
                     .get_mut(&operation.unsigned.signer)
                     .unwrap()
-                    .liquid -= amount;
+                    .balance -= amount;
                 let node = ledger.nodes.get_mut(&node_id).unwrap();
                 node.validator_bond += amount;
                 if node.validator_bond >= ledger.settings.validator_bond
@@ -2682,8 +2682,8 @@ fn submit_signed_node_operation(
                 node.validator_exit_requested_at = None;
                 node.validator_bond_unlock_at = None;
                 let account = ledger.accounts.entry(reward_address.clone()).or_default();
-                account.liquid = account
-                    .liquid
+                account.balance = account
+                    .balance
                     .checked_add(amount)
                     .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
                 add_history(ledger, &reward_address, &operation_id_value);
@@ -3180,8 +3180,8 @@ fn apply_traffic_settlement(
         .accounts
         .entry(reward_address.clone())
         .or_default()
-        .liquid = ledger.accounts[&reward_address]
-        .liquid
+        .balance = ledger.accounts[&reward_address]
+        .balance
         .checked_add(amount)
         .ok_or_else(|| Error::msg("Node traffic income overflow"))?;
     let node = ledger
@@ -3419,10 +3419,10 @@ pub fn fund_network(
             .get(&keyfile.address)
             .cloned()
             .unwrap_or_default();
-        if sender.liquid < amount {
+        if sender.balance < amount {
             return Err(Error::msg(format!(
-                "insufficient Liquid MRK: available {}, required {}",
-                format_mrk(sender.liquid),
+                "insufficient spendable MRK: available {}, required {}",
+                format_mrk(sender.balance),
                 format_mrk(amount)
             )));
         }
@@ -3446,7 +3446,7 @@ pub fn fund_network(
             .accounts
             .get_mut(&keyfile.address)
             .expect("owner account")
-            .liquid -= amount;
+            .balance -= amount;
         ledger
             .networks
             .get_mut(&commitment)
@@ -4254,7 +4254,7 @@ pub fn claim_node_rewards(
             .ok_or_else(|| Error::msg("registered node is missing from the ledger"))?
             .claimable_reward;
         if claimable == 0 {
-            return Err(Error::msg("node has no claimable Liquid MRK reward"));
+            return Err(Error::msg("node has no claimable MRK reward"));
         }
         let nonce = ledger.accounts[&owner_file.address].nonce + 1;
         let payload = json!({
@@ -4287,7 +4287,7 @@ pub fn claim_node_rewards(
             .accounts
             .entry(reward_address.clone())
             .or_default()
-            .liquid += claimable;
+            .balance += claimable;
         finalize_operation(ledger, &signed, &operation_id, now)?;
         add_history(ledger, &reward_address, &operation_id);
         Ok((operation_id, claimable))
@@ -4388,8 +4388,8 @@ pub fn withdraw_service_bond(
         node.service_bond = 0;
         node.service_bond_unlock_at = None;
         let account = ledger.accounts.entry(reward_address.clone()).or_default();
-        account.liquid = account
-            .liquid
+        account.balance = account
+            .balance
             .checked_add(amount)
             .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
         finalize_operation(ledger, &signed, &operation_id, now)?;
@@ -5090,10 +5090,10 @@ pub fn join_validator_pool(
             .get(&reward_file.address)
             .cloned()
             .unwrap_or_default();
-        if reward_account.liquid < needed {
+        if reward_account.balance < needed {
             return Err(Error::msg(format!(
-                "insufficient Liquid MRK for Validator Bond: available {}, required {}",
-                format_mrk(reward_account.liquid),
+                "insufficient spendable MRK for Validator Bond: available {}, required {}",
+                format_mrk(reward_account.balance),
                 format_mrk(needed)
             )));
         }
@@ -5116,7 +5116,7 @@ pub fn join_validator_pool(
             .accounts
             .get_mut(&reward_file.address)
             .expect("reward account")
-            .liquid -= needed;
+            .balance -= needed;
         let node = ledger.nodes.get_mut(&node_id).expect("node");
         node.validator_bond += needed;
         if node.validator_bond >= ledger.settings.validator_bond
@@ -5251,8 +5251,8 @@ pub fn withdraw_validator_bond(
         node.validator_exit_requested_at = None;
         node.validator_bond_unlock_at = None;
         let account = ledger.accounts.entry(reward_address.clone()).or_default();
-        account.liquid = account
-            .liquid
+        account.balance = account
+            .balance
             .checked_add(amount)
             .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
         finalize_operation(ledger, &signed, &operation_id, now)?;
@@ -7156,10 +7156,10 @@ pub fn create_governance_proposal(
         }
         ensure_account(ledger, &reward_file)?;
         let reward_account = ledger.accounts[&reward_file.address].clone();
-        if reward_account.liquid < GOVERNANCE_PROPOSAL_BOND {
+        if reward_account.balance < GOVERNANCE_PROPOSAL_BOND {
             return Err(Error::msg(format!(
-                "insufficient Liquid MRK for Proposal Bond: available {}, required {}",
-                format_mrk(reward_account.liquid),
+                "insufficient spendable MRK for Proposal Bond: available {}, required {}",
+                format_mrk(reward_account.balance),
                 format_mrk(GOVERNANCE_PROPOSAL_BOND)
             )));
         }
@@ -7218,7 +7218,7 @@ pub fn create_governance_proposal(
             .accounts
             .get_mut(&reward_file.address)
             .expect("reward account")
-            .liquid -= GOVERNANCE_PROPOSAL_BOND;
+            .balance -= GOVERNANCE_PROPOSAL_BOND;
         let record = GovernanceProposalRecord {
             proposal_id,
             proposer_node_id: node_id,
@@ -7600,7 +7600,7 @@ pub fn finalize_governance_proposal(
             .accounts
             .entry(refund_address.clone())
             .or_default()
-            .liquid += refund;
+            .balance += refund;
         finalize_operation(ledger, &signed, &operation_id, now)?;
         add_history(ledger, &refund_address, &operation_id);
         let mut finalized_tally = tally;
@@ -8025,14 +8025,14 @@ fn apply_replicated_governance_action(
             {
                 return Err(Error::msg("proposal snapshots are not deterministic"));
             }
-            if ledger.accounts[&operation.unsigned.signer].liquid < GOVERNANCE_PROPOSAL_BOND {
+            if ledger.accounts[&operation.unsigned.signer].balance < GOVERNANCE_PROPOSAL_BOND {
                 return Err(Error::msg("insufficient Proposal Bond"));
             }
             ledger
                 .accounts
                 .get_mut(&operation.unsigned.signer)
                 .expect("signer")
-                .liquid -= GOVERNANCE_PROPOSAL_BOND;
+                .balance -= GOVERNANCE_PROPOSAL_BOND;
             let snapshot_epoch = payload["snapshot_epoch"]
                 .as_u64()
                 .ok_or_else(|| Error::msg("proposal snapshot epoch is invalid"))?;
@@ -8239,7 +8239,7 @@ fn apply_replicated_governance_terminal_action(
                     .accounts
                     .entry(proposal.proposer_reward_address.clone())
                     .or_default()
-                    .liquid += refund;
+                    .balance += refund;
             }
         }
         "FinalizeProposal" => {
@@ -8282,7 +8282,7 @@ fn apply_replicated_governance_terminal_action(
                 .accounts
                 .entry(proposal.proposer_reward_address.clone())
                 .or_default()
-                .liquid += refund;
+                .balance += refund;
         }
         "ExecuteProposal" => {
             let action: GovernanceProposalAction =
@@ -8385,8 +8385,8 @@ fn apply_governance_proposal_action(
             validate_treasury_spend_amount(ledger, *amount, now)?;
             ledger.treasury -= *amount;
             let account = ledger.accounts.entry(recipient.clone()).or_default();
-            account.liquid = account
-                .liquid
+            account.balance = account
+                .balance
                 .checked_add(*amount)
                 .ok_or_else(|| Error::msg("treasury recipient balance overflow"))?;
         }
@@ -8486,7 +8486,7 @@ fn cancel_distributed_governance_proposals(ledger: &mut LedgerState, now: i64) {
             .accounts
             .entry(proposal.proposer_reward_address.clone())
             .or_default()
-            .liquid += refund;
+            .balance += refund;
     }
 }
 
@@ -9554,12 +9554,12 @@ fn settle_one_epoch(ledger: &mut LedgerState, epoch_end: i64) -> Result<()> {
         let bond_needed = required_bond.saturating_sub(node.service_bond);
         let to_bond = reward.min(bond_needed);
         node.service_bond += to_bond;
-        let liquid_reward = reward - to_bond;
-        let immediate = liquid_reward
+        let reward_after_bond = reward - to_bond;
+        let immediate = reward_after_bond
             .checked_mul(u128::from(ledger.reward_immediate_bps_snapshot))
             .ok_or_else(|| Error::msg("immediate Node reward calculation overflow"))?
             / BPS_DENOMINATOR;
-        let vesting = liquid_reward - immediate;
+        let vesting = reward_after_bond - immediate;
         node.claimable_reward = node
             .claimable_reward
             .checked_add(immediate)
@@ -10127,9 +10127,9 @@ mod tests {
         settle_elapsed_epochs_for_block(&mut ledger, now + 60).unwrap();
         let node = &ledger.nodes[&1];
         let expected = 500 * crate::amount::MRK_SCALE;
-        let liquid_reward = expected - 10;
-        let immediate = liquid_reward * 1_000 / BPS_DENOMINATOR;
-        let vesting = liquid_reward - immediate;
+        let reward_after_bond = expected - 10;
+        let immediate = reward_after_bond * 1_000 / BPS_DENOMINATOR;
+        let vesting = reward_after_bond - immediate;
         assert_eq!(node.service_bond, 10);
         assert_eq!(node.claimable_reward, immediate);
         assert_eq!(node_vesting_reward(node).unwrap(), vesting);

@@ -220,7 +220,7 @@ Node initialization creates three separate encrypted keys:
 
 - Node Owner Key for registration and lifecycle operations.
 - Relay Key for signed Probe responses.
-- Reward Key for Liquid MRK income.
+- Reward Key for spendable MRK income.
 
 Use the Reward Key through the account alias `node:<name>`:
 

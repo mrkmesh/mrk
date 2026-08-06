@@ -109,7 +109,7 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
             ledger.next_node_id = 21;
             for node_id in 1..=4 {
                 let reward = ledger.nodes[&node_id].reward_address.clone();
-                ledger.accounts.get_mut(&reward).unwrap().liquid =
+                ledger.accounts.get_mut(&reward).unwrap().balance =
                     if node_id == 1 { 2_010 * MRK_SCALE } else { 10 };
             }
             Ok(())
@@ -255,7 +255,7 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
 
     let ledger = paths.read_ledger().unwrap();
     assert_eq!(ledger.treasury, GENESIS_TREASURY_ALLOCATION - amount);
-    assert_eq!(ledger.accounts[&recipient.address].liquid, amount);
+    assert_eq!(ledger.accounts[&recipient.address].balance, amount);
     assert_eq!(ledger.treasury_spends.len(), 1);
     assert_eq!(ledger.treasury_spends[0].operation_id, receipt.operation_id);
     assert_eq!(ledger.lifetime_minted, GENESIS_TREASURY_ALLOCATION);

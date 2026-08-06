@@ -89,7 +89,7 @@ fn critical_governance_uses_snapshot_power_timelock_and_cancels_below_twenty() {
             }
             ledger.next_node_id = 21;
             let reward = ledger.nodes[&1].reward_address.clone();
-            ledger.accounts.get_mut(&reward).unwrap().liquid = 2_000 * MRK_SCALE;
+            ledger.accounts.get_mut(&reward).unwrap().balance = 2_000 * MRK_SCALE;
             Ok(())
         })
         .unwrap();
@@ -258,7 +258,7 @@ fn critical_governance_uses_snapshot_power_timelock_and_cancels_below_twenty() {
         execute_at + 1,
     )
     .unwrap();
-    let balance_after_bond = paths.read_ledger().unwrap().accounts[&reward_address].liquid;
+    let balance_after_bond = paths.read_ledger().unwrap().accounts[&reward_address].balance;
     paths
         .with_ledger_mut(|ledger| {
             ledger.nodes.get_mut(&20).unwrap().status = NodeStatus::WarmingUp;
@@ -280,7 +280,7 @@ fn critical_governance_uses_snapshot_power_timelock_and_cancels_below_twenty() {
         GovernanceProposalStatus::Cancelled
     );
     assert_eq!(
-        ledger.accounts[&reward_address].liquid,
+        ledger.accounts[&reward_address].balance,
         balance_after_bond + 1_000 * MRK_SCALE
     );
 

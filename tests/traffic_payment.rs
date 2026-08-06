@@ -37,7 +37,7 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
                 .accounts
                 .get_mut(&config.reward_address)
                 .unwrap()
-                .liquid = 10 * MRK_SCALE;
+                .balance = 10 * MRK_SCALE;
             Ok(())
         })
         .unwrap();
@@ -148,7 +148,7 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     );
     let before = service::balance(&paths, &config.reward_address)
         .unwrap()
-        .liquid;
+        .balance;
     service::submit_traffic_settlement(
         &paths,
         "node1",
@@ -161,7 +161,7 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let expected = parse_mrk("0.000625MRK").unwrap();
     let after = service::balance(&paths, &config.reward_address)
         .unwrap()
-        .liquid;
+        .balance;
     assert_eq!(after - before, expected);
     let authorization = service::payment_authorization(&paths, &authorization_id).unwrap();
     assert_eq!(authorization.settled_amount, expected);

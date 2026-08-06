@@ -137,7 +137,7 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
     assert_eq!(ledger.nodes[&2].status, NodeStatus::WarmingUp);
     assert!(service::withdraw_service_bond(&paths, "node1", password, now + 25).is_err());
     let reward_address = ledger.nodes[&1].reward_address.clone();
-    let reward_balance_before = ledger.accounts[&reward_address].liquid;
+    let reward_balance_before = ledger.accounts[&reward_address].balance;
     drop(ledger);
 
     let (_, withdrawn) =
@@ -148,7 +148,7 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
     assert_eq!(ledger.nodes[&1].service_bond, 0);
     assert_eq!(ledger.nodes[&1].service_bond_unlock_at, None);
     assert_eq!(
-        ledger.accounts[&reward_address].liquid,
+        ledger.accounts[&reward_address].balance,
         reward_balance_before + 100
     );
     assert!(service::verify_blockchain(&paths).unwrap().ok);
@@ -210,7 +210,7 @@ fn finalized_offline_timeout_slashes_bond_and_vesting_to_treasury() {
     assert_eq!(ledger.treasury, treasury_before + 160);
     assert_eq!(ledger.pool_remaining, pool_before);
     assert_eq!(ledger.lifetime_minted, lifetime_minted_before);
-    assert_eq!(ledger.accounts[&reward_address].liquid, 0);
+    assert_eq!(ledger.accounts[&reward_address].balance, 0);
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, Some(now + 11));
     assert_eq!(
         ledger.finalized_checkpoint.as_ref().unwrap().nodes[&1].offline_slashed_at,
@@ -613,7 +613,7 @@ fn node1_produces_until_four_validators_and_restores_below_twenty_nodes() {
                     .accounts
                     .get_mut(&node.reward_address)
                     .unwrap()
-                    .liquid = 10;
+                    .balance = 10;
             }
             for node_id in 5..=20 {
                 let mut node = node1.clone();

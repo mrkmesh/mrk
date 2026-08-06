@@ -591,7 +591,7 @@ fn default_operation_history_from_height() -> u64 {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AccountState {
     pub public_key: Option<String>,
-    pub liquid: u128,
+    pub balance: u128,
     pub nonce: u64,
     pub operation_ids: Vec<String>,
 }

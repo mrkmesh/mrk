@@ -310,7 +310,7 @@ fn account_and_node_cli_commands_emit_json() {
         String::from_utf8_lossy(&balance.stderr)
     );
     let balance_json: serde_json::Value = serde_json::from_slice(&balance.stdout).unwrap();
-    assert_eq!(balance_json["liquid"], 0);
+    assert_eq!(balance_json["balance"], 0);
 
     let treasury = run_mrk_rpc(&root, port, &["treasury", "status"]);
     assert!(
