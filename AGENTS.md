@@ -23,7 +23,17 @@ Add focused unit tests beside small modules and cross-module or CLI scenarios un
 
 ## Commit & Pull Request Guidelines
 
-Recent history follows Conventional Commit-style subjects: `feat: add relay registry discovery`, `fix: finalize epoch vesting through blocks`, and `refactor: group account and block CLI commands`. Use an imperative, scoped subject and keep each commit logically focused. Pull requests should explain the behavior change, identify protocol or persisted-state compatibility effects, link related issues, and list verification commands. Include CLI output for user-visible changes; screenshots are only useful when documentation or rendered output changes.
+Use Conventional Commit subjects for all changes after the initial repository import:
+
+```text
+<type>(<optional-scope>): <imperative summary>
+```
+
+Use lowercase types such as `feat`, `fix`, `refactor`, `docs`, `test`, `chore`, `build`, `ci`, or `perf`. Omit the scope when the change spans the protocol or several modules. Keep the summary concise, start it with an imperative lowercase verb, and do not end it with a period; for example, `fix: finalize IP slot lifecycle through consensus` or `feat(relay): add registry discovery`. Keep each commit logically focused. Add a body only when the motivation, protocol behavior, or compatibility impact is not clear from the subject; separate it from the subject with a blank line. The historical `Initial commit` subject is the import exception, not a template for later changes.
+
+Preserve the repository owner's identity as both Git Author and Committer: `rkonfj <rkonfj@gmail.com>`. When Codex contributes to a commit, add `Co-authored-by: Codex <codex@openai.com>` as the final trailer paragraph after a blank line. Do not use a Codex identity, `localhost` address, or noreply address for the Author or Committer fields.
+
+Pull requests should explain the behavior change, identify protocol or persisted-state compatibility effects, link related issues, and list verification commands. Include CLI output for user-visible changes; screenshots are only useful when documentation or rendered output changes.
 
 ## Security & Configuration
 
