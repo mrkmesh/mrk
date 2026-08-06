@@ -250,7 +250,7 @@ reward_n = base_reward_n + deterministic_rounding_remainder_n
 
 Availability 模式随 Active Validator 门槛双向切换：少于 7 个时写入 `NODE1_TRUSTED`，由 Genesis Node 1 单人证明；在 Epoch 边界达到至少 7 个时写入 `MULTI_VALIDATOR`。首次进入多 Validator 模式的激活时间和 Epoch 会进入状态根并永久保留，后续回退和恢复不覆盖该历史。Node 1 自证是协议明确接受的低节点数信任假设，不适用随机审计或虚假 Probe 处罚。
 
-`warmup-seconds` 默认 `604,800` 秒（7 天），允许范围为 0 到 `31,536,000` 秒（365 天），属于 Critical 治理参数。除 Genesis Node 1 外，Node 注册时计算并写入不可追溯修改的 `warmup_until = registered_at + warmup_seconds`；后续治理修改只影响新注册 Node，既不能提前释放旧 Node，也不能让已经完成考察的 Node 重新进入考察期。Genesis Node 1 注册后直接进入 `ACTIVE`，写入 `warmup_until = registered_at` 与 `active_since = registered_at`；它没有考察期，但仍须取得有效 Availability Probe，才可为 Slot 累计 Node Seconds。
+`warmup-seconds` 默认 `86,400` 秒（1 天），允许范围为 0 到 `31,536,000` 秒（365 天），属于 Critical 治理参数。除 Genesis Node 1 外，Node 注册时计算并写入不可追溯修改的 `warmup_until = registered_at + warmup_seconds`；后续治理修改只影响新注册 Node，既不能提前释放旧 Node，也不能让已经完成考察的 Node 重新进入考察期。Genesis Node 1 注册后直接进入 `ACTIVE`，写入 `warmup_until = registered_at` 与 `active_since = registered_at`；它没有考察期，但仍须取得有效 Availability Probe，才可为 Slot 累计 Node Seconds。
 
 `mrk node run` 自动执行本节点到达秘密 Ticket 时刻的 Probe，并以有界并发和 10 秒单请求超时提交证明；`mrk node probe` 保留为人工诊断/补提入口，但同样不能绕过 Ticket 和时间窗口。Slot 时长、Primary 数量/法定票数、审计比例、Auditor 数量/法定票数都是 Critical 治理参数，默认分别为 60、5/3、5%、3/2。
 
@@ -483,7 +483,7 @@ mrk node --node <node-name> governance propose-set \
 | `required-service-bond` | `500MRK` | `0..=MAX_SUPPLY` | Standard | 修改后会重新影响 Governance-Eligible 资格和后续奖励的 Bond 补足目标 |
 | `service-bond-unlock-seconds` | `2,592,000` | `0..=31,536,000` 秒 | Critical | 只在后续 `DrainNode` 终局时快照为该 Node 的解锁时间；已有解锁时间不变 |
 | `offline-slash-seconds` | `604,800` | `3,600..=31,536,000` 秒 | Critical | 从 Node 最近一次终局成功 Availability Probe 起计算；达到阈值的终局区块强制退出并罚没 Service Bond 与未归属奖励 |
-| `warmup-seconds` | `604,800` | `0..=31,536,000` 秒 | Critical | 只写入修改后注册的非 Genesis Node 的 `warmup_until`，不追溯修改现有 Node |
+| `warmup-seconds` | `86,400` | `0..=31,536,000` 秒 | Critical | 只写入修改后注册的非 Genesis Node 的 `warmup_until`，不追溯修改现有 Node |
 | `heartbeat-grace-seconds` | `90` | `10..=3,600` 秒 | Standard | 无 |
 | `probe-validity-seconds` | `300` | `30..=3,600` 秒，且不得短于 `availability-slot-seconds` | Standard | 修改后会重新影响 Probe 新鲜度和 Governance-Eligible 资格 |
 | `availability-slot-seconds` | `60` | `60..=300` 秒，且不得长于 `probe-validity-seconds` | Critical | 无 |

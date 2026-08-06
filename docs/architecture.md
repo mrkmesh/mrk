@@ -296,7 +296,7 @@ Sec-WebSocket-Protocol: mrk.consensus.v1
 
 Genesis 固定把 5 亿 MRK 铸入无私钥 Treasury；Genesis 之后，新增 MRK 只有“合格节点在线时长”一个释放渠道。注册、用户身份、流量、连接数、Validator 出批次、治理或 Treasury 支出均不能继续铸币。流量付款和国库支出只转移已有 MRK；Relay 与客户端即使合谋制造虚假流量，也不能扩大 Epoch 发行预算。
 
-新 Node 不需要预先持有 MRK。除 Genesis Node 1 外，注册时按当时的 `warmup-seconds` 固化 `warmup_until`；默认考察期 7 天，Critical 治理可在 0 到 365 天范围修改，但只影响修改后注册的 Node。Node 1 注册后立即为 `ACTIVE`，且 `warmup_until = registered_at`。节点完成预热后，每个 60 秒 Availability Slot 由验证节点按照秘密 Owner-signed Ticket 规定的时刻直连登记 `reward_ip` 并验证 Endpoint TLS 与 Relay Key 签名。少于 7 个 Active Validator 时绝对信任 Node 1 的一票证明并允许自证；达到至少 7 个 Active Validator 的 Epoch 边界后切换为默认 Primary 5 选 3，跌破门槛时自动回退。5% Slot 在至少 9 席时再执行 Auditor 3 选 2。达到全部所需法定票数的 Slot 才累计 Node Seconds，最初获得的奖励先形成 Service Bond；此后的 Liquid 奖励默认 10% 立即可领取、90% 在 180 天内线性释放，并且只有最终确认区块跨越 Epoch 边界时才推进释放状态。奖励查询保持只读，领取只转移已经最终确认的可领取余额。`reward-immediate-bps` 与 `reward-vesting-seconds` 都是下一 Epoch 快照生效的 Critical 治理参数。所有普通 Node 使用相同释放公式，没有早期节点额外奖励。Active Validator 在 Epoch 检查点签名率达到 95% 时使用 `1.25×` Node Seconds 权重；加成只改变固定预算的分配，不增加发行总额。
+新 Node 不需要预先持有 MRK。除 Genesis Node 1 外，注册时按当时的 `warmup-seconds` 固化 `warmup_until`；默认考察期 1 天，Critical 治理可在 0 到 365 天范围修改，但只影响修改后注册的 Node。Node 1 注册后立即为 `ACTIVE`，且 `warmup_until = registered_at`。节点完成预热后，每个 60 秒 Availability Slot 由验证节点按照秘密 Owner-signed Ticket 规定的时刻直连登记 `reward_ip` 并验证 Endpoint TLS 与 Relay Key 签名。少于 7 个 Active Validator 时绝对信任 Node 1 的一票证明并允许自证；达到至少 7 个 Active Validator 的 Epoch 边界后切换为默认 Primary 5 选 3，跌破门槛时自动回退。5% Slot 在至少 9 席时再执行 Auditor 3 选 2。达到全部所需法定票数的 Slot 才累计 Node Seconds，最初获得的奖励先形成 Service Bond；此后的 Liquid 奖励默认 10% 立即可领取、90% 在 180 天内线性释放，并且只有最终确认区块跨越 Epoch 边界时才推进释放状态。奖励查询保持只读，领取只转移已经最终确认的可领取余额。`reward-immediate-bps` 与 `reward-vesting-seconds` 都是下一 Epoch 快照生效的 Critical 治理参数。所有普通 Node 使用相同释放公式，没有早期节点额外奖励。Active Validator 在 Epoch 检查点签名率达到 95% 时使用 `1.25×` Node Seconds 权重；加成只改变固定预算的分配，不增加发行总额。
 
 ### 6.2 Genesis 国库
 
@@ -532,7 +532,7 @@ tests/
 4. 单消息、单连接队列、通道数和计费窗口的默认上限。
 5. Relay 是否必须看不到业务明文；如果必须，端到端加密协议属于上层 SDK 扩展或 VPN 应用职责，不能只依赖 WSS。
 
-这些参数不阻塞当前 CLI。CLI 默认 1,800 秒 Epoch、每 Epoch 固定铸造 500 MRK 并由合格活跃 Node 按权重瓜分、除 Node 1 外 7 天新 Node 考察期、60 秒 Availability Slot、启动期 Node 1 一票绝对信任、去中心化阶段 Primary 5 选 3与默认 5% Auditor 3 选 2、7 天 IP 重用冷却、Ed25519 + `mrk1` 地址、`0.001 MRK` 转账费和 10 分钟操作有效期。`epoch-seconds`、`epoch-mint-amount`、`warmup-seconds`、Slot、验证节点数、法定票数及审计参数只能通过 Critical 治理修改；Epoch 时长和铸币量从下一个 Epoch 快照生效，考察期修改只作用于新注册的非 Genesis Node。
+这些参数不阻塞当前 CLI。CLI 默认 1,800 秒 Epoch、每 Epoch 固定铸造 500 MRK 并由合格活跃 Node 按权重瓜分、除 Node 1 外 1 天新 Node 考察期、60 秒 Availability Slot、启动期 Node 1 一票绝对信任、去中心化阶段 Primary 5 选 3与默认 5% Auditor 3 选 2、7 天 IP 重用冷却、Ed25519 + `mrk1` 地址、`0.001 MRK` 转账费和 10 分钟操作有效期。`epoch-seconds`、`epoch-mint-amount`、`warmup-seconds`、Slot、验证节点数、法定票数及审计参数只能通过 Critical 治理修改；Epoch 时长和铸币量从下一个 Epoch 快照生效，考察期修改只作用于新注册的非 Genesis Node。
 
 ## 13. 最小成功指标
 

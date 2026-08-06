@@ -146,7 +146,7 @@ impl Default for LedgerSettings {
             required_service_bond: 500 * MRK_SCALE,
             service_bond_unlock_seconds: default_service_bond_unlock_seconds(),
             offline_slash_seconds: default_offline_slash_seconds(),
-            warmup_seconds: 7 * 86_400,
+            warmup_seconds: 86_400,
             heartbeat_grace_seconds: 90,
             probe_validity_seconds: default_probe_validity_seconds(),
             availability_slot_seconds: default_availability_slot_seconds(),
@@ -879,6 +879,7 @@ mod tests {
         assert_eq!(settings.service_bond_unlock_seconds, 30 * 86_400);
         assert_eq!(settings.offline_slash_seconds, 7 * 86_400);
         assert_eq!(settings.required_service_bond, 500 * super::MRK_SCALE);
+        assert_eq!(settings.warmup_seconds, 86_400);
         assert_eq!(settings.availability_verifier_count, 5);
         assert_eq!(settings.availability_quorum, 3);
         assert_eq!(settings.availability_audit_rate_bps, 500);

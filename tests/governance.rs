@@ -35,7 +35,7 @@ fn node1_direct_governance_switches_at_twenty_eligible_nodes_and_restores() {
     assert_eq!(node1.last_probe_success, None);
     assert_eq!(node1.total_eligible_seconds, 0);
     assert!(matches!(node2.status, NodeStatus::WarmingUp));
-    assert_eq!(node2.warmup_until, now + 7 * 86_400);
+    assert_eq!(node2.warmup_until, now + 86_400);
 
     let ledger = paths.read_ledger().unwrap();
     let genesis = ledger.genesis_authority.unwrap();
