@@ -123,7 +123,7 @@ First start the receiving member; without `--peer`, it accepts the first incomin
 mrk pipe \
   --network team \
   --member client-b \
-  --endpoint wss://relay.example.com/v1/relay
+  --endpoint relay.example.com
 ```
 
 Then start the initiating member with the target ID shown by `member issue` or `member show`:
@@ -132,7 +132,7 @@ Then start the initiating member with the target ID shown by `member issue` or `
 mrk pipe \
   --network team \
   --member client-a \
-  --endpoint wss://relay.example.com/v1/relay \
+  --endpoint relay.example.com \
   --peer <CLIENT_B_MEMBER_ID> \
   --authorization <FINALIZED_AUTHORIZATION_ID>
 ```
@@ -148,6 +148,8 @@ mrk payment refund <AUTHORIZATION_ID> --account default
 
 Production clients require TLS 1.3 `wss://` with a publicly trusted certificate. Private deployments may add a PEM trust anchor with `--tls-ca /path/to/ca.pem`; hostname and certificate-purpose validation remain enabled. Loopback development may use `ws://127.0.0.1/... --allow-insecure-local`; plaintext WebSocket to non-loopback hosts is rejected.
 
+Endpoint options accept `host` or `host:port` shorthand. A missing scheme defaults to `wss://`, and a missing path defaults to `/v1/relay` for Node and pipe endpoints or `/v1/rpc` for RPC and bootstrap endpoints. Explicit schemes and paths remain supported.
+
 ## Node lifecycle
 
 ```bash
@@ -157,13 +159,13 @@ mrk node run --listen 0.0.0.0:8787
 
 # Joining nodes only; obtain the state_... root through an independent trusted channel.
 mrk node bootstrap \
-  --peer wss://seed.example.com/v1/rpc \
+  --peer seed.example.com \
   --checkpoint-root state_<64-lowercase-hex>
 
 mrk node register \
-  --endpoint wss://relay.example.com/v1/relay \
+  --endpoint relay.example.com \
   --price-per-gib 0.02MRK
-mrk node update-reward-ip --endpoint wss://new-relay.example.com/v1/relay
+mrk node update-reward-ip --endpoint new-relay.example.com
 
 mrk node status
 mrk node backup
@@ -177,7 +179,7 @@ mrk node withdraw-service-bond
 ```
 
 `mrk node run` starts the Unix administration Socket before registration. Genesis Node 1 registers on its empty chain. Every later Node first runs `mrk node bootstrap`, then `mrk node register`. A downloaded snapshot is accepted only when its full SHA-256 state root matches the operator-supplied root. Obtain that root from an independent trusted release, quorum announcement, or comparison with multiple operators—not from the peer serving the snapshot. The daemon remembers the peer, forwards its signed registration operation, and continuously downloads and verifies finalized catch-up blocks. It enables its public WSS listener after registration succeeds. All later `mrk node` commands also use that Socket. Public `mrk` queries use
-`--rpc-endpoint wss://relay.example.com/v1/rpc` (or `MRK_RPC_ENDPOINT`).
+`--rpc-endpoint relay.example.com` (or `MRK_RPC_ENDPOINT`).
 
 The public Node registry and the connectable Relay set are separate queries:
 

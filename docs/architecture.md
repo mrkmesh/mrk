@@ -414,26 +414,28 @@ mrk payment status <AUTHORIZATION_ID>
 
 ```text
 mrk pipe --network team --member client-b \
-  --endpoint wss://relay.example.com/v1/relay
+  --endpoint relay.example.com
 
 mrk pipe --network team --member client-a \
-  --endpoint wss://relay.example.com/v1/relay \
+  --endpoint relay.example.com \
   --peer <CLIENT_B_MEMBER_ID> \
   --authorization <AUTHORIZATION_ID>
 ```
 
 生产环境只接受 TLS 1.3 `wss://`；私有 PKI 可使用 `--tls-ca <PEM>` 增加信任锚，但仍校验主机名和证书用途。`ws://` 仅在显式指定 `--allow-insecure-local` 且目标为回环地址时用于本地测试。
 
+所有 Endpoint 参数都接受 `host` 或 `host:port` 简写：缺省协议时自动补 `wss://`；缺省 path 时，Node 和 pipe Endpoint 自动补 `/v1/relay`，RPC 和 Bootstrap Endpoint 自动补 `/v1/rpc`。显式协议和 path 保持支持。
+
 ### Relay
 
 ```text
 mrk node init --lite
 mrk node run --listen 0.0.0.0:8787
-mrk node bootstrap --peer wss://seed.example.com/v1/rpc \
+mrk node bootstrap --peer seed.example.com \
   --checkpoint-root state_<64-lowercase-hex>
-mrk node register --endpoint wss://relay.example.com/v1/relay \
+mrk node register --endpoint relay.example.com \
   --price-per-gib 0.02MRK
-mrk node update-reward-ip --endpoint wss://new-relay.example.com/v1/relay
+mrk node update-reward-ip --endpoint new-relay.example.com
 mrk node status
 mrk node backup
 mrk node backup-verify ~/.mrk/backups/mrk-HEIGHT-TIME.json --expected-state-root state_...

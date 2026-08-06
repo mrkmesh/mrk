@@ -284,7 +284,7 @@ fn account_and_node_cli_commands_emit_json() {
             "node",
             "register",
             "--endpoint",
-            "wss://1.1.1.1/v1/relay",
+            "1.1.1.1",
             "--price-per-gib",
             "0.02MRK",
         ],

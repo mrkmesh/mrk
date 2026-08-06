@@ -1,6 +1,7 @@
 pub mod amount;
 pub mod consensus;
 pub mod crypto;
+pub mod endpoint;
 pub mod error;
 pub mod model;
 pub mod relay;

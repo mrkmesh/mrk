@@ -22,6 +22,7 @@ use crate::{
     Error, Result,
     consensus::{CONSENSUS_PROTOCOL, ConsensusWireMessage, MAX_CONSENSUS_MESSAGE_SIZE},
     crypto::{random_bytes, verify_bytes},
+    endpoint::{CONSENSUS_PATH, RELAY_PATH, RPC_PATH, normalize_websocket_url},
     model::{PROTOCOL_VERSION, RelayDirection},
     relay::{
         ChallengePayload, ErrorPayload, FrameType, IncomingPayload, OpenPayload, ProbePayload,
@@ -163,7 +164,7 @@ async fn rpc_call(
 ) -> Result<serde_json::Value> {
     let mut stream = connect_websocket_protocol(
         endpoint,
-        "/v1/rpc",
+        RPC_PATH,
         RPC_PROTOCOL,
         allow_insecure_local,
         tls_ca,
@@ -426,9 +427,8 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 }
                 (channel_id, incoming.peer_id, incoming.authorization_id, false)
             };
-            let mut rpc_endpoint = Url::parse(&options.endpoint)
-                .map_err(|error| Error::msg(format!("invalid Relay endpoint: {error}")))?;
-            rpc_endpoint.set_path("/v1/rpc");
+            let mut rpc_endpoint = normalize_websocket_url(&options.endpoint, RELAY_PATH)?;
+            rpc_endpoint.set_path(RPC_PATH);
             rpc_endpoint.set_query(None);
             rpc_endpoint.set_fragment(None);
             let view: service::RelayAuthorizationView = serde_json::from_value(
@@ -674,14 +674,13 @@ pub fn sync_consensus_peer(
                     ));
                 }
                 let target = service::node_record_by_id(&paths, target_node_id)?;
-                let mut url = Url::parse(&target.endpoint)
-                    .map_err(|error| Error::msg(format!("invalid Validator endpoint: {error}")))?;
-                url.set_path("/v1/consensus");
+                let mut url = normalize_websocket_url(&target.endpoint, RELAY_PATH)?;
+                url.set_path(CONSENSUS_PATH);
                 url.set_query(None);
                 url.set_fragment(None);
                 let mut stream = connect_websocket_protocol(
                     url.as_str(),
-                    "/v1/consensus",
+                    CONSENSUS_PATH,
                     CONSENSUS_PROTOCOL,
                     allow_insecure_local,
                     tls_ca.as_deref(),
@@ -1279,7 +1278,7 @@ async fn connect_websocket(
 ) -> Result<BoxedIo> {
     connect_websocket_protocol(
         endpoint,
-        "/v1/relay",
+        RELAY_PATH,
         crate::relay::RELAY_PROTOCOL,
         allow_insecure_local,
         tls_ca,
@@ -1294,8 +1293,7 @@ async fn connect_websocket_protocol(
     allow_insecure_local: bool,
     tls_ca: Option<&Path>,
 ) -> Result<BoxedIo> {
-    let url =
-        Url::parse(endpoint).map_err(|error| Error::msg(format!("invalid Relay URL: {error}")))?;
+    let url = normalize_websocket_url(endpoint, expected_path)?;
     if url.path() != expected_path {
         return Err(Error::msg(format!(
             "WebSocket URL path must be {expected_path}"
@@ -1369,8 +1367,7 @@ async fn fetch_probe(
     challenge: &str,
     allow_insecure_local: bool,
 ) -> Result<ProbePayload> {
-    let url = Url::parse(endpoint)
-        .map_err(|error| Error::msg(format!("invalid Node endpoint URL: {error}")))?;
+    let url = normalize_websocket_url(endpoint, RELAY_PATH)?;
     let reward_ip = reward_ip
         .parse::<IpAddr>()
         .map_err(|_| Error::msg("registered Probe reward IP is invalid"))?;

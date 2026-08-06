@@ -108,14 +108,11 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
     );
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, Some(now + 6));
 
-    service::update_reward_ip(
-        &paths,
-        "node2",
-        password,
-        "wss://1.1.1.1/v1/relay",
-        now + 10,
-    )
-    .unwrap();
+    service::update_reward_ip(&paths, "node2", password, "1.1.1.1", now + 10).unwrap();
+    assert_eq!(
+        service::node_record(&paths, "node2").unwrap().endpoint,
+        "wss://1.1.1.1/v1/relay"
+    );
     service::produce_node1_block(&paths, "node1", password, false, now + 11).unwrap();
     let ledger = paths.read_ledger().unwrap();
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].node_id, 1);
@@ -252,7 +249,7 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
     let report = service::install_bootstrap_snapshot(
         &target,
         "joining",
-        "wss://1.1.1.1/v1/rpc",
+        "1.1.1.1",
         &trusted_root,
         false,
         None,

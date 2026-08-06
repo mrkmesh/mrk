@@ -22,6 +22,7 @@ use crate::{
         random_bytes, sha256_full_id, sha256_id, sign_bytes, validate_address,
         validate_keystore_password, verify_bytes,
     },
+    endpoint::{RELAY_PATH, RPC_PATH, normalize_websocket_url},
     model::{
         AvailabilityMode, AvailabilitySlotRecord, AvailabilityVerifierRole, BlockConsensusMode,
         BlockRecord, ConsensusProposal, ConsensusVote, ConsensusVoteType,
@@ -2425,6 +2426,7 @@ fn submit_signed_node_operation(
                 let ip_slot =
                     validate_reward_ip_slot(&reward_ip, payload_str(payload, "ip_slot")?)?;
                 let price_per_gib = parse_payload_u128(payload, "price_per_gib_base_units")?;
+                let endpoint = parse_wss_endpoint(payload_str(payload, "endpoint")?)?.to_string();
                 let registered_at = payload["registered_at"].as_i64().unwrap_or(executed_at);
                 let (status, warmup_until, active_since) =
                     initial_node_lifecycle(node_id, registered_at, ledger.settings.warmup_seconds)?;
@@ -2435,7 +2437,7 @@ fn submit_signed_node_operation(
                     owner_public_key: public_key.to_owned(),
                     relay_public_key: payload_str(payload, "relay_public_key")?.to_owned(),
                     reward_address: reward_address.clone(),
-                    endpoint: payload_str(payload, "endpoint")?.to_owned(),
+                    endpoint,
                     reward_ip,
                     ip_slot: ip_slot.clone(),
                     price_per_gib,
@@ -3765,6 +3767,13 @@ pub fn install_bootstrap_snapshot(
     tls_ca: Option<&std::path::Path>,
     snapshot: BootstrapSnapshot,
 ) -> Result<BootstrapInstallReport> {
+    let peer = normalize_websocket_url(peer, RPC_PATH)?;
+    if peer.path() != RPC_PATH {
+        return Err(Error::msg(format!(
+            "bootstrap peer path must be {RPC_PATH}"
+        )));
+    }
+    let peer = peer.to_string();
     if !expected_state_root.starts_with("state_") || expected_state_root.len() != 70 {
         return Err(Error::msg(
             "trusted checkpoint root must be a full state_ SHA-256 identifier",
@@ -3812,7 +3821,7 @@ pub fn install_bootstrap_snapshot(
         Ok(())
     })?;
     let mut config = original_config.clone();
-    config.bootstrap_peer = Some(peer.to_owned());
+    config.bootstrap_peer = Some(peer.clone());
     config.trusted_checkpoint_root = Some(expected_state_root.to_owned());
     config.bootstrap_allow_insecure_local = allow_insecure_local;
     config.bootstrap_tls_ca = tls_ca.map(|path| path.to_string_lossy().into_owned());
@@ -3828,7 +3837,7 @@ pub fn install_bootstrap_snapshot(
         ledger_id: snapshot.ledger_id,
         height: snapshot.height,
         state_root: snapshot.state_root,
-        peer: peer.to_owned(),
+        peer,
     })
 }
 
@@ -4007,7 +4016,8 @@ pub fn register_node(
     if config.node_id.is_some() {
         return Err(Error::msg(format!("node '{name}' is already registered")));
     }
-    let reward_ip = resolve_endpoint_public_ip(endpoint)?;
+    let endpoint = parse_wss_endpoint(endpoint)?.to_string();
+    let reward_ip = resolve_endpoint_public_ip(&endpoint)?;
     let ip_slot = ip_slot(reward_ip);
     let price_per_gib = parse_mrk(price_text)?;
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
@@ -4024,7 +4034,7 @@ pub fn register_node(
             "node_id": node_id,
             "name": name,
             "owner_public_key": owner_file.public_key,
-            "endpoint": endpoint,
+            "endpoint": endpoint.clone(),
             "reward_ip": reward_ip.to_string(),
             "ip_slot": ip_slot,
             "relay_public_key": relay_file.public_key,
@@ -4053,7 +4063,7 @@ pub fn register_node(
             owner_public_key: owner_file.public_key.clone(),
             relay_public_key: relay_file.public_key.clone(),
             reward_address: reward_file.address.clone(),
-            endpoint: endpoint.to_owned(),
+            endpoint: endpoint.clone(),
             reward_ip: reward_ip.to_string(),
             ip_slot: ip_slot.clone(),
             price_per_gib,
@@ -4119,7 +4129,8 @@ pub fn update_reward_ip(
     let node_id = config
         .node_id
         .ok_or_else(|| Error::msg("node is not registered"))?;
-    let reward_ip = resolve_endpoint_public_ip(endpoint)?;
+    let endpoint = parse_wss_endpoint(endpoint)?.to_string();
+    let reward_ip = resolve_endpoint_public_ip(&endpoint)?;
     let new_ip_slot = ip_slot(reward_ip);
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
     let owner_key = decrypt_key(&owner_file, password)?;
@@ -4136,7 +4147,7 @@ pub fn update_reward_ip(
         let nonce = ledger.accounts[&owner_file.address].nonce + 1;
         let payload = json!({
             "node_id": node_id,
-            "endpoint": endpoint,
+            "endpoint": endpoint.clone(),
             "reward_ip": reward_ip.to_string(),
             "ip_slot": new_ip_slot,
         });
@@ -4154,7 +4165,7 @@ pub fn update_reward_ip(
         apply_reward_ip_update(
             ledger,
             node_id,
-            endpoint,
+            &endpoint,
             &reward_ip.to_string(),
             &new_ip_slot,
             now,
@@ -9095,13 +9106,14 @@ fn resolve_network(ledger: &LedgerState, alias_or_commitment: &str) -> Result<St
 }
 
 fn parse_wss_endpoint(endpoint: &str) -> Result<Url> {
-    let url = Url::parse(endpoint)
-        .map_err(|error| Error::msg(format!("invalid endpoint URL: {error}")))?;
+    let url = normalize_websocket_url(endpoint, RELAY_PATH)?;
     if url.scheme() != "wss" {
         return Err(Error::msg("node endpoint must use wss://"));
     }
-    if url.host().is_none() {
-        return Err(Error::msg("node endpoint is missing its host"));
+    if url.path() != RELAY_PATH {
+        return Err(Error::msg(format!(
+            "node endpoint path must be {RELAY_PATH}"
+        )));
     }
     Ok(url)
 }
@@ -9287,7 +9299,7 @@ fn apply_reward_ip_update(
     declared_slot: &str,
     updated_at: i64,
 ) -> Result<()> {
-    parse_wss_endpoint(endpoint)?;
+    let endpoint = parse_wss_endpoint(endpoint)?.to_string();
     let new_slot = validate_reward_ip_slot(reward_ip, declared_slot)?;
     let warmup_until = updated_at
         .checked_add(ledger.settings.warmup_seconds)
@@ -9310,7 +9322,7 @@ fn apply_reward_ip_update(
         release_node_ip_slot(ledger, node_id, updated_at);
     }
     let node = ledger.nodes.get_mut(&node_id).expect("Node exists");
-    node.endpoint = endpoint.to_owned();
+    node.endpoint = endpoint;
     node.reward_ip = reward_ip.to_owned();
     node.ip_slot = new_slot.clone();
     node.status = NodeStatus::WarmingUp;

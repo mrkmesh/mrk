@@ -750,9 +750,10 @@ struct RpcOptions {
 
 impl RpcOptions {
     fn call(&self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        let endpoint = self.endpoint.as_deref().ok_or_else(|| {
-            Error::msg("this command requires --rpc-endpoint wss://<node>/v1/rpc")
-        })?;
+        let endpoint = self
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| Error::msg("this command requires --rpc-endpoint <node>"))?;
         relay_client::run_rpc_call(
             endpoint,
             method,
