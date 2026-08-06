@@ -398,7 +398,7 @@ fn validator_authenticates_and_reads_status_over_consensus_websocket() {
     .unwrap();
     paths
         .with_ledger_mut(|ledger| {
-            ledger.settings.min_service_bond = 0;
+            ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
             ledger.settings.validator_bond = 10;
             ledger.settings.warmup_seconds = 0;
@@ -542,7 +542,7 @@ fn four_independent_validators_gossip_operation_and_finalize() {
     let recipient = service::create_local_account(&paths, "recipient", password).unwrap();
     paths
         .with_ledger_mut(|ledger| {
-            ledger.settings.min_service_bond = 0;
+            ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
             ledger.settings.validator_bond = 10;
             ledger.settings.warmup_seconds = 0;

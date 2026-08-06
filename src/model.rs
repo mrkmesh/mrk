@@ -27,6 +27,14 @@ fn default_reward_vesting_seconds() -> i64 {
     180 * 86_400
 }
 
+fn default_service_bond_unlock_seconds() -> i64 {
+    30 * 86_400
+}
+
+fn default_offline_slash_seconds() -> i64 {
+    7 * 86_400
+}
+
 fn default_probe_validity_seconds() -> i64 {
     300
 }
@@ -90,7 +98,11 @@ pub struct LedgerSettings {
     pub reward_vesting_seconds: i64,
     pub validator_weight_bps: u32,
     pub validator_signature_threshold_bps: u32,
-    pub min_service_bond: u128,
+    pub required_service_bond: u128,
+    #[serde(default = "default_service_bond_unlock_seconds")]
+    pub service_bond_unlock_seconds: i64,
+    #[serde(default = "default_offline_slash_seconds")]
+    pub offline_slash_seconds: i64,
     pub warmup_seconds: i64,
     pub heartbeat_grace_seconds: i64,
     #[serde(default = "default_probe_validity_seconds")]
@@ -131,7 +143,9 @@ impl Default for LedgerSettings {
             reward_vesting_seconds: default_reward_vesting_seconds(),
             validator_weight_bps: 12_500,
             validator_signature_threshold_bps: 9_500,
-            min_service_bond: 100 * MRK_SCALE,
+            required_service_bond: 500 * MRK_SCALE,
+            service_bond_unlock_seconds: default_service_bond_unlock_seconds(),
+            offline_slash_seconds: default_offline_slash_seconds(),
             warmup_seconds: 7 * 86_400,
             heartbeat_grace_seconds: 90,
             probe_validity_seconds: default_probe_validity_seconds(),
@@ -759,6 +773,14 @@ pub struct NodeRecord {
     pub epoch_eligible_seconds: u64,
     pub total_eligible_seconds: u64,
     pub service_bond: u128,
+    #[serde(default)]
+    pub service_bond_unlock_at: Option<i64>,
+    #[serde(default)]
+    pub offline_slashed_at: Option<i64>,
+    #[serde(default)]
+    pub offline_slashed_service_bond: u128,
+    #[serde(default)]
+    pub offline_slashed_vesting_reward: u128,
     pub claimable_reward: u128,
     #[serde(default)]
     pub reward_vesting_schedules: Vec<RewardVestingSchedule>,
@@ -854,6 +876,9 @@ mod tests {
         assert_eq!(ledger.reward_immediate_bps_snapshot, 1_000);
         assert_eq!(settings.reward_vesting_seconds, 180 * 86_400);
         assert_eq!(ledger.reward_vesting_seconds_snapshot, 180 * 86_400);
+        assert_eq!(settings.service_bond_unlock_seconds, 30 * 86_400);
+        assert_eq!(settings.offline_slash_seconds, 7 * 86_400);
+        assert_eq!(settings.required_service_bond, 500 * super::MRK_SCALE);
         assert_eq!(settings.availability_verifier_count, 5);
         assert_eq!(settings.availability_quorum, 3);
         assert_eq!(settings.availability_audit_rate_bps, 500);

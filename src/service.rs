@@ -100,6 +100,12 @@ pub struct NodeRewardsView {
     pub total_eligible_seconds: u64,
     pub service_bond: u128,
     pub service_bond_display: String,
+    pub service_bond_unlock_at: Option<i64>,
+    pub offline_slashed_at: Option<i64>,
+    pub offline_slashed_service_bond: u128,
+    pub offline_slashed_service_bond_display: String,
+    pub offline_slashed_vesting_reward: u128,
+    pub offline_slashed_vesting_reward_display: String,
     pub claimable_reward: u128,
     pub claimable_reward_display: String,
     pub vesting_reward: u128,
@@ -127,6 +133,8 @@ pub struct RegistryNodeView {
     pub probe_success_count: u64,
     pub service_bond_base_units: String,
     pub service_bond_display: String,
+    pub service_bond_unlock_at: Option<i64>,
+    pub offline_slashed_at: Option<i64>,
     pub validator: bool,
     pub validator_candidate: bool,
 }
@@ -2188,7 +2196,7 @@ fn stage_consensus_candidate(
             )
             | (
                 "NodeRegistry",
-                "RegisterNode" | "UpdateRewardIp" | "DrainNode"
+                "RegisterNode" | "UpdateRewardIp" | "DrainNode" | "WithdrawServiceBond"
             )
             | ("NodeEmissionController", "ClaimNodeReward")
             | (
@@ -2442,6 +2450,10 @@ fn submit_signed_node_operation(
                     epoch_eligible_seconds: 0,
                     total_eligible_seconds: 0,
                     service_bond: 0,
+                    service_bond_unlock_at: None,
+                    offline_slashed_at: None,
+                    offline_slashed_service_bond: 0,
+                    offline_slashed_vesting_reward: 0,
                     claimable_reward: 0,
                     reward_vesting_schedules: Vec::new(),
                     validator: false,
@@ -2504,7 +2516,53 @@ fn submit_signed_node_operation(
                     &operation.unsigned.signer,
                     public_key,
                 )?;
+                ensure_node_can_drain(ledger.nodes.get(&node_id).expect("Node exists"))?;
                 ledger.nodes.get_mut(&node_id).unwrap().status = NodeStatus::Draining;
+            }
+            ("NodeRegistry", "WithdrawServiceBond") => {
+                let node_id = payload["node_id"]
+                    .as_u64()
+                    .ok_or_else(|| Error::msg("Node ID is invalid"))?;
+                ensure_replicated_node_owner(
+                    ledger,
+                    node_id,
+                    &operation.unsigned.signer,
+                    public_key,
+                )?;
+                let amount = parse_payload_u128(payload, "amount_base_units")?;
+                let declared_reward_address = payload_str(payload, "reward_address")?;
+                let node = ledger.nodes.get(&node_id).expect("Node exists");
+                if node.status != NodeStatus::Exited {
+                    return Err(Error::msg(
+                        "Service Bond can only be withdrawn after the Node has exited",
+                    ));
+                }
+                let unlock_at = node
+                    .service_bond_unlock_at
+                    .ok_or_else(|| Error::msg("Service Bond is not pending unlock"))?;
+                if now < unlock_at {
+                    return Err(Error::msg(format!(
+                        "Service Bond remains locked until {unlock_at}"
+                    )));
+                }
+                if amount == 0 || amount != node.service_bond {
+                    return Err(Error::msg("Service Bond withdrawal amount is invalid"));
+                }
+                if declared_reward_address != node.reward_address {
+                    return Err(Error::msg(
+                        "Service Bond reward address does not match Node",
+                    ));
+                }
+                let reward_address = node.reward_address.clone();
+                let node = ledger.nodes.get_mut(&node_id).expect("Node exists");
+                node.service_bond = 0;
+                node.service_bond_unlock_at = None;
+                let account = ledger.accounts.entry(reward_address.clone()).or_default();
+                account.liquid = account
+                    .liquid
+                    .checked_add(amount)
+                    .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
+                add_history(ledger, &reward_address, &operation_id_value);
             }
             ("NodeEmissionController", "ClaimNodeReward") => {
                 let node_id = payload["node_id"]
@@ -2572,7 +2630,19 @@ fn submit_signed_node_operation(
                 let unlock_at = payload["unlock_at"]
                     .as_i64()
                     .ok_or_else(|| Error::msg("Validator unlock time is invalid"))?;
+                let expected_unlock_at = executed_at
+                    .checked_add(VALIDATOR_BOND_UNLOCK_SECONDS)
+                    .ok_or_else(|| Error::msg("Validator Bond unlock timestamp overflow"))?;
                 let node = ledger.nodes.get_mut(&node_id).unwrap();
+                if node.validator_bond == 0 {
+                    return Err(Error::msg("node has no Validator Bond"));
+                }
+                if node.validator_exit_requested_at.is_some() {
+                    return Err(Error::msg("validator exit is already pending"));
+                }
+                if unlock_at != expected_unlock_at {
+                    return Err(Error::msg("Validator Bond unlock timestamp is invalid"));
+                }
                 node.validator_exit_requested_at = Some(executed_at);
                 node.validator_bond_unlock_at = Some(unlock_at);
             }
@@ -2587,20 +2657,35 @@ fn submit_signed_node_operation(
                     public_key,
                 )?;
                 let amount = parse_payload_u128(payload, "amount_base_units")?;
-                let reward_address = payload_str(payload, "reward_address")?.to_owned();
-                let node = ledger.nodes.get_mut(&node_id).unwrap();
-                if node.validator || node.validator_bond != amount {
+                let declared_reward_address = payload_str(payload, "reward_address")?;
+                let node = ledger.nodes.get(&node_id).expect("Node exists");
+                let unlock_at = node
+                    .validator_bond_unlock_at
+                    .ok_or_else(|| Error::msg("validator exit has not been requested"))?;
+                if now < unlock_at {
+                    return Err(Error::msg(format!(
+                        "Validator Bond remains locked until {unlock_at}"
+                    )));
+                }
+                if node.validator || amount == 0 || node.validator_bond != amount {
                     return Err(Error::msg("Validator Bond is not withdrawable"));
                 }
+                if declared_reward_address != node.reward_address {
+                    return Err(Error::msg(
+                        "Validator Bond reward address does not match Node",
+                    ));
+                }
+                let reward_address = node.reward_address.clone();
+                let node = ledger.nodes.get_mut(&node_id).expect("Node exists");
                 node.validator_bond = 0;
                 node.validator_candidate_since = None;
                 node.validator_exit_requested_at = None;
                 node.validator_bond_unlock_at = None;
-                ledger
-                    .accounts
-                    .entry(reward_address.clone())
-                    .or_default()
-                    .liquid += amount;
+                let account = ledger.accounts.entry(reward_address.clone()).or_default();
+                account.liquid = account
+                    .liquid
+                    .checked_add(amount)
+                    .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
                 add_history(ledger, &reward_address, &operation_id_value);
             }
             ("Availability", "AttestProbe") => {
@@ -3983,6 +4068,10 @@ pub fn register_node(
             epoch_eligible_seconds: 0,
             total_eligible_seconds: 0,
             service_bond: 0,
+            service_bond_unlock_at: None,
+            offline_slashed_at: None,
+            offline_slashed_service_bond: 0,
+            offline_slashed_vesting_reward: 0,
             claimable_reward: 0,
             reward_vesting_schedules: Vec::new(),
             validator: false,
@@ -4132,6 +4221,12 @@ pub fn node_rewards(paths: &DataPaths, name: &str) -> Result<NodeRewardsView> {
         total_eligible_seconds: node.total_eligible_seconds,
         service_bond: node.service_bond,
         service_bond_display: format_mrk(node.service_bond),
+        service_bond_unlock_at: node.service_bond_unlock_at,
+        offline_slashed_at: node.offline_slashed_at,
+        offline_slashed_service_bond: node.offline_slashed_service_bond,
+        offline_slashed_service_bond_display: format_mrk(node.offline_slashed_service_bond),
+        offline_slashed_vesting_reward: node.offline_slashed_vesting_reward,
+        offline_slashed_vesting_reward_display: format_mrk(node.offline_slashed_vesting_reward),
         claimable_reward: node.claimable_reward,
         claimable_reward_display: format_mrk(node.claimable_reward),
         vesting_reward,
@@ -4211,9 +4306,10 @@ pub fn drain_node(paths: &DataPaths, name: &str, password: &str, now: i64) -> Re
             .nodes
             .get(&node_id)
             .ok_or_else(|| Error::msg("registered node is missing from the ledger"))?;
-        if matches!(node.status, NodeStatus::Draining | NodeStatus::Exited) {
-            return Err(Error::msg("node is already draining or exited"));
+        if node.owner_address != owner_file.address {
+            return Err(Error::msg("Node Owner key does not match the registry"));
         }
+        ensure_node_can_drain(node)?;
         let nonce = ledger.accounts[&owner_file.address].nonce + 1;
         let payload = json!({"node_id": node_id});
         let signed = sign_operation(
@@ -4230,6 +4326,75 @@ pub fn drain_node(paths: &DataPaths, name: &str, password: &str, now: i64) -> Re
         ledger.nodes.get_mut(&node_id).expect("node").status = NodeStatus::Draining;
         finalize_operation(ledger, &signed, &operation_id, now)?;
         Ok(operation_id)
+    })
+}
+
+pub fn withdraw_service_bond(
+    paths: &DataPaths,
+    name: &str,
+    password: &str,
+    now: i64,
+) -> Result<(String, u128)> {
+    let config = paths.read_node_config(name)?;
+    let node_id = config
+        .node_id
+        .ok_or_else(|| Error::msg("node is not registered"))?;
+    let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
+    let owner_key = decrypt_key(&owner_file, password)?;
+    paths.with_ledger_mut(|ledger| {
+        let node = ledger
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| Error::msg("registered node is missing from the ledger"))?;
+        if node.owner_address != owner_file.address {
+            return Err(Error::msg("Node Owner key does not match the registry"));
+        }
+        if node.status != NodeStatus::Exited {
+            return Err(Error::msg(
+                "Service Bond can only be withdrawn after the Node has exited",
+            ));
+        }
+        let unlock_at = node
+            .service_bond_unlock_at
+            .ok_or_else(|| Error::msg("Service Bond is not pending unlock"))?;
+        if now < unlock_at {
+            return Err(Error::msg(format!(
+                "Service Bond remains locked until {unlock_at}"
+            )));
+        }
+        let amount = node.service_bond;
+        if amount == 0 {
+            return Err(Error::msg("node has no Service Bond to withdraw"));
+        }
+        let reward_address = node.reward_address.clone();
+        let nonce = ledger.accounts[&owner_file.address].nonce + 1;
+        let payload = json!({
+            "node_id": node_id,
+            "amount_base_units": amount.to_string(),
+            "reward_address": reward_address,
+        });
+        let signed = sign_operation(
+            ledger,
+            (&owner_file, &owner_key),
+            "NodeRegistry",
+            "WithdrawServiceBond",
+            nonce,
+            now + DEFAULT_OPERATION_VALIDITY_SECONDS,
+            payload,
+        )?;
+        let operation_id = operation_id(&signed)?;
+        verify_operation(&signed, &owner_file.public_key)?;
+        let node = ledger.nodes.get_mut(&node_id).expect("Node exists");
+        node.service_bond = 0;
+        node.service_bond_unlock_at = None;
+        let account = ledger.accounts.entry(reward_address.clone()).or_default();
+        account.liquid = account
+            .liquid
+            .checked_add(amount)
+            .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
+        finalize_operation(ledger, &signed, &operation_id, now)?;
+        add_history(ledger, &reward_address, &operation_id);
+        Ok((operation_id, amount))
     })
 }
 
@@ -4849,6 +5014,8 @@ fn registry_node_view(node: &NodeRecord, settings: &LedgerSettings) -> RegistryN
         probe_success_count: node.probe_success_count,
         service_bond_base_units: node.service_bond.to_string(),
         service_bond_display: format_mrk(node.service_bond),
+        service_bond_unlock_at: node.service_bond_unlock_at,
+        offline_slashed_at: node.offline_slashed_at,
         validator: node.validator,
         validator_candidate: node.validator_candidate_since.is_some()
             && node.validator_exit_requested_at.is_none()
@@ -5000,7 +5167,9 @@ pub fn request_validator_exit(
             return Err(Error::msg("validator exit is already pending"));
         }
         let account = ledger.accounts[&owner_file.address].clone();
-        let unlock_at = now + VALIDATOR_BOND_UNLOCK_SECONDS;
+        let unlock_at = now
+            .checked_add(VALIDATOR_BOND_UNLOCK_SECONDS)
+            .ok_or_else(|| Error::msg("Validator Bond unlock timestamp overflow"))?;
         let payload = json!({"node_id": node_id, "unlock_at": unlock_at});
         let signed = sign_operation(
             ledger,
@@ -5055,6 +5224,9 @@ pub fn withdraw_validator_bond(
             ));
         }
         let amount = node.validator_bond;
+        if amount == 0 {
+            return Err(Error::msg("node has no Validator Bond to withdraw"));
+        }
         let reward_address = node.reward_address.clone();
         let account = ledger.accounts[&owner_file.address].clone();
         let payload = json!({
@@ -5078,11 +5250,11 @@ pub fn withdraw_validator_bond(
         node.validator_candidate_since = None;
         node.validator_exit_requested_at = None;
         node.validator_bond_unlock_at = None;
-        ledger
-            .accounts
-            .entry(reward_address.clone())
-            .or_default()
-            .liquid += amount;
+        let account = ledger.accounts.entry(reward_address.clone()).or_default();
+        account.liquid = account
+            .liquid
+            .checked_add(amount)
+            .ok_or_else(|| Error::msg("Reward account balance overflow"))?;
         finalize_operation(ledger, &signed, &operation_id, now)?;
         add_history(ledger, &reward_address, &operation_id);
         Ok((operation_id, amount))
@@ -6124,7 +6296,8 @@ fn prepare_block_operations(
         operation.status = OperationStatus::Finalized;
         operation.block_height = Some(height);
     }
-    finalize_draining_nodes(&mut simulated, timestamp);
+    finalize_offline_nodes(&mut simulated, timestamp)?;
+    finalize_draining_nodes(&mut simulated, timestamp)?;
     simulated.pending_operation_ids.clear();
     Ok((simulated, operation_ids.to_vec()))
 }
@@ -6231,7 +6404,8 @@ fn replay_block_operations(
         operation.status = OperationStatus::Finalized;
         operation.block_height = Some(height);
     }
-    finalize_draining_nodes(&mut state, timestamp);
+    finalize_offline_nodes(&mut state, timestamp)?;
+    finalize_draining_nodes(&mut state, timestamp)?;
     state.pending_operation_ids.clear();
     Ok((state, accepted))
 }
@@ -7990,6 +8164,23 @@ fn ensure_replicated_node_owner(
     Ok(())
 }
 
+fn ensure_node_can_drain(node: &NodeRecord) -> Result<()> {
+    if matches!(node.status, NodeStatus::Draining | NodeStatus::Exited) {
+        return Err(Error::msg("node is already draining or exited"));
+    }
+    if node.validator
+        || node.validator_bond > 0
+        || node.validator_candidate_since.is_some()
+        || node.validator_exit_requested_at.is_some()
+        || node.validator_bond_unlock_at.is_some()
+    {
+        return Err(Error::msg(
+            "Validator role and Validator Bond must be fully exited and withdrawn before draining the Node",
+        ));
+    }
+    Ok(())
+}
+
 fn apply_replicated_governance_terminal_action(
     ledger: &mut LedgerState,
     public_key: &str,
@@ -8144,6 +8335,8 @@ fn governance_parameter_is_critical(parameter: &str) -> bool {
             | "epoch-mint-amount"
             | "reward-immediate-bps"
             | "reward-vesting-seconds"
+            | "service-bond-unlock-seconds"
+            | "offline-slash-seconds"
             | "warmup-seconds"
             | "validator-weight-bps"
             | "validator-signature-threshold-bps"
@@ -8512,7 +8705,7 @@ fn governance_eligible_node_ids(ledger: &LedgerState, now: i64) -> Vec<u64> {
             });
             (matches!(node.status, NodeStatus::Active)
                 && node_owns_ip_slot_at(ledger, *node_id, now)
-                && node.service_bond >= ledger.settings.min_service_bond
+                && node.service_bond >= ledger.settings.required_service_bond
                 && node.total_eligible_seconds >= ledger.settings.governance_min_service_seconds
                 && probe_fresh)
                 .then_some(*node_id)
@@ -8586,14 +8779,28 @@ fn set_governance_parameter(
             settings.validator_signature_threshold_bps = parsed;
             (old.to_string(), parsed.to_string())
         }
-        "min-service-bond" => {
+        "required-service-bond" => {
             let parsed = parse_mrk(value)?;
             if parsed > MAX_SUPPLY {
-                return Err(Error::msg("min-service-bond must not exceed MAX_SUPPLY"));
+                return Err(Error::msg(
+                    "required-service-bond must not exceed MAX_SUPPLY",
+                ));
             }
-            let old = settings.min_service_bond;
-            settings.min_service_bond = parsed;
+            let old = settings.required_service_bond;
+            settings.required_service_bond = parsed;
             (format_mrk(old), format_mrk(parsed))
+        }
+        "service-bond-unlock-seconds" => {
+            let parsed = integer(value, parameter, 0, 365 * 86_400)? as i64;
+            let old = settings.service_bond_unlock_seconds;
+            settings.service_bond_unlock_seconds = parsed;
+            (old.to_string(), parsed.to_string())
+        }
+        "offline-slash-seconds" => {
+            let parsed = integer(value, parameter, 3_600, 365 * 86_400)? as i64;
+            let old = settings.offline_slash_seconds;
+            settings.offline_slash_seconds = parsed;
+            (old.to_string(), parsed.to_string())
         }
         "warmup-seconds" => {
             let parsed = integer(value, parameter, 0, 365 * 86_400)? as i64;
@@ -9109,7 +9316,9 @@ fn apply_reward_ip_update(
     node.status = NodeStatus::WarmingUp;
     node.warmup_until = warmup_until;
     node.active_since = None;
-    node.last_probe_success = None;
+    // Keep the previous finalized proof as the offline-slash clock until the new
+    // address obtains its first successful proof. Status still prevents discovery,
+    // rewards, governance, and Validator eligibility during warmup.
 
     let retained_binding = old_slot == new_slot
         && ledger
@@ -9124,7 +9333,7 @@ fn apply_reward_ip_update(
     Ok(())
 }
 
-fn finalize_draining_nodes(ledger: &mut LedgerState, finalized_at: i64) {
+fn finalize_draining_nodes(ledger: &mut LedgerState, finalized_at: i64) -> Result<()> {
     let draining = ledger
         .nodes
         .iter()
@@ -9133,6 +9342,21 @@ fn finalize_draining_nodes(ledger: &mut LedgerState, finalized_at: i64) {
         })
         .collect::<Vec<_>>();
     for node_id in draining {
+        let forfeited_reward =
+            node_vesting_reward(ledger.nodes.get(&node_id).expect("draining Node exists"))?;
+        let service_bond_unlock_at = if ledger.nodes[&node_id].service_bond > 0 {
+            Some(
+                finalized_at
+                    .checked_add(ledger.settings.service_bond_unlock_seconds)
+                    .ok_or_else(|| Error::msg("Service Bond unlock timestamp overflow"))?,
+            )
+        } else {
+            None
+        };
+        ledger.treasury = ledger
+            .treasury
+            .checked_add(forfeited_reward)
+            .ok_or_else(|| Error::msg("Treasury balance overflow"))?;
         release_node_ip_slot(ledger, node_id, finalized_at);
         let node = ledger
             .nodes
@@ -9140,7 +9364,71 @@ fn finalize_draining_nodes(ledger: &mut LedgerState, finalized_at: i64) {
             .expect("draining Node exists");
         node.status = NodeStatus::Exited;
         node.last_heartbeat = None;
+        node.reward_vesting_schedules.clear();
+        node.service_bond_unlock_at = service_bond_unlock_at;
     }
+    Ok(())
+}
+
+fn finalize_offline_nodes(ledger: &mut LedgerState, finalized_at: i64) -> Result<()> {
+    if ledger.settings.offline_slash_seconds < 0 {
+        return Err(Error::msg("offline slash duration cannot be negative"));
+    }
+    let offline = ledger
+        .nodes
+        .iter()
+        .filter_map(|(node_id, node)| {
+            if !matches!(
+                node.status,
+                NodeStatus::WarmingUp | NodeStatus::Active | NodeStatus::Draining
+            ) {
+                return None;
+            }
+            let last_probe_success = node.last_probe_success?;
+            let slash_at = last_probe_success.checked_add(ledger.settings.offline_slash_seconds)?;
+            (finalized_at >= slash_at).then_some(*node_id)
+        })
+        .collect::<Vec<_>>();
+
+    if offline.is_empty() {
+        return Ok(());
+    }
+    let offline_set = offline.iter().copied().collect::<BTreeSet<_>>();
+    for node_id in offline {
+        let node = ledger.nodes.get(&node_id).expect("offline Node exists");
+        let slashed_service_bond = node.service_bond;
+        let slashed_vesting_reward = node_vesting_reward(node)?;
+        let total_slashed = slashed_service_bond
+            .checked_add(slashed_vesting_reward)
+            .ok_or_else(|| Error::msg("offline slash amount overflow"))?;
+        ledger.treasury = ledger
+            .treasury
+            .checked_add(total_slashed)
+            .ok_or_else(|| Error::msg("Treasury balance overflow"))?;
+        release_node_ip_slot(ledger, node_id, finalized_at);
+        let node = ledger.nodes.get_mut(&node_id).expect("offline Node exists");
+        node.status = NodeStatus::Exited;
+        node.last_heartbeat = None;
+        node.service_bond = 0;
+        node.service_bond_unlock_at = None;
+        node.reward_vesting_schedules.clear();
+        node.offline_slashed_at = Some(finalized_at);
+        node.offline_slashed_service_bond = node
+            .offline_slashed_service_bond
+            .checked_add(slashed_service_bond)
+            .ok_or_else(|| Error::msg("slashed Service Bond total overflow"))?;
+        node.offline_slashed_vesting_reward = node
+            .offline_slashed_vesting_reward
+            .checked_add(slashed_vesting_reward)
+            .ok_or_else(|| Error::msg("slashed vesting reward total overflow"))?;
+        node.validator = false;
+    }
+    ledger
+        .consensus
+        .active_validators
+        .retain(|node_id| !offline_set.contains(node_id));
+    fallback_to_node1_availability_if_needed(ledger);
+    Ok(())
 }
 
 /// Applies deterministic Epoch transitions while constructing or replaying a block post-state.
@@ -9260,10 +9548,10 @@ fn settle_one_epoch(ledger: &mut LedgerState, epoch_end: i64) -> Result<()> {
     for allocation in allocations.iter_mut().take(leftover_count) {
         allocation.1 += 1;
     }
-    let min_bond = ledger.settings.min_service_bond;
+    let required_bond = ledger.settings.required_service_bond;
     for (node_id, reward, _) in allocations {
         let node = ledger.nodes.get_mut(&node_id).expect("weighted node");
-        let bond_needed = min_bond.saturating_sub(node.service_bond);
+        let bond_needed = required_bond.saturating_sub(node.service_bond);
         let to_bond = reward.min(bond_needed);
         node.service_bond += to_bond;
         let liquid_reward = reward - to_bond;
@@ -9370,7 +9658,7 @@ mod tests {
     #[test]
     fn conflicting_ip_slot_has_only_one_governance_eligible_owner() {
         let mut ledger = LedgerState::default();
-        ledger.settings.min_service_bond = 0;
+        ledger.settings.required_service_bond = 0;
         ledger.settings.governance_min_service_seconds = 0;
         let mut owner = availability_test_node(1);
         owner.last_probe_success = Some(100);
@@ -9384,6 +9672,22 @@ mod tests {
         assert!(bind_ip_slot_if_available(&mut ledger, &slot, 1, 0));
         assert!(!bind_ip_slot_if_available(&mut ledger, &slot, 2, 100));
         assert_eq!(governance_eligible_node_ids(&ledger, 100), vec![1]);
+    }
+
+    #[test]
+    fn validator_state_must_be_cleared_before_node_drain() {
+        let mut node = availability_test_node(1);
+        assert!(ensure_node_can_drain(&node).is_err());
+
+        node.validator = false;
+        node.validator_bond = 1;
+        assert!(ensure_node_can_drain(&node).is_err());
+
+        node.validator_bond = 0;
+        node.validator_candidate_since = None;
+        node.validator_exit_requested_at = None;
+        node.validator_bond_unlock_at = None;
+        assert!(ensure_node_can_drain(&node).is_ok());
     }
 
     fn availability_test_node(node_id: u64) -> NodeRecord {
@@ -9409,6 +9713,10 @@ mod tests {
             epoch_eligible_seconds: 0,
             total_eligible_seconds: 0,
             service_bond: 0,
+            service_bond_unlock_at: None,
+            offline_slashed_at: None,
+            offline_slashed_service_bond: 0,
+            offline_slashed_vesting_reward: 0,
             claimable_reward: 0,
             reward_vesting_schedules: Vec::new(),
             validator: true,
@@ -9433,7 +9741,7 @@ mod tests {
         };
         ledger.settings.epoch_seconds = 300;
         ledger.settings.governance_min_service_seconds = 0;
-        ledger.settings.min_service_bond = 0;
+        ledger.settings.required_service_bond = 0;
         for node_id in 1..=7 {
             let mut node = availability_test_node(node_id);
             node.validator_bond = ledger.settings.validator_bond;
@@ -9485,7 +9793,7 @@ mod tests {
     #[test]
     fn thirty_one_seat_committee_rotates_at_most_ten_nodes_per_finalized_epoch() {
         let mut ledger = LedgerState::default();
-        ledger.settings.min_service_bond = 0;
+        ledger.settings.required_service_bond = 0;
         ledger.settings.governance_min_service_seconds = 0;
         ledger.settings.max_active_validators = 31;
         ledger.settings.max_validator_rotations = 10;
@@ -9593,7 +9901,7 @@ mod tests {
         ledger.settings.availability_slot_seconds = 60;
         ledger.settings.availability_audit_rate_bps = 10_000;
         ledger.settings.warmup_seconds = 0;
-        ledger.settings.min_service_bond = 0;
+        ledger.settings.required_service_bond = 0;
         for node_id in 1..=9 {
             let mut node = availability_test_node(node_id);
             node.owner_address = verifier_file.address.clone();
@@ -9733,6 +10041,10 @@ mod tests {
                     } else {
                         100 * crate::amount::MRK_SCALE
                     },
+                    service_bond_unlock_at: None,
+                    offline_slashed_at: None,
+                    offline_slashed_service_bond: 0,
+                    offline_slashed_vesting_reward: 0,
                     claimable_reward: 0,
                     reward_vesting_schedules: Vec::new(),
                     validator: node_id == 1,
@@ -9771,7 +10083,7 @@ mod tests {
         };
         ledger.settings.epoch_seconds = 60;
         ledger.epoch_seconds_snapshot = 60;
-        ledger.settings.min_service_bond = 10;
+        ledger.settings.required_service_bond = 10;
         ledger.nodes.insert(
             1,
             NodeRecord {
@@ -9796,6 +10108,10 @@ mod tests {
                 epoch_eligible_seconds: 60,
                 total_eligible_seconds: 60,
                 service_bond: 0,
+                service_bond_unlock_at: None,
+                offline_slashed_at: None,
+                offline_slashed_service_bond: 0,
+                offline_slashed_vesting_reward: 0,
                 claimable_reward: 0,
                 reward_vesting_schedules: Vec::new(),
                 validator: false,
@@ -9829,7 +10145,7 @@ mod tests {
             "vesting must advance only at Epoch boundaries"
         );
 
-        ledger.settings.min_service_bond = 0;
+        ledger.settings.required_service_bond = 0;
         ledger.settings.epoch_seconds = 120;
         ledger.settings.epoch_mint_amount = 450 * crate::amount::MRK_SCALE;
         ledger.settings.reward_immediate_bps = 2_000;
@@ -9874,6 +10190,10 @@ mod tests {
         let mut settings = LedgerSettings::default();
         assert!(governance_parameter_is_critical("reward-immediate-bps"));
         assert!(governance_parameter_is_critical("reward-vesting-seconds"));
+        assert!(governance_parameter_is_critical(
+            "service-bond-unlock-seconds"
+        ));
+        assert!(governance_parameter_is_critical("offline-slash-seconds"));
         assert_eq!(
             set_governance_parameter(&mut settings, "reward-immediate-bps", "2500").unwrap(),
             ("1000".to_owned(), "2500".to_owned())
@@ -9886,6 +10206,26 @@ mod tests {
         );
         assert_eq!(settings.reward_vesting_seconds, 86_400);
         assert!(set_governance_parameter(&mut settings, "reward-vesting-seconds", "0").is_err());
+        assert_eq!(
+            set_governance_parameter(&mut settings, "service-bond-unlock-seconds", "86400")
+                .unwrap(),
+            ((30 * 86_400).to_string(), "86400".to_owned())
+        );
+        assert_eq!(settings.service_bond_unlock_seconds, 86_400);
+        assert!(
+            set_governance_parameter(
+                &mut settings,
+                "service-bond-unlock-seconds",
+                &(365_i64 * 86_400 + 1).to_string(),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            set_governance_parameter(&mut settings, "offline-slash-seconds", "86400").unwrap(),
+            ((7 * 86_400).to_string(), "86400".to_owned())
+        );
+        assert_eq!(settings.offline_slash_seconds, 86_400);
+        assert!(set_governance_parameter(&mut settings, "offline-slash-seconds", "3599").is_err());
     }
 
     #[test]
@@ -9943,6 +10283,10 @@ mod tests {
             epoch_eligible_seconds: 0,
             total_eligible_seconds: 0,
             service_bond: 0,
+            service_bond_unlock_at: None,
+            offline_slashed_at: None,
+            offline_slashed_service_bond: 0,
+            offline_slashed_vesting_reward: 0,
             claimable_reward: 10,
             reward_vesting_schedules: vec![
                 RewardVestingSchedule {

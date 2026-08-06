@@ -212,6 +212,7 @@ NodeRecord {
   max_message_size
   region
   service_bond
+  service_bond_unlock_at
   registered_at
   warmup_until
   status
@@ -224,11 +225,11 @@ NodeRecord {
 
 Availability 有显式且受状态根保护的两阶段信任模型。Active Validator 少于 7 个时为 `NODE1_TRUSTED`，协议绝对信任 Node 1 的一票证明并允许 Node 1 自证；在 Epoch 边界拥有至少 7 个 Active Validator 后切换为 `MULTI_VALIDATOR`，默认 Primary 5 选 3并禁止目标自证。委员会再次低于 7 席时自动回退到 `NODE1_TRUSTED`，恢复到至少 7 席后可再次进入 `MULTI_VALIDATOR`。首次激活时间和 Epoch 作为历史记录保留，后续切换不会覆盖。
 
-去中心化阶段的 Probe Challenge 和检查时刻来自验证者 Owner Key 对 Ledger、Epoch、Slot、目标、验证者及 `PRIMARY/AUDIT` 角色的签名 Ticket。目标在收到网络请求前不能预测 Ticket。默认 5% Slot 在至少 9 个 Active Validator 时额外选择与目标及 Primary 集合互不重叠的 3 个 Auditor，并要求 2 票；被审计 Slot 只有同时达到 Primary 和 Audit 法定票数才记账。网络失败本身不可形成确定性罚没证据，只有双签等密码学冲突可处罚本金。
+去中心化阶段的 Probe Challenge 和检查时刻来自验证者 Owner Key 对 Ledger、Epoch、Slot、目标、验证者及 `PRIMARY/AUDIT` 角色的签名 Ticket。目标在收到网络请求前不能预测 Ticket。默认 5% Slot 在至少 9 个 Active Validator 时额外选择与目标及 Primary 集合互不重叠的 3 个 Auditor，并要求 2 票；被审计 Slot 只有同时达到 Primary 和 Audit 法定票数才记账。单次网络失败不触发罚没；连续达到治理阈值仍缺少终局成功证明时，状态机才罚没 Service Bond。Validator Bond 仍只应由双签等密码学冲突证据处罚。
 
 上述状态结构、Ticket 域和 `mrk-probe-v1` Payload 属于尚未正式发布的协议版本 1。IP Slot 所有权、Reward IP 更新以及退出释放均属于 v1 发布前的确定性区块状态转换。发布前可直接调整协议及磁盘格式，不提供早期开发数据的兼容或静默迁移；已有测试数据应重建，或通过显式可信 Bootstrap 替换。
 
-注册和开始运行不要求预先持有 MRK。节点最初获得的在线时长奖励优先形成 Service Bond；Bond 只能约束有客观证据的违规，不能证明节点一定快速或稳定。
+注册和开始运行不要求预先持有 MRK。节点最初获得的在线时长奖励优先形成默认 500 MRK 的 Service Bond；Bond 只能约束有客观证据的违规，不能证明节点一定快速或稳定。
 
 ### 5.2 发现接口
 
@@ -256,7 +257,9 @@ Indexer 可以缓存这些终局结果并附加区域、延迟等部署数据，
 4. 转发 `DATA`，执行限流和背压，累计可计费 payload 字节。
 5. 定期请求付款凭证，保留每个会话最新有效凭证。
 
-退出时先进入 `draining`，停止接收新连接；已有连接结束并完成结算后，经过解锁期取回由奖励形成的 Service Bond。
+Owner 签署 `DrainNode` 后先进入 `DRAINING`，该操作所在区块终局时确定性转为 `EXITED` 并释放 IP Slot。已经归属的 `claimable_reward` 保留，尚未归属的线性释放余额退回 Treasury。由奖励形成的 Service Bond 从终局时间起默认锁定 30 天，之后由 Owner 签署 `WithdrawServiceBond` 转入 Reward 账户。若 Node 是 Validator，必须先退出委员会并取回 Validator Bond。
+
+连续 7 天没有新的终局 Availability 成功证明属于可客观重放的长期离线。下一终局区块会强制该 Node 退出并释放 IP Slot，将 Service Bond 与尚未归属的线性奖励一并转入 Treasury，且不建立 Bond 解锁时间；已经归属的奖励不罚没。阈值由 Critical 参数 `offline-slash-seconds` 控制，本机 Heartbeat 不作为证据。没有终局区块时协议时间不推进，罚没只能在共识恢复后执行。
 
 ### 5.4 Validator 委员会与共识接口
 
@@ -439,6 +442,7 @@ mrk node probe --target-node-id 1 --watch
 mrk node rewards
 mrk node claim
 mrk node drain
+mrk node withdraw-service-bond
 ```
 
 启动顺序固定为先 `init`，再启动常驻 `run`。Genesis Node 1 可直接 `register`；其余 Node 必须先执行 `bootstrap`，再 `register`。Bootstrap 通过公开 WSS 下载终局检查点，但只有完整 `state_` SHA-256 根与操作者从独立可信渠道取得的固定值一致才原子安装；不能把提供快照的同一 Peer 当成根的信任来源。守护进程保存 Bootstrap Peer，把本地签名注册 Operation 提交给它，并持续拉取公开 Catch-up 数据；每次安装仍验证链连续性、委员会连续、Commit Certificate、Operation 签名和最终状态根。落后超过 4,096 Block 或越过 Peer 的裁剪边界时必须重新取得并显式固定更新的检查点。`run` 在未注册阶段只监听本地 Unix Socket；注册成功后才启用公网 WSS Listener。此后全部 `mrk node` 管理命令都经该 Socket 执行。

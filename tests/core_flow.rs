@@ -28,7 +28,7 @@ fn node_reward_transfer_and_private_network_flow() {
             ledger.settings.availability_slot_seconds = slot_seconds;
             ledger.settings.warmup_seconds = 0;
             ledger.settings.heartbeat_grace_seconds = 120;
-            ledger.settings.min_service_bond = 0;
+            ledger.settings.required_service_bond = 0;
             Ok(())
         })
         .unwrap();

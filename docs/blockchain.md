@@ -168,15 +168,19 @@ MVP 固定 `IP_REUSE_COOLDOWN = 7 days`。
 新 Node 不需要预先持有 MRK，也不以质押作为开始运行 Relay 的前提。节点最初获得的在线时长奖励优先形成协议要求的自有 Service Bond；达到最低 Bond 后，后续奖励才进入 Liquid MRK。
 
 ```text
-MIN_SERVICE_BOND = 100 MRK
+REQUIRED_SERVICE_BOND = 500 MRK
 
 node_uptime_reward
-  -> until 100 MRK Service Bond: 100% Service Bond
-  -> after MIN_SERVICE_BOND: 10% immediately claimable Liquid MRK
-  -> after MIN_SERVICE_BOND: 90% linearly vested over 180 days
+  -> until 500 MRK Service Bond: 100% Service Bond
+  -> after REQUIRED_SERVICE_BOND: 10% immediately claimable Liquid MRK
+  -> after REQUIRED_SERVICE_BOND: 90% linearly vested over 180 days
 ```
 
-MVP 最低 Service Bond 为 100 MRK。退出解锁期仍属于节点治理参数，但不得阻止零 MRK 新节点开始累计在线时长。奖励先补足 Service Bond；剩余 Liquid 部分使用当前 Epoch 的 `reward-immediate-bps` 与 `reward-vesting-seconds` 快照拆分。默认立即释放 `1,000 bps = 10%`，其余 90% 从该 Epoch 结算边界开始，在 180 天内线性释放。
+MVP 要求的 Service Bond 为 500 MRK。Node 的 `DrainNode` 操作终局时进入 `EXITED`：已经进入 `claimable_reward` 的奖励仍归 Node，所有尚未归属的线性释放余额原子退回 Treasury，释放批次随即清空；这只是已铸 MRK 的状态转移，不回补节点发行池，也不改变 `lifetime_minted`。Service Bond 从该终局区块时间起按 `service-bond-unlock-seconds` 延迟解锁，默认 30 天，解锁后必须由 Owner Key 签署 `WithdrawServiceBond` 才能转入 Reward 账户。持有 Validator 身份或尚未取回 Validator Bond 的 Node 不得开始 Drain。
+
+恶意停机使用终局 Availability 证明而非本机 Heartbeat 判断。具有历史成功证明的 `WARMING_UP`、`ACTIVE` 或 `DRAINING` Node，如果从 `last_probe_success` 起连续 `offline-slash-seconds` 没有新的终局成功证明，默认 7 天，则在下一终局区块中被强制置为 `EXITED` 并释放 IP Slot；全部 Service Bond 和尚未归属的线性释放余额原子转入 Treasury，Bond 不产生解锁时间，已归属的 `claimable_reward` 仍保留。该区块会记录罚没时间、Service Bond 数额和线性奖励数额。Reward IP 更新保留旧证明作为罚没计时基准，直到新地址取得首个成功证明，避免通过反复换 IP 重置离线时钟。若全网无法产生终局区块，状态机无法单独推进时间或执行罚没；恢复终局后由首个达到阈值的区块执行。
+
+奖励先补足 Service Bond；剩余 Liquid 部分使用当前 Epoch 的 `reward-immediate-bps` 与 `reward-vesting-seconds` 快照拆分。默认立即释放 `1,000 bps = 10%`，其余 90% 从该 Epoch 结算边界开始，在 180 天内线性释放。
 
 ### 5.4 Node 1
 
@@ -476,7 +480,9 @@ mrk node --node <node-name> governance propose-set \
 | `reward-vesting-seconds` | `15,552,000` | `1..=315,360,000` 秒 | Critical | 当前 Epoch 不变，从下一个 Epoch 快照生效；已建立批次期限不变 |
 | `validator-weight-bps` | `12,500` | `10,000..=20,000` bps，即 `1.00x..=2.00x` | Critical | 无 |
 | `validator-signature-threshold-bps` | `9,500` | `5,000..=10,000` bps，即 `50%..=100%` | Critical | 无 |
-| `min-service-bond` | `100MRK` | `0..=MAX_SUPPLY` | Standard | 修改后会重新影响 Governance-Eligible 资格 |
+| `required-service-bond` | `500MRK` | `0..=MAX_SUPPLY` | Standard | 修改后会重新影响 Governance-Eligible 资格和后续奖励的 Bond 补足目标 |
+| `service-bond-unlock-seconds` | `2,592,000` | `0..=31,536,000` 秒 | Critical | 只在后续 `DrainNode` 终局时快照为该 Node 的解锁时间；已有解锁时间不变 |
+| `offline-slash-seconds` | `604,800` | `3,600..=31,536,000` 秒 | Critical | 从 Node 最近一次终局成功 Availability Probe 起计算；达到阈值的终局区块强制退出并罚没 Service Bond 与未归属奖励 |
 | `warmup-seconds` | `604,800` | `0..=31,536,000` 秒 | Critical | 只写入修改后注册的非 Genesis Node 的 `warmup_until`，不追溯修改现有 Node |
 | `heartbeat-grace-seconds` | `90` | `10..=3,600` 秒 | Standard | 无 |
 | `probe-validity-seconds` | `300` | `30..=3,600` 秒，且不得短于 `availability-slot-seconds` | Standard | 修改后会重新影响 Probe 新鲜度和 Governance-Eligible 资格 |
@@ -640,7 +646,7 @@ MSL 不使用 Gas。每种有成本或可被滥用的财务/治理操作使用�
 ## 12. 正式实现前必须确定
 
 1. Probe 的地理分布、随机来源和一个 Relay 实例被认定为独立可服务节点的客观资源条件；
-2. Service Bond 的退出解锁期；Validator Bond 当前采用 30 天；
+2. Service Bond 除长期缺少终局 Availability 证明外的客观罚没证据，以及 Validator Bond 的治理处置流程；两者主动退出解锁期当前默认均为 30 天；
 3. 流量结算中的 Relay、Treasury 和 Burn 分成比例；
 4. MSL 跨节点状态编码、快照格式、数据保留周期和 Catch-up 协议；
 5. 单签名阶段的账户余额、单笔结算和系统总锁仓上限；

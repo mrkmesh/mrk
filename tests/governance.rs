@@ -60,7 +60,7 @@ fn node1_direct_governance_switches_at_twenty_eligible_nodes_and_restores() {
 
     paths
         .with_ledger_mut(|ledger| {
-            ledger.settings.min_service_bond = 0;
+            ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
             ledger.settings.heartbeat_grace_seconds = 120;
             ledger.settings.probe_validity_seconds = 300;

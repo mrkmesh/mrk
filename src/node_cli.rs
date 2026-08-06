@@ -224,6 +224,7 @@ pub(crate) enum DaemonCommand {
         interval_seconds: u64,
     },
     Claim,
+    WithdrawServiceBond,
     Drain,
     Block {
         #[command(subcommand)]
@@ -445,7 +446,9 @@ fn governance_parameter_parser(value: &str) -> std::result::Result<String, Strin
         "reward-vesting-seconds",
         "validator-weight-bps",
         "validator-signature-threshold-bps",
-        "min-service-bond",
+        "required-service-bond",
+        "service-bond-unlock-seconds",
+        "offline-slash-seconds",
         "warmup-seconds",
         "heartbeat-grace-seconds",
         "probe-validity-seconds",
@@ -1348,12 +1351,20 @@ fn execute_daemon_command(
             let rewards = service::node_rewards(paths, &cli.node)?;
             print_value(cli.output, &rewards, || {
                 format!(
-                    "Node ID: {}\nStatus: {}\nEpoch seconds: {}\nTotal seconds: {}\nService Bond: {}\nClaimable: {}\nVesting: {}\nVesting schedules: {}",
+                    "Node ID: {}\nStatus: {}\nEpoch seconds: {}\nTotal seconds: {}\nService Bond: {}\nService Bond unlock at: {}\nOffline slashed at: {}\nSlashed Service Bond: {}\nSlashed vesting: {}\nClaimable: {}\nVesting: {}\nVesting schedules: {}",
                     rewards.node_id,
                     rewards.status,
                     rewards.epoch_eligible_seconds,
                     rewards.total_eligible_seconds,
                     rewards.service_bond_display,
+                    rewards
+                        .service_bond_unlock_at
+                        .map_or_else(|| "not scheduled".to_owned(), |value| value.to_string()),
+                    rewards
+                        .offline_slashed_at
+                        .map_or_else(|| "never".to_owned(), |value| value.to_string()),
+                    rewards.offline_slashed_service_bond_display,
+                    rewards.offline_slashed_vesting_reward_display,
                     rewards.claimable_reward_display,
                     rewards.vesting_reward_display,
                     rewards.vesting_schedule_count,
@@ -1414,6 +1425,29 @@ fn execute_daemon_command(
                 || {
                     format!(
                         "SUBMITTED\nOperation: {operation_id}\nClaimed: {}",
+                        format_mrk(amount)
+                    )
+                },
+            )?;
+        }
+        DaemonCommand::WithdrawServiceBond => {
+            let password = read_password("Node Owner password: ")?;
+            let (operation_id, amount) = service::withdraw_service_bond(
+                paths,
+                &cli.node,
+                &password,
+                Utc::now().timestamp(),
+            )?;
+            print_value(
+                cli.output,
+                &serde_json::json!({
+                    "operation_id": operation_id,
+                    "amount_base_units": amount.to_string(),
+                    "status": "PENDING",
+                }),
+                || {
+                    format!(
+                        "SUBMITTED\nOperation: {operation_id}\nWithdrawn Service Bond: {}",
                         format_mrk(amount)
                     )
                 },

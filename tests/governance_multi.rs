@@ -49,7 +49,7 @@ fn critical_governance_uses_snapshot_power_timelock_and_cancels_below_twenty() {
     register(&paths, "node2", password, "wss://8.8.8.8/v1/relay", now);
     paths
         .with_ledger_mut(|ledger| {
-            ledger.settings.min_service_bond = 0;
+            ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
             ledger.settings.heartbeat_grace_seconds = 120;
             ledger.settings.probe_validity_seconds = 300;

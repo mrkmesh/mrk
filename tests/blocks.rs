@@ -1,6 +1,6 @@
 use chrono::Utc;
 use mrk::{
-    model::{IpSlotRecord, NodeStatus, OperationStatus},
+    model::{IpSlotRecord, NodeStatus, OperationStatus, RewardVestingSchedule},
     service,
     storage::DataPaths,
 };
@@ -31,11 +31,30 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
         .with_ledger_mut(|ledger| {
             ledger.settings.warmup_seconds = 0;
             ledger.settings.ip_reuse_cooldown_seconds = 10;
+            ledger.settings.service_bond_unlock_seconds = 20;
             Ok(())
         })
         .unwrap();
 
     register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
+    let (treasury_before_exit, pool_before_exit, lifetime_minted_before_exit) = paths
+        .with_ledger_mut(|ledger| {
+            let node = ledger.nodes.get_mut(&1).unwrap();
+            node.service_bond = 100;
+            node.claimable_reward = 10;
+            node.reward_vesting_schedules = vec![RewardVestingSchedule {
+                total_amount: 90,
+                released_amount: 30,
+                starts_at: now,
+                ends_at: now + 1_000,
+            }];
+            Ok((
+                ledger.treasury,
+                ledger.pool_remaining,
+                ledger.lifetime_minted,
+            ))
+        })
+        .unwrap();
     service::produce_node1_block(&paths, "node1", password, false, now + 1).unwrap();
 
     let conflicting = register(&paths, "node2", password, "wss://1.1.1.1/v1/relay", now + 2);
@@ -76,6 +95,13 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
     service::produce_node1_block(&paths, "node1", password, false, now + 6).unwrap();
     let ledger = paths.read_ledger().unwrap();
     assert_eq!(ledger.nodes[&1].status, NodeStatus::Exited);
+    assert_eq!(ledger.nodes[&1].claimable_reward, 10);
+    assert_eq!(ledger.nodes[&1].service_bond, 100);
+    assert_eq!(ledger.nodes[&1].service_bond_unlock_at, Some(now + 26));
+    assert!(ledger.nodes[&1].reward_vesting_schedules.is_empty());
+    assert_eq!(ledger.treasury, treasury_before_exit + 60);
+    assert_eq!(ledger.pool_remaining, pool_before_exit);
+    assert_eq!(ledger.lifetime_minted, lifetime_minted_before_exit);
     assert_eq!(
         ledger.finalized_checkpoint.as_ref().unwrap().nodes[&1].status,
         NodeStatus::Exited
@@ -109,6 +135,87 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].bound_at, now + 16);
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, None);
     assert_eq!(ledger.nodes[&2].status, NodeStatus::WarmingUp);
+    assert!(service::withdraw_service_bond(&paths, "node1", password, now + 25).is_err());
+    let reward_address = ledger.nodes[&1].reward_address.clone();
+    let reward_balance_before = ledger.accounts[&reward_address].liquid;
+    drop(ledger);
+
+    let (_, withdrawn) =
+        service::withdraw_service_bond(&paths, "node1", password, now + 27).unwrap();
+    assert_eq!(withdrawn, 100);
+    service::produce_node1_block(&paths, "node1", password, false, now + 28).unwrap();
+    let ledger = paths.read_ledger().unwrap();
+    assert_eq!(ledger.nodes[&1].service_bond, 0);
+    assert_eq!(ledger.nodes[&1].service_bond_unlock_at, None);
+    assert_eq!(
+        ledger.accounts[&reward_address].liquid,
+        reward_balance_before + 100
+    );
+    assert!(service::verify_blockchain(&paths).unwrap().ok);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finalized_offline_timeout_slashes_bond_and_vesting_to_treasury() {
+    let root = temp_root("offline-slash");
+    let paths = DataPaths::new(Some(root.clone())).unwrap();
+    let password = "offline-slash-integration-password";
+    let now = Utc::now().timestamp();
+    register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
+    let (treasury_before, pool_before, lifetime_minted_before, reward_address) = paths
+        .with_ledger_mut(|ledger| {
+            ledger.settings.offline_slash_seconds = 10;
+            let node = ledger.nodes.get_mut(&1).unwrap();
+            node.last_probe_success = Some(now);
+            node.service_bond = 100;
+            node.claimable_reward = 10;
+            node.reward_vesting_schedules = vec![RewardVestingSchedule {
+                total_amount: 90,
+                released_amount: 30,
+                starts_at: now,
+                ends_at: now + 1_000,
+            }];
+            Ok((
+                ledger.treasury,
+                ledger.pool_remaining,
+                ledger.lifetime_minted,
+                node.reward_address.clone(),
+            ))
+        })
+        .unwrap();
+
+    service::produce_node1_block(&paths, "node1", password, false, now + 1).unwrap();
+    assert_eq!(
+        service::node_record(&paths, "node1").unwrap().status,
+        NodeStatus::Active
+    );
+    service::drain_node(&paths, "node1", password, now + 10).unwrap();
+    assert_eq!(
+        service::node_record(&paths, "node1").unwrap().status,
+        NodeStatus::Draining
+    );
+    service::produce_node1_block(&paths, "node1", password, false, now + 11).unwrap();
+
+    let ledger = paths.read_ledger().unwrap();
+    let node = &ledger.nodes[&1];
+    assert_eq!(node.status, NodeStatus::Exited);
+    assert_eq!(node.claimable_reward, 10);
+    assert_eq!(node.service_bond, 0);
+    assert_eq!(node.service_bond_unlock_at, None);
+    assert!(node.reward_vesting_schedules.is_empty());
+    assert_eq!(node.offline_slashed_at, Some(now + 11));
+    assert_eq!(node.offline_slashed_service_bond, 100);
+    assert_eq!(node.offline_slashed_vesting_reward, 60);
+    assert_eq!(ledger.treasury, treasury_before + 160);
+    assert_eq!(ledger.pool_remaining, pool_before);
+    assert_eq!(ledger.lifetime_minted, lifetime_minted_before);
+    assert_eq!(ledger.accounts[&reward_address].liquid, 0);
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, Some(now + 11));
+    assert_eq!(
+        ledger.finalized_checkpoint.as_ref().unwrap().nodes[&1].offline_slashed_at,
+        Some(now + 11)
+    );
     assert!(service::verify_blockchain(&paths).unwrap().ok);
 
     std::fs::remove_dir_all(root).unwrap();
@@ -493,7 +600,7 @@ fn node1_produces_until_four_validators_and_restores_below_twenty_nodes() {
     let node1 = registered[0].clone();
     paths
         .with_ledger_mut(|ledger| {
-            ledger.settings.min_service_bond = 0;
+            ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
             ledger.settings.validator_bond = 10;
             ledger.settings.heartbeat_grace_seconds = 120;
