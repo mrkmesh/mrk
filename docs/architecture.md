@@ -400,6 +400,7 @@ mrk account history --account default --limit 20
 ```text
 mrk network create --name team
 mrk network fund --network team --amount 100MRK
+mrk network show --network team
 mrk member issue --network team --name client-a
 mrk member show --network team --name client-a
 mrk member revoke --network team --serial 42

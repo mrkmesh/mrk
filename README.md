@@ -99,6 +99,7 @@ The public listener exposes `/health` for process liveness and `/ready` for traf
 ```bash
 mrk network create --name team --account default
 mrk network fund --network team --amount 100MRK --account default
+mrk network show --network team
 mrk member issue --network team --name client-a --account default
 mrk member show --network team --name client-a
 mrk member revoke --network team --serial 1 --account default

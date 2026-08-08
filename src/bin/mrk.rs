@@ -180,6 +180,10 @@ enum NetworkCommand {
         #[arg(long, default_value = "default")]
         account: String,
     },
+    Show {
+        #[arg(long)]
+        network: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -412,11 +416,15 @@ fn run() -> Result<()> {
             }
             AccountCommand::History { target, limit } => {
                 let address = resolve_address(&paths, &target)?;
-                let history = rpc.call(
+                let value = rpc.call(
                     "account.history",
                     serde_json::json!({ "address": address, "limit": limit.min(1_000) }),
                 )?;
-                print_rpc_value(cli.output, &history)?;
+                let history: Vec<mrk::model::OperationRecord> =
+                    serde_json::from_value(value.clone())?;
+                print_value(cli.output, &value, || {
+                    account_history_text(&address, &history)
+                })?;
             }
         },
         Command::Network { command } => match command {
@@ -475,6 +483,11 @@ fn run() -> Result<()> {
                     serde_json::json!({ "public_key": keyfile.public_key, "operation": operation }),
                 )?;
                 print_rpc_value(cli.output, &result)?;
+            }
+            NetworkCommand::Show { network } => {
+                let value = rpc.call("network.get", serde_json::json!({ "alias": network }))?;
+                let network: mrk::model::NetworkRecord = serde_json::from_value(value.clone())?;
+                print_value(cli.output, &value, || network_text(&network))?;
             }
         },
         Command::Registry { command } => match command {
@@ -817,6 +830,56 @@ fn resolve_address(paths: &DataPaths, target: &AccountOrAddress) -> Result<Strin
     match &target.address {
         Some(address) => Ok(address.clone()),
         None => Ok(service::account_keyfile(paths, &target.account)?.address),
+    }
+}
+
+fn network_text(network: &mrk::model::NetworkRecord) -> String {
+    format!(
+        "Network:      {}\nCommitment:   {}\nOwner:        {}\nFund balance: {}",
+        network.alias,
+        network.commitment,
+        network.owner_address,
+        format_mrk(network.escrow_balance)
+    )
+}
+
+fn account_history_text(address: &str, history: &[mrk::model::OperationRecord]) -> String {
+    if history.is_empty() {
+        return format!("No account history for {address}.");
+    }
+
+    let mut output = format!("Account: {address}\nOperations: {}", history.len());
+    for (index, operation) in history.iter().enumerate() {
+        let created_at = chrono::DateTime::<Utc>::from_timestamp(operation.created_at, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| operation.created_at.to_string());
+        let block = operation
+            .block_height
+            .map_or_else(|| "-".to_owned(), |height| height.to_string());
+        let details = serde_json::to_string(&operation.payload)
+            .expect("operation payload serialization cannot fail");
+        output.push_str(&format!(
+            "\n\n{}. {}  {}\n   Operation: {}\n   Created:   {}\n   Block:     {}\n   Signer:    {}\n   Nonce:     {}\n   Details:   {}",
+            index + 1,
+            operation_status_text(&operation.status),
+            operation.kind,
+            operation.operation_id,
+            created_at,
+            block,
+            operation.signer,
+            operation.nonce,
+            details
+        ));
+    }
+    output
+}
+
+fn operation_status_text(status: &mrk::model::OperationStatus) -> &'static str {
+    match status {
+        mrk::model::OperationStatus::Pending => "PENDING",
+        mrk::model::OperationStatus::Finalized => "FINALIZED",
+        mrk::model::OperationStatus::Rejected => "REJECTED",
+        mrk::model::OperationStatus::Expired => "EXPIRED",
     }
 }
 

@@ -416,6 +416,81 @@ fn account_and_node_cli_commands_emit_json() {
     assert_eq!(finalized_json["status"], "FINALIZED");
     assert!(finalized_json["block_height"].as_u64().unwrap() >= 1);
 
+    let create_network = run_mrk_rpc(
+        &root,
+        port,
+        &[
+            "network",
+            "create",
+            "--name",
+            "team",
+            "--account",
+            "default",
+        ],
+    );
+    assert!(
+        create_network.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create_network.stderr)
+    );
+    let produced = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "block", "produce"],
+    );
+    assert!(
+        produced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&produced.stderr)
+    );
+
+    let network = run_mrk_rpc(&root, port, &["network", "show", "--network", "team"]);
+    assert!(
+        network.status.success(),
+        "{}",
+        String::from_utf8_lossy(&network.stderr)
+    );
+    let network_json: serde_json::Value = serde_json::from_slice(&network.stdout).unwrap();
+    assert_eq!(network_json["alias"], "team");
+    assert_eq!(network_json["escrow_balance"], 0);
+
+    let network_text = Command::new(env!("CARGO_BIN_EXE_mrk"))
+        .arg("--data-dir")
+        .arg(&root)
+        .arg("--rpc-endpoint")
+        .arg(format!("ws://127.0.0.1:{port}/v1/rpc"))
+        .arg("--rpc-allow-insecure-local")
+        .args(["network", "show", "--network", "team"])
+        .output()
+        .unwrap();
+    assert!(
+        network_text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&network_text.stderr)
+    );
+    let network_text = String::from_utf8_lossy(&network_text.stdout);
+    assert!(network_text.contains("Network:      team"));
+    assert!(network_text.contains("Fund balance: 0 MRK"));
+
+    let history_text = Command::new(env!("CARGO_BIN_EXE_mrk"))
+        .arg("--data-dir")
+        .arg(&root)
+        .arg("--rpc-endpoint")
+        .arg(format!("ws://127.0.0.1:{port}/v1/rpc"))
+        .arg("--rpc-allow-insecure-local")
+        .args(["account", "history", "--account", "default"])
+        .output()
+        .unwrap();
+    assert!(
+        history_text.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history_text.stderr)
+    );
+    let history_text = String::from_utf8_lossy(&history_text.stdout);
+    assert!(history_text.contains("Operations: 1"));
+    assert!(history_text.contains("FINALIZED  NetworkRegistry.CreateNetwork"));
+    assert!(history_text.contains("Details:   {\"alias\":\"team\""));
+
     let registry = run_mrk_rpc(&root, port, &["registry", "list", "--status", "active"]);
     assert!(
         registry.status.success(),
@@ -503,6 +578,16 @@ fn account_and_node_cli_commands_emit_json() {
     assert!(account_help.contains("balance"));
     assert!(account_help.contains("transfer"));
     assert!(account_help.contains("history"));
+
+    let network_help = Command::new(env!("CARGO_BIN_EXE_mrk"))
+        .args(["network", "--help"])
+        .output()
+        .unwrap();
+    assert!(network_help.status.success());
+    let network_help = String::from_utf8_lossy(&network_help.stdout);
+    assert!(network_help.contains("create"));
+    assert!(network_help.contains("fund"));
+    assert!(network_help.contains("show"));
 
     let block_help = Command::new(env!("CARGO_BIN_EXE_mrk"))
         .args(["block", "--help"])
