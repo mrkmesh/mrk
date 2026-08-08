@@ -138,9 +138,36 @@ mrk pipe \
   --authorization <FINALIZED_AUTHORIZATION_ID>
 ```
 
-After authentication and channel acceptance, stdin bytes are sent as opaque Relay `DATA` frames and received bytes are written to stdout. Status messages use stderr, so stdout remains safe for piping into another application. Each direction preserves order independently.
+After authentication and channel acceptance, the members authenticate an ephemeral X25519 key exchange with their Ed25519 member keys. `mrk pipe` then encrypts every stdin payload end to end with AES-256-GCM before sending it as an opaque Relay `DATA` frame; there is no plaintext fallback. Received payloads are authenticated and decrypted before being written to stdout. Status messages use stderr, so stdout remains safe for piping into another application. Each direction uses a separate session key and preserves order independently. The Relay can still observe member identifiers, traffic lengths, and timing, and billing covers the encrypted payloads and key-exchange overhead that it actually transports.
+
+Other Rust applications can use the same implementation through `mrk::sdk`. `RelayConnection::open` and `IncomingStream::accept` return an `EncryptedStream` implementing Tokio `AsyncRead + AsyncWrite`. Writes are automatically split below the Relay's advertised WebSocket limit; applications see one continuous byte stream and do not add message metadata.
+
+```rust
+use mrk::{
+    sdk::{ClientOptions, MemberIdentity, RelayClient},
+    storage::DataPaths,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let paths = DataPaths::new(None)?;
+    let password = std::env::var("MRK_KEYSTORE_PASSWORD")?;
+    let identity = MemberIdentity::from_data_paths(&paths, "team", "client-a", &password)?;
+    let connection = RelayClient::connect(ClientOptions::new("relay.example.com", identity)).await?;
+    let mut stream = connection.open("<CLIENT_B_MEMBER_ID>", "<AUTHORIZATION_ID>").await?;
+
+    stream.write_all(b"hello").await?;
+    stream.shutdown().await?;
+    let mut reply = Vec::new();
+    stream.read_to_end(&mut reply).await?;
+    Ok(())
+}
+```
 
 Paid Relay sessions use a finalized `PaymentAuthorization` that reserves Network Escrow without paying the Node up front. Each direction pauses new DATA after 64 MiB or two minutes, whichever occurs first, while control frames remain live. The sender signs a cumulative checkpoint and the receiver countersigns the matching delivered prefix; only this dual-signed receipt can release the proportional `price_per_gib` amount to the Node. Receipts are exchanged off chain and only the latest cumulative pair is needed for settlement. Unreceipted funds return after the authorization and seven-day claim window expire; traffic settlement never mints MRK.
+
+Payment checkpoint and receipt exchange is internal to the encrypted stream SDK. There is no standalone Payment SDK in this version; authorization, status, refund, and settlement operations remain available through `mrk payment`.
 
 ```bash
 mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>

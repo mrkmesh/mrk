@@ -6,6 +6,7 @@ pub mod error;
 pub mod model;
 pub mod relay;
 pub mod relay_client;
+pub mod sdk;
 pub mod service;
 pub mod storage;
 

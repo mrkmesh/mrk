@@ -19,7 +19,7 @@ MRK 本身不是 VPN，而是一个无需许可的中继基础设施：
 - 不实现 VPN 协议、TCP/UDP 转发、DNS 或公网出口。
 - 不处理 NAT 穿透、打洞或客户端直连，所有数据都经过 Relay。
 - 不解析或修改上层载荷。
-- 不保证端到端加密。WSS 只保护“客户端到 Relay”这一跳；若不能信任 Relay，上层应用必须在发送前自行加密载荷。
+- 不隐藏连接元数据、密文长度或传输时序；SDK 保护字节流内容，但 Relay 仍参与寻址、转发和计费。
 - 协议内只使用 MRK 计价、质押和结算。协议不验证真人，也不按身份提供用户免费额度；任何人都可以无需审批运行 Relay。Genesis 固定铸造 5 亿 MRK 到无私钥国库，另外 5 亿只按合格节点在线时长释放。MSL 不实现通用智能合约、虚拟机、Gas 市场或其他资产。完整规则见[MRK 专用结算账本、节点发行与治理协议](./blockchain.md)。
 
 ## 2. 核心架构
@@ -41,7 +41,7 @@ flowchart LR
 
 | 组件 | 职责 |
 | --- | --- |
-| Client SDK | 连接 WSS、认证成员、逻辑通道复用、背压、重连、付款凭证 |
+| Client SDK | 连接 WSS、认证成员、逻辑通道复用、端到端加密、背压、连接状态和内部付款凭证 |
 | Relay Node | 验证成员、维护在线目录、转发不透明数据、计量、限流 |
 | Owner CLI/API | 创建私网、签发/撤销成员、配置预算 |
 | Node Registry | 节点身份、WSS 地址、价格、能力、质押状态 |
@@ -144,30 +144,32 @@ FrameHeader {
 | `PING` / `PONG` | 双向 | 应用层存活检测和延迟测量 |
 | `ERROR` | Relay → Client | 返回机器可读错误码 |
 
-`OPEN` 只包含目标 `member_id` 和可选的不透明应用元数据。Relay 必须确认双方属于同一私网，不能跨 `network_id` 建立通道。
+`OPEN` 只选择目标 `member_id` 和已最终确认的 `authorization_id`，不承载应用元数据。Relay 必须确认双方属于同一私网，不能跨 `network_id` 建立通道。
 
 ### 4.3 SDK 对上层应用的最小接口
 
 ```text
-RelayClient.connect(options) -> RelayConnection
+RelayClient::connect(options).await -> RelayConnection
 
-RelayConnection.open(peer_id, metadata?) -> Channel
-RelayConnection.on_incoming(handler)
-RelayConnection.on_state_change(handler)
-RelayConnection.close()
+RelayConnection::open(peer_id, authorization_id).await -> EncryptedStream
+RelayConnection::accept().await -> IncomingStream
+IncomingStream::accept().await -> EncryptedStream
+IncomingStream::reject().await
+RelayConnection::subscribe_state() -> watch::Receiver<ConnectionState>
+RelayConnection::close().await
 
-Channel.send(bytes) -> Promise<void>
-Channel.on_data(handler)
-Channel.on_close(handler)
-Channel.close(code?, reason?)
+EncryptedStream: AsyncRead + AsyncWrite
 ```
 
 语义约定：
 
-- `send()` 成功只表示 Relay 已接受数据，不表示目标应用已经处理。
-- 每条 `DATA` 保留 WebSocket 消息边界；基础设施不解释载荷。
-- 同一通道内按 `sequence` 有序，重连后旧通道失效，由上层应用决定是否重放业务数据。
-- SDK 必须暴露背压；发送缓冲超过阈值时 `send()` 等待或失败，不能无限占用内存。
+- 对应用只暴露连续字节流，不暴露或保留 WebSocket 消息边界，也不添加消息元数据。
+- `AsyncWrite` 自动按 Relay 在 `WELCOME.max_message_size` 公布的上限拆块；每个密文块都计入严格递增的方向序号和累计流量哈希。
+- 成员凭证由本地固定的 Network Owner 公钥验证。双方用成员 Ed25519 密钥认证临时 X25519 握手，并通过 HKDF-SHA256 派生两个独立的 AES-256-GCM 方向密钥。
+- 加密上下文绑定 Ledger、Node、Channel、Authorization、Session、双方 Member ID 和握手 transcript；Relay 修改、重排、重放或跨通道替换密文都会认证失败。
+- `AsyncWrite::shutdown()` 发送认证 FIN 和最终累计 Checkpoint，并等待 Receipt；Relay 在认证 FIN 完成前关闭通道属于截断错误。
+- SDK 使用有界队列和有界字节缓冲暴露背压，不能无限占用内存。
+- 同一通道内按 `sequence` 有序；连接断开后旧通道失效，由上层应用决定是否重新建立并重放业务数据。
 - WSS 基于 TCP，存在队头阻塞。这是当前协议选择的已知取舍，上层不要把它当成无序数据报服务。
 
 ### 4.4 Relay 内部转发表
@@ -336,8 +338,8 @@ MSL 在 Governance-Eligible Node 少于 20 个或 Active Validator 少于 4 个�
 
 | 风险 | 缓解措施 | 仍然存在的边界 |
 | --- | --- | --- |
-| Relay 读取载荷 | 上层应用在 `send()` 前端到端加密 | WSS 本身不能防 Relay 读取明文 |
-| Relay 修改数据 | 上层载荷认证；SDK 的帧序号检测异常 | Relay 可以丢弃、延迟数据 |
+| Relay 读取载荷 | SDK 认证密钥交换并端到端加密全部流记录 | Relay 仍可观察成员、密文长度和时序 |
+| Relay 修改数据 | AES-GCM 认证及上下文、方向、序号绑定 | Relay 仍可以丢弃、延迟或截断；截断会报错 |
 | 跨私网转发 | Owner 签名凭证和 network 隔离键 | Owner 本身是私网信任根 |
 | 凭证盗用 | 握手 challenge + 成员私钥签名、短期凭证 | 终端私钥泄露仍会导致冒用 |
 | Relay 虚增账单 | 付款方按本地发送量签署累计金额 | 合谋只能在关联账户间转移已有 MRK，不能扩大 Epoch 发行上限 |
@@ -422,6 +424,8 @@ mrk pipe --network team --member client-a \
   --peer <CLIENT_B_MEMBER_ID> \
   --authorization <AUTHORIZATION_ID>
 ```
+
+通道建立后，双方使用成员 Ed25519 密钥认证临时 X25519 密钥交换，并以两个独立的 AES-256-GCM 方向密钥端到端加密全部 stdin 数据，不支持明文降级。Relay 继续把 `DATA` payload 当作不透明字节进行转发、流量哈希和计费，因此无法读取内容，但仍可观察成员标识、密文长度和传输时序；密钥交换与 AEAD 开销计入实际 Relay 流量。
 
 生产环境只接受 TLS 1.3 `wss://`；私有 PKI 可使用 `--tls-ca <PEM>` 增加信任锚，但仍校验主机名和证书用途。`ws://` 仅在显式指定 `--allow-insecure-local` 且目标为回环地址时用于本地测试。
 
@@ -534,14 +538,13 @@ tests/
 2. Probe 的地理和 ASN 分散规则、随机来源及误判申诉流程。
 3. 帧编码选择：固定二进制结构或 Protobuf；建议热路径固定头部、控制载荷 Protobuf。
 4. 单消息、单连接队列、通道数和计费窗口的默认上限。
-5. Relay 是否必须看不到业务明文；如果必须，端到端加密协议属于上层 SDK 扩展或 VPN 应用职责，不能只依赖 WSS。
 
 这些参数不阻塞当前 CLI。CLI 默认 1,800 秒 Epoch、每 Epoch 固定铸造 500 MRK 并由合格活跃 Node 按权重瓜分、除 Node 1 外 1 天新 Node 考察期、60 秒 Availability Slot、启动期 Node 1 一票绝对信任、去中心化阶段 Primary 5 选 3与默认 5% Auditor 3 选 2、7 天 IP 重用冷却、Ed25519 + `mrk1` 地址、`0.001 MRK` 转账费和 10 分钟操作有效期。`epoch-seconds`、`epoch-mint-amount`、`warmup-seconds`、Slot、验证节点数、法定票数及审计参数只能通过 Critical 治理修改；Epoch 时长和铸币量从下一个 Epoch 快照生效，考察期修改只作用于新注册的非 Genesis Node。
 
 ## 13. 最小成功指标
 
 - 新节点从安装到可被发现少于 10 分钟。
-- SDK 只通过 `open/send/on_data/close` 即可集成，不暴露账本细节。
+- SDK 只通过 `open/accept` 和标准 `AsyncRead + AsyncWrite` 即可集成，不要求应用处理账本、付款帧或消息拆块。
 - 单连接内存始终受硬上限约束，慢客户端不会拖垮整个 Relay。
 - 跨私网消息、未授权成员和重复付款凭证全部被拒绝。
 - 任一 Relay 无法扣取超过成员已签署累计凭证的资金。

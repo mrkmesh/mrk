@@ -329,38 +329,60 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         let mut alice_stdout = alice_cli.stdout.take().unwrap();
         let mut bob_stdin = bob_cli.stdin.take().unwrap();
         let mut bob_stdout = bob_cli.stdout.take().unwrap();
-        alice_stdin.write_all(b"cli-alice-to-bob").unwrap();
-        alice_stdin.flush().unwrap();
+        let large_payload = (0..256 * 1024)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
         let (alice_tx, alice_rx) = std::sync::mpsc::channel();
+        let (alice_eof_tx, alice_eof_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            let mut bytes = [0_u8; 16];
+            let mut bytes = vec![0_u8; 16 + 256 * 1024];
             let result = bob_stdout.read_exact(&mut bytes).map(|_| bytes);
+            let succeeded = result.is_ok();
             let _ = alice_tx.send(result);
+            if succeeded {
+                let mut trailing = Vec::new();
+                let _ = alice_eof_tx.send(bob_stdout.read_to_end(&mut trailing).map(|_| trailing));
+            }
         });
+        alice_stdin.write_all(b"cli-alice-to-bob").unwrap();
+        alice_stdin.write_all(&large_payload).unwrap();
+        alice_stdin.flush().unwrap();
+        drop(alice_stdin);
         let from_alice = alice_rx
-            .recv_timeout(Duration::from_secs(5))
+            .recv_timeout(Duration::from_secs(10))
             .unwrap()
             .unwrap();
-        assert_eq!(&from_alice, b"cli-alice-to-bob");
+        assert_eq!(&from_alice[..16], b"cli-alice-to-bob");
+        assert_eq!(&from_alice[16..], large_payload);
 
-        bob_stdin.write_all(b"cli-bob-to-alice").unwrap();
-        bob_stdin.flush().unwrap();
         let (bob_tx, bob_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let mut bytes = [0_u8; 16];
-            let result = alice_stdout.read_exact(&mut bytes).map(|_| bytes);
+            let result = alice_stdout.read_exact(&mut bytes).and_then(|_| {
+                let mut trailing = Vec::new();
+                alice_stdout
+                    .read_to_end(&mut trailing)
+                    .map(|_| (bytes, trailing))
+            });
             let _ = bob_tx.send(result);
         });
-        let from_bob = bob_rx
-            .recv_timeout(Duration::from_secs(5))
+        bob_stdin.write_all(b"cli-bob-to-alice").unwrap();
+        bob_stdin.flush().unwrap();
+        drop(bob_stdin);
+        let (from_bob, trailing) = bob_rx
+            .recv_timeout(Duration::from_secs(10))
             .unwrap()
             .unwrap();
         assert_eq!(&from_bob, b"cli-bob-to-alice");
+        assert!(trailing.is_empty());
+        let trailing = alice_eof_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(trailing.is_empty());
 
-        alice_cli.kill().unwrap();
-        bob_cli.kill().unwrap();
-        alice_cli.wait().unwrap();
-        bob_cli.wait().unwrap();
+        assert!(alice_cli.wait().unwrap().success());
+        assert!(bob_cli.wait().unwrap().success());
         proxy.abort();
     });
 

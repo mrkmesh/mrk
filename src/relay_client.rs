@@ -2,7 +2,7 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -21,24 +21,20 @@ const RPC_PROTOCOL: &str = "mrk.rpc.v1";
 use crate::{
     Error, Result,
     consensus::{CONSENSUS_PROTOCOL, ConsensusWireMessage, MAX_CONSENSUS_MESSAGE_SIZE},
-    crypto::{random_bytes, verify_bytes},
+    crypto::random_bytes,
     endpoint::{CONSENSUS_PATH, RELAY_PATH, RPC_PATH, normalize_websocket_url},
-    model::{PROTOCOL_VERSION, RelayDirection},
     relay::{
         ChallengePayload, ErrorPayload, FrameType, IncomingPayload, OpenPayload, ProbePayload,
-        RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES, RELAY_PAYMENT_WINDOW_SECONDS,
-        ReceiverReceipt, RelayFrame, SenderCheckpoint, WelcomePayload, WsMessage,
-        read_ws_message_async, receiver_receipt_signing_bytes, relay_transcript_initial_hash,
-        relay_transcript_next_hash, sender_checkpoint_hash, sender_checkpoint_signing_bytes,
-        websocket_accept_key, write_ws_message_async,
+        RelayFrame, WelcomePayload, WsMessage, read_ws_message_async, websocket_accept_key,
+        write_ws_message_async,
     },
     service,
     storage::DataPaths,
 };
 
-trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(crate) trait AsyncIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncIo for T {}
-type BoxedIo = Box<dyn AsyncIo>;
+pub(crate) type BoxedIo = Box<dyn AsyncIo>;
 
 pub struct RelayConnection {
     reader: ReadHalf<BoxedIo>,
@@ -55,7 +51,6 @@ pub struct StdioPipeOptions {
     pub endpoint: String,
     pub peer: Option<String>,
     pub authorization: Option<String>,
-    pub metadata: String,
     pub allow_insecure_local: bool,
     pub tls_ca: Option<PathBuf>,
 }
@@ -155,7 +150,7 @@ pub fn run_public_chain_sync(paths: DataPaths, node_name: String) -> Result<u64>
     Ok(height)
 }
 
-async fn rpc_call(
+pub(crate) async fn rpc_call(
     endpoint: &str,
     method: &str,
     params: serde_json::Value,
@@ -401,90 +396,70 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
         .build()
         .map_err(Error::Io)?
         .block_on(async move {
-            let mut connection = RelayConnection::connect_with_ca(
-                &options.paths,
-                &options.network,
-                &options.member,
-                &options.password,
-                &options.endpoint,
-                options.allow_insecure_local,
-                options.tls_ca.as_deref(),
-            )
-            .await?;
-            let node_id = connection.node_id;
-            let (channel_id, remote_member, authorization_id, initiator) = if let Some(peer_id) = options.peer {
-                let authorization = options.authorization.as_deref().ok_or_else(|| {
+            let StdioPipeOptions {
+                paths,
+                network,
+                member,
+                password,
+                endpoint,
+                peer,
+                authorization,
+                allow_insecure_local,
+                tls_ca,
+            } = options;
+            let identity =
+                crate::sdk::MemberIdentity::from_data_paths(&paths, &network, &member, &password)
+                    .map_err(|error| Error::msg(error.to_string()))?;
+            drop(paths);
+            let mut client_options = crate::sdk::ClientOptions::new(&endpoint, identity)
+                .allow_insecure_local(allow_insecure_local);
+            if let Some(path) = &tls_ca {
+                client_options = client_options.tls_ca(path);
+            }
+            let connection = crate::sdk::RelayClient::connect(client_options)
+                .await
+                .map_err(|error| Error::msg(error.to_string()))?;
+            let stream = if let Some(peer_id) = peer {
+                let authorization = authorization.as_deref().ok_or_else(|| {
                     Error::msg("initiating a paid Relay channel requires --authorization")
                 })?;
-                let channel_id = connection
-                    .open(&peer_id, authorization, &options.metadata)
-                    .await?;
-                (channel_id, peer_id, authorization.to_owned(), true)
+                connection
+                    .open(peer_id, authorization)
+                    .await
+                    .map_err(|error| Error::msg(error.to_string()))?
             } else {
-                let (channel_id, incoming) = connection.accept().await?;
-                if incoming.authorization_id.is_empty() || incoming.session_id.is_empty() {
-                    return Err(Error::msg("incoming Relay channel has no payment authorization"));
-                }
-                (channel_id, incoming.peer_id, incoming.authorization_id, false)
+                connection
+                    .accept()
+                    .await
+                    .map_err(|error| Error::msg(error.to_string()))?
+                    .accept()
+                    .await
+                    .map_err(|error| Error::msg(error.to_string()))?
             };
-            let mut rpc_endpoint = normalize_websocket_url(&options.endpoint, RELAY_PATH)?;
-            rpc_endpoint.set_path(RPC_PATH);
-            rpc_endpoint.set_query(None);
-            rpc_endpoint.set_fragment(None);
-            let view: service::RelayAuthorizationView = serde_json::from_value(
-                rpc_call(
-                    rpc_endpoint.as_str(),
-                    "payment.get",
-                    serde_json::json!({"authorization_id": authorization_id}),
-                    options.allow_insecure_local,
-                    options.tls_ca.as_deref(),
-                )
-                .await?,
-            )?;
-            let credential = service::member_credential(
-                &options.paths,
-                &options.network,
-                &options.member,
-            )?;
-            let expected_local = if initiator {
-                &view.authorization.sender_member_id
-            } else {
-                &view.authorization.receiver_member_id
-            };
-            let expected_remote = if initiator {
-                &view.authorization.receiver_member_id
-            } else {
-                &view.authorization.sender_member_id
-            };
-            if !view.finalized
-                || view.authorization.authorization_id != authorization_id
-                || view.authorization.node_id != node_id
-                || view.authorization.network_id != credential.network_id
-                || &credential.member_id != expected_local
-                || &remote_member != expected_remote
-                || view.authorization.refunded_at.is_some()
-                || Utc::now().timestamp() >= view.authorization.valid_until
-            {
-                return Err(Error::msg(
-                    "Relay payment authorization does not match this channel",
-                ));
-            }
             eprintln!(
-                "Relay channel {channel_id} connected to member {remote_member}; piping stdin/stdout"
+                "End-to-end encrypted Relay stream connected to member {}; piping stdin/stdout",
+                stream.peer_id(),
             );
-            pipe_channel(
-                connection,
-                channel_id,
-                PipeSession {
-                    paths: &options.paths,
-                    network: &options.network,
-                    member: &options.member,
-                    password: &options.password,
-                    view,
-                    initiator,
-                },
-            )
-            .await
+            let (mut stream_reader, mut stream_writer) = split(stream);
+            let mut stdin = tokio::io::stdin();
+            let mut stdout = tokio::io::stdout();
+            let upload = async {
+                tokio::io::copy(&mut stdin, &mut stream_writer).await?;
+                if std::env::var_os("MRK_RELAY_DEBUG").is_some() {
+                    eprintln!("pipe member {member}: stdin reached EOF");
+                }
+                stream_writer.shutdown().await
+            };
+            let download = async {
+                tokio::io::copy(&mut stream_reader, &mut stdout).await?;
+                if std::env::var_os("MRK_RELAY_DEBUG").is_some() {
+                    eprintln!("pipe member {member}: authenticated remote EOF");
+                }
+                stdout.flush().await
+            };
+            tokio::try_join!(upload, download)
+                .map_err(|error| Error::msg(format!("pipe member {member}: {error}")))?;
+            Ok(())
         })
 }
 
@@ -922,356 +897,7 @@ async fn write_consensus_message_async(
     write_ws_message_async(stream, &WsMessage::Binary(bytes), true).await
 }
 
-struct ClientDirectionState {
-    sequence: u64,
-    cumulative_bytes: u64,
-    transcript_hash: String,
-    window_started_at: Option<Instant>,
-    window_started_bytes: u64,
-    awaiting_receipt: bool,
-    pending_checkpoint: Option<SenderCheckpoint>,
-}
-
-struct PipeSession<'a> {
-    paths: &'a DataPaths,
-    network: &'a str,
-    member: &'a str,
-    password: &'a str,
-    view: service::RelayAuthorizationView,
-    initiator: bool,
-}
-
-async fn pipe_channel(
-    connection: RelayConnection,
-    channel_id: u32,
-    session: PipeSession<'_>,
-) -> Result<()> {
-    let PipeSession {
-        paths,
-        network,
-        member,
-        password,
-        view,
-        initiator,
-    } = session;
-    let RelayConnection {
-        mut reader,
-        mut writer,
-        welcome,
-        node_id: _,
-    } = connection;
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
-    let mut input = vec![0_u8; 64 * 1024];
-    let outgoing_direction = if initiator {
-        RelayDirection::SenderToReceiver
-    } else {
-        RelayDirection::ReceiverToSender
-    };
-    let incoming_direction = if initiator {
-        RelayDirection::ReceiverToSender
-    } else {
-        RelayDirection::SenderToReceiver
-    };
-    let initial_state = |direction| {
-        let settled = view
-            .authorization
-            .directions
-            .get(&direction)
-            .cloned()
-            .unwrap_or_default();
-        let hash = settled.settled_transcript_hash.clone().unwrap_or_else(|| {
-            relay_transcript_initial_hash(
-                &view.ledger_id,
-                view.authorization.node_id,
-                &view.authorization.authorization_id,
-                &view.authorization.session_id,
-                direction,
-            )
-        });
-        ClientDirectionState {
-            sequence: settled.settled_sequence,
-            cumulative_bytes: settled.settled_payload_bytes,
-            transcript_hash: hash,
-            window_started_at: None,
-            window_started_bytes: settled.settled_payload_bytes,
-            awaiting_receipt: false,
-            pending_checkpoint: None,
-        }
-    };
-    let mut outgoing = initial_state(outgoing_direction);
-    let mut incoming = initial_state(incoming_direction);
-    let mut heartbeat =
-        tokio::time::interval(Duration::from_secs(u64::from(welcome.heartbeat_seconds)));
-    heartbeat.tick().await;
-    let mut payment_timer = tokio::time::interval(Duration::from_secs(1));
-    payment_timer.tick().await;
-    let mut closing_after_receipt = false;
-    loop {
-        tokio::select! {
-            input_result = stdin.read(&mut input), if !outgoing.awaiting_receipt => {
-                let size = input_result?;
-                if size == 0 {
-                    if outgoing.cumulative_bytes > outgoing.window_started_bytes {
-                        let checkpoint = sign_pipe_checkpoint(
-                            paths, network, member, password, &view, outgoing_direction, &outgoing,
-                        )?;
-                        write_relay_frame_half(&mut writer, RelayFrame {
-                            frame_type: FrameType::SenderCheckpoint,
-                            flags: RELAY_CHECKPOINT_FINAL_FLAG,
-                            channel_id,
-                            sequence: outgoing.sequence,
-                            payload: serde_json::to_vec(&checkpoint)?,
-                        }).await?;
-                        outgoing.awaiting_receipt = true;
-                        outgoing.pending_checkpoint = Some(checkpoint);
-                        closing_after_receipt = true;
-                    } else {
-                        write_relay_frame_half(
-                            &mut writer,
-                            RelayFrame {
-                                frame_type: FrameType::Close,
-                                flags: 0,
-                                channel_id,
-                                sequence: outgoing.sequence,
-                                payload: Vec::new(),
-                            },
-                        ).await?;
-                        return Ok(());
-                    }
-                    continue;
-                }
-                outgoing.sequence = outgoing.sequence.checked_add(1)
-                    .ok_or_else(|| Error::msg("relay DATA sequence overflow"))?;
-                outgoing.window_started_at.get_or_insert_with(Instant::now);
-                outgoing.cumulative_bytes = outgoing.cumulative_bytes
-                    .checked_add(size as u64)
-                    .ok_or_else(|| Error::msg("relay byte counter overflow"))?;
-                outgoing.transcript_hash = relay_transcript_next_hash(
-                    &outgoing.transcript_hash,
-                    outgoing.sequence,
-                    &input[..size],
-                );
-                write_relay_frame_half(
-                    &mut writer,
-                    RelayFrame {
-                        frame_type: FrameType::Data,
-                        flags: 0,
-                        channel_id,
-                        sequence: outgoing.sequence,
-                        payload: input[..size].to_vec(),
-                    },
-                ).await?;
-                if outgoing.cumulative_bytes.saturating_sub(outgoing.window_started_bytes)
-                    >= RELAY_PAYMENT_WINDOW_BYTES
-                {
-                    let checkpoint = sign_pipe_checkpoint(
-                        paths, network, member, password, &view, outgoing_direction, &outgoing,
-                    )?;
-                    write_relay_frame_half(&mut writer, RelayFrame {
-                        frame_type: FrameType::SenderCheckpoint,
-                        flags: 0,
-                        channel_id,
-                        sequence: outgoing.sequence,
-                        payload: serde_json::to_vec(&checkpoint)?,
-                    }).await?;
-                    outgoing.awaiting_receipt = true;
-                    outgoing.pending_checkpoint = Some(checkpoint);
-                }
-            }
-            message = read_ws_message_async(&mut reader, false) => {
-                match message? {
-                    WsMessage::Binary(bytes) => {
-                        let frame = RelayFrame::decode(&bytes)?;
-                        match frame.frame_type {
-                            FrameType::Data if frame.channel_id == channel_id => {
-                                if frame.sequence != incoming.sequence.saturating_add(1) {
-                                    return Err(Error::msg("received relay DATA sequence gap"));
-                                }
-                                incoming.sequence = frame.sequence;
-                                incoming.window_started_at.get_or_insert_with(Instant::now);
-                                incoming.cumulative_bytes = incoming.cumulative_bytes
-                                    .checked_add(frame.payload.len() as u64)
-                                    .ok_or_else(|| Error::msg("relay byte counter overflow"))?;
-                                incoming.transcript_hash = relay_transcript_next_hash(
-                                    &incoming.transcript_hash,
-                                    frame.sequence,
-                                    &frame.payload,
-                                );
-                                stdout.write_all(&frame.payload).await?;
-                                stdout.flush().await?;
-                            }
-                            FrameType::SenderCheckpoint if frame.channel_id == channel_id => {
-                                let checkpoint: SenderCheckpoint = serde_json::from_slice(&frame.payload)?;
-                                let sender_public_key = match checkpoint.direction {
-                                    RelayDirection::SenderToReceiver => &view.sender_public_key,
-                                    RelayDirection::ReceiverToSender => &view.receiver_public_key,
-                                };
-                                if checkpoint.direction != incoming_direction
-                                    || checkpoint.ledger_id != view.ledger_id
-                                    || checkpoint.protocol_version != PROTOCOL_VERSION
-                                    || checkpoint.node_id != view.authorization.node_id
-                                    || checkpoint.authorization_id != view.authorization.authorization_id
-                                    || checkpoint.session_id != view.authorization.session_id
-                                    || checkpoint.sequence != incoming.sequence
-                                    || checkpoint.cumulative_sent_bytes != incoming.cumulative_bytes
-                                    || checkpoint.transcript_hash != incoming.transcript_hash
-                                    || checkpoint.sender_member_id != if initiator {
-                                        view.authorization.receiver_member_id.as_str()
-                                    } else {
-                                        view.authorization.sender_member_id.as_str()
-                                    }
-                                    || checkpoint.checkpoint_at > Utc::now().timestamp().saturating_add(30)
-                                {
-                                    return Err(Error::msg("Relay SenderCheckpoint does not match received DATA"));
-                                }
-                                verify_bytes(
-                                    sender_public_key,
-                                    &sender_checkpoint_signing_bytes(&checkpoint)?,
-                                    &checkpoint.sender_signature,
-                                )?;
-                                let receipt = service::sign_receiver_receipt(
-                                    paths,
-                                    network,
-                                    member,
-                                    password,
-                                    &checkpoint,
-                                    Utc::now().timestamp(),
-                                )?;
-                                write_relay_frame_half(&mut writer, RelayFrame {
-                                    frame_type: FrameType::ReceiverReceipt,
-                                    flags: 0,
-                                    channel_id,
-                                    sequence: checkpoint.sequence,
-                                    payload: serde_json::to_vec(&receipt)?,
-                                }).await?;
-                                incoming.window_started_at = None;
-                                incoming.window_started_bytes = incoming.cumulative_bytes;
-                            }
-                            FrameType::ReceiverReceipt if frame.channel_id == channel_id => {
-                                let receipt: ReceiverReceipt = serde_json::from_slice(&frame.payload)?;
-                                let checkpoint = outgoing.pending_checkpoint.as_ref()
-                                    .ok_or_else(|| Error::msg("unexpected Relay ReceiverReceipt"))?;
-                                let receiver_public_key = match receipt.direction {
-                                    RelayDirection::SenderToReceiver => &view.receiver_public_key,
-                                    RelayDirection::ReceiverToSender => &view.sender_public_key,
-                                };
-                                if receipt.direction != outgoing_direction
-                                    || receipt.ledger_id != view.ledger_id
-                                    || receipt.protocol_version != PROTOCOL_VERSION
-                                    || receipt.node_id != view.authorization.node_id
-                                    || receipt.authorization_id != view.authorization.authorization_id
-                                    || receipt.session_id != view.authorization.session_id
-                                    || receipt.sequence != checkpoint.sequence
-                                    || receipt.cumulative_received_bytes != checkpoint.cumulative_sent_bytes
-                                    || receipt.transcript_hash != checkpoint.transcript_hash
-                                    || receipt.sender_checkpoint_hash != sender_checkpoint_hash(checkpoint)?
-                                    || receipt.receiver_member_id != if initiator {
-                                        view.authorization.receiver_member_id.as_str()
-                                    } else {
-                                        view.authorization.sender_member_id.as_str()
-                                    }
-                                    || receipt.received_at < checkpoint.checkpoint_at
-                                    || receipt.received_at.saturating_sub(checkpoint.checkpoint_at) > 30
-                                {
-                                    return Err(Error::msg("invalid Relay ReceiverReceipt"));
-                                }
-                                verify_bytes(
-                                    receiver_public_key,
-                                    &receiver_receipt_signing_bytes(&receipt)?,
-                                    &receipt.receiver_signature,
-                                )?;
-                                outgoing.window_started_at = None;
-                                outgoing.window_started_bytes = outgoing.cumulative_bytes;
-                                outgoing.awaiting_receipt = false;
-                                outgoing.pending_checkpoint = None;
-                                if closing_after_receipt {
-                                    write_relay_frame_half(&mut writer, RelayFrame {
-                                        frame_type: FrameType::Close,
-                                        flags: 0,
-                                        channel_id,
-                                        sequence: outgoing.sequence,
-                                        payload: Vec::new(),
-                                    }).await?;
-                                    return Ok(());
-                                }
-                            }
-                            FrameType::Close if frame.channel_id == channel_id => return Ok(()),
-                            FrameType::Error => return Err(protocol_error(&frame.payload)),
-                            FrameType::Ping => {
-                                write_relay_frame_half(&mut writer, RelayFrame { frame_type: FrameType::Pong, ..frame }).await?;
-                            }
-                            FrameType::Pong => {}
-                            _ => return Err(Error::msg("unexpected relay frame on active channel")),
-                        }
-                    }
-                    WsMessage::Ping(payload) => {
-                        write_ws_message_async(&mut writer, &WsMessage::Pong(payload), true).await?;
-                    }
-                    WsMessage::Pong(_) => {}
-                    WsMessage::Close(_) => return Ok(()),
-                }
-            }
-            _ = heartbeat.tick() => {
-                write_relay_frame_half(
-                    &mut writer,
-                    RelayFrame::control(FrameType::Ping, Vec::new()),
-                ).await?;
-            }
-            _ = payment_timer.tick(), if !outgoing.awaiting_receipt && outgoing.window_started_at.is_some() => {
-                let authorization_expiring = Utc::now().timestamp()
-                    >= view.authorization.valid_until.saturating_sub(5);
-                if authorization_expiring || outgoing.window_started_at.is_some_and(|started| {
-                    started.elapsed() >= Duration::from_secs((RELAY_PAYMENT_WINDOW_SECONDS + 1) as u64)
-                }) && outgoing.cumulative_bytes > outgoing.window_started_bytes {
-                    let checkpoint = sign_pipe_checkpoint(
-                        paths, network, member, password, &view, outgoing_direction, &outgoing,
-                    )?;
-                    write_relay_frame_half(&mut writer, RelayFrame {
-                        frame_type: FrameType::SenderCheckpoint,
-                        flags: if authorization_expiring { RELAY_CHECKPOINT_FINAL_FLAG } else { 0 },
-                        channel_id,
-                        sequence: outgoing.sequence,
-                        payload: serde_json::to_vec(&checkpoint)?,
-                    }).await?;
-                    outgoing.awaiting_receipt = true;
-                    outgoing.pending_checkpoint = Some(checkpoint);
-                    closing_after_receipt = authorization_expiring;
-                }
-            }
-        }
-    }
-}
-
-fn sign_pipe_checkpoint(
-    paths: &DataPaths,
-    network: &str,
-    member: &str,
-    password: &str,
-    view: &service::RelayAuthorizationView,
-    direction: RelayDirection,
-    state: &ClientDirectionState,
-) -> Result<SenderCheckpoint> {
-    service::sign_sender_checkpoint(
-        paths,
-        network,
-        member,
-        password,
-        service::SenderCheckpointSigningRequest {
-            ledger_id: &view.ledger_id,
-            node_id: view.authorization.node_id,
-            authorization_id: &view.authorization.authorization_id,
-            session_id: &view.authorization.session_id,
-            direction,
-            sequence: state.sequence,
-            cumulative_sent_bytes: state.cumulative_bytes,
-            transcript_hash: &state.transcript_hash,
-            checkpoint_at: Utc::now().timestamp(),
-        },
-    )
-}
-
-async fn connect_websocket(
+pub(crate) async fn connect_websocket(
     endpoint: &str,
     allow_insecure_local: bool,
     tls_ca: Option<&Path>,
@@ -1482,10 +1108,6 @@ async fn read_relay_frame(stream: &mut BoxedIo) -> Result<RelayFrame> {
 
 async fn write_relay_frame(stream: &mut BoxedIo, frame: RelayFrame) -> Result<()> {
     write_ws_message_async(stream, &WsMessage::Binary(frame.encode()?), true).await
-}
-
-async fn write_relay_frame_half(writer: &mut WriteHalf<BoxedIo>, frame: RelayFrame) -> Result<()> {
-    write_ws_message_async(writer, &WsMessage::Binary(frame.encode()?), true).await
 }
 
 fn protocol_error(payload: &[u8]) -> Error {

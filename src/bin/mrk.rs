@@ -90,8 +90,6 @@ enum Command {
         peer: Option<String>,
         #[arg(long, requires = "peer")]
         authorization: Option<String>,
-        #[arg(long, default_value = "stdio")]
-        metadata: String,
         #[arg(long)]
         allow_insecure_local: bool,
         #[arg(long)]
@@ -714,7 +712,6 @@ fn run() -> Result<()> {
             endpoint,
             peer,
             authorization,
-            metadata,
             allow_insecure_local,
             tls_ca,
         } => {
@@ -727,7 +724,6 @@ fn run() -> Result<()> {
                 endpoint,
                 peer,
                 authorization,
-                metadata,
                 allow_insecure_local,
                 tls_ca,
             })?;
