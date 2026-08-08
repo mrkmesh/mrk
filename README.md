@@ -136,7 +136,8 @@ mrk pipe \
   --network team \
   --member client-a \
   --endpoint relay.example.com \
-  --peer <CLIENT_B_MEMBER_ID>
+  --peer <CLIENT_B_MEMBER_ID> \
+  --max-auto-recovery-bytes 1048576
 ```
 
 The initiating member signs a `ReserveSession` operation. The SDK applies the current
@@ -144,6 +145,10 @@ Owner policy, atomically reserves the shared Network Fund, waits for finality, a
 opens the channel.
 
 After authentication and channel acceptance, the members authenticate an ephemeral X25519 key exchange with their Ed25519 member keys. `mrk pipe` then encrypts every stdin payload end to end with AES-256-GCM before sending it as an opaque Relay `DATA` frame; there is no plaintext fallback. Received payloads are authenticated and decrypted before being written to stdout. Status messages use stderr, so stdout remains safe for piping into another application. Each direction uses a separate session key and preserves order independently. The Relay can still observe member identifiers, traffic lengths, and timing, and billing covers the encrypted payloads and key-exchange overhead that it actually transports.
+
+Pressing Ctrl+C starts a graceful close instead of terminating immediately. Each endpoint sends an authenticated FIN and a `CloseIntent`; the Node answers with a final `CheckpointRequest`, and the clients return the ordinary dual-signed final receipt. The CLI exits after the Node has persisted those receipts. The Node then finalizes settlement and releases the unused reservation in the background. A second Ctrl+C forces shutdown if the peer cannot complete the receipt exchange.
+
+If a process disappears before that exchange, the Node keeps the unsigned tail only in memory and records a small authorization hold without DATA, sequence counters, or transcript state. On restart, `mrk pipe --max-auto-recovery-bytes N` first recovers matching interrupted sessions and only then opens a new session; the standalone `payment settle` command exposes the same limit for manual recovery. The default is zero. The recovery channel carries settlement frames only. If the Node itself restarted, the exact tail is gone and cannot be signed. The Node Owner may waive the claim with `node payment abandon`, or configure a bounded local auto-abandon policy. Only dual-signed receipts awaiting chain settlement are persisted, and they are deleted after finality.
 
 Other Rust applications can use the same implementation through `mrk::sdk`. `RelayConnection::open_auto` and `IncomingStream::accept` return an `EncryptedStream` implementing Tokio `AsyncRead + AsyncWrite`. Writes are automatically split below the Relay's advertised WebSocket limit; applications see one continuous byte stream and do not add message metadata.
 
@@ -173,14 +178,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Paid Relay sessions use a finalized `PaymentAuthorization` that reserves Network Fund without paying the Node up front. By default every active member may create a bounded reservation; the Owner can update or disable the policy at any time, while finalized reservations retain their policy snapshot. Each direction pauses new DATA after 64 MiB or two minutes, whichever occurs first, while control frames remain live. The sender signs a cumulative checkpoint and the receiver countersigns the matching delivered prefix; only this dual-signed receipt can release the proportional `price_per_gib` amount to the Node. After both directions countersign their final checkpoints, unused reservation returns immediately. Otherwise it remains claimable for seven days after expiry and is reclaimed by the next automatic reservation. Traffic settlement never mints MRK.
+Paid Relay sessions use a finalized `PaymentAuthorization` that reserves Network Fund without paying the Node up front. By default every active member may create a bounded reservation; the Owner can update or disable the policy at any time, while finalized reservations retain their policy snapshot. Each direction pauses new DATA after 16 MiB or 15 seconds, whichever occurs first, while control frames remain live. The Node sends a `CheckpointRequest` containing the exact sequence, byte count, and transcript hash it observed. During a live session the sender and receiver match it against their in-memory transcript before signing. Only this dual-signed receipt can release the proportional `price_per_gib` amount to the Node. After both directions countersign their final checkpoints and the settlement finalizes, unused reservation returns to the Network Fund. Otherwise it remains claimable for seven days after expiry and is reclaimed by the next automatic reservation. Traffic settlement never mints MRK.
 
 Payment checkpoint and receipt exchange is internal to the encrypted stream SDK. There is no standalone Payment SDK in this version; authorization, status, refund, and settlement operations remain available through `mrk payment`.
 
 ```bash
 mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>
 mrk payment history --network team [--member client-a]
+mrk payment unsettled --network team --member client-a
+mrk payment settle <AUTHORIZATION_ID> --network team --member client-a --endpoint relay.example.com --max-auto-recovery-bytes 1048576
 mrk payment refund <AUTHORIZATION_ID> --account default
+mrk node --node default payment unsettled
+mrk node --node default payment policy set --max-auto-abandon-bytes 0
+mrk node --node default payment policy set --network team --max-auto-abandon-bytes 1048576
+mrk node --node default payment abandon <AUTHORIZATION_ID>
 ```
 
 `payment status` accepts either the authorization ID or session ID.

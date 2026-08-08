@@ -2,7 +2,7 @@
 
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
@@ -12,7 +12,10 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc::SyncSender},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, SyncSender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -31,16 +34,17 @@ use mrk::{
         RelayDirection, SignedOperation,
     },
     relay::{
-        ChallengePayload, ErrorPayload, FrameType, IncomingPayload, MAX_FRAME_PAYLOAD, OpenPayload,
-        RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES, RELAY_PAYMENT_WINDOW_SECONDS,
-        ReceiverReceipt, RelayFrame, SenderCheckpoint, WelcomePayload, WsMessage, read_ws_message,
-        receiver_receipt_signing_bytes, relay_transcript_initial_hash, relay_transcript_next_hash,
-        sender_checkpoint_hash, sender_checkpoint_signing_bytes, websocket_server_response,
+        ChallengePayload, CheckpointRequest, CloseIntent, ErrorPayload, FrameType, IncomingPayload,
+        MAX_FRAME_PAYLOAD, OpenPayload, RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES,
+        RELAY_PAYMENT_WINDOW_SECONDS, ReceiverReceipt, RelayFrame, SenderCheckpoint,
+        WelcomePayload, WsMessage, read_ws_message, receiver_receipt_signing_bytes,
+        relay_transcript_initial_hash, relay_transcript_next_hash, sender_checkpoint_hash,
+        sender_checkpoint_signing_bytes, websocket_server_response,
         websocket_server_response_for_protocol, write_ws_message,
     },
     relay_client,
     service::{self, AuthenticatedMember},
-    storage::{DataPaths, PendingTrafficSettlement},
+    storage::{ActiveRelaySession, DataPaths, PendingTrafficSettlement, UnsettledRelaySession},
 };
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +55,8 @@ const MAX_PUBLIC_CONNECTIONS_PER_IP: usize = 128;
 const MAX_RPC_REQUESTS_PER_MINUTE: u32 = 120;
 const MAX_RPC_MUTATIONS_PER_MINUTE: u32 = 20;
 const RPC_PROTOCOL: &str = "mrk.rpc.v1";
+const RELAY_RECOVERY_GRACE_SECONDS: i64 = 30;
+const RELAY_UNKNOWN_TAIL_MAX_BYTES: u64 = 2 * RELAY_PAYMENT_WINDOW_BYTES;
 
 thread_local! {
     static ADMIN_PASSWORD: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -64,6 +70,7 @@ struct Peer {
     sender: SyncSender<WsMessage>,
 }
 
+#[derive(Clone)]
 struct Route {
     source: u64,
     destination: u64,
@@ -73,6 +80,17 @@ struct Route {
     authorization: Option<service::RelayAuthorizationView>,
     source_direction: DirectionState,
     destination_direction: DirectionState,
+    recovery: bool,
+}
+
+#[derive(Clone)]
+struct InterruptedRoute {
+    authorization: service::RelayAuthorizationView,
+    source_sequence: u64,
+    destination_sequence: u64,
+    source_direction: DirectionState,
+    destination_direction: DirectionState,
+    disconnected_at: i64,
 }
 
 #[derive(Clone, Default)]
@@ -84,6 +102,8 @@ struct DirectionState {
     checkpoint_due: bool,
     awaiting_receipt: bool,
     pending_checkpoint: Option<SenderCheckpoint>,
+    checkpoint_request: Option<CheckpointRequest>,
+    final_receipt_persisted: bool,
 }
 
 #[derive(Default)]
@@ -93,12 +113,17 @@ struct HubState {
     peers: HashMap<u64, Peer>,
     member_connections: HashMap<(String, String), Vec<u64>>,
     routes: HashMap<u32, Route>,
+    interrupted_routes: HashMap<String, InterruptedRoute>,
+    last_recovery_policy_at: i64,
 }
 
 struct RelayHub {
     state: Mutex<HubState>,
     paths: Option<DataPaths>,
     node_id: Option<u64>,
+    settlement_wakeup: Option<SyncSender<()>>,
+    node_name: Option<String>,
+    node_password: Option<String>,
 }
 
 impl Default for RelayHub {
@@ -107,6 +132,9 @@ impl Default for RelayHub {
             state: Mutex::new(HubState::default()),
             paths: None,
             node_id: None,
+            settlement_wakeup: None,
+            node_name: None,
+            node_password: None,
         }
     }
 }
@@ -243,6 +271,40 @@ pub(crate) enum DaemonCommand {
     Governance {
         #[command(subcommand)]
         command: GovernanceCommand,
+    },
+    Payment {
+        #[command(subcommand)]
+        command: NodePaymentCommand,
+    },
+}
+
+#[derive(Subcommand, Serialize, Deserialize)]
+pub(crate) enum NodePaymentCommand {
+    Unsettled,
+    Abandon {
+        authorization_id: String,
+    },
+    Policy {
+        #[command(subcommand)]
+        command: NodePaymentPolicyCommand,
+    },
+}
+
+#[derive(Subcommand, Serialize, Deserialize)]
+pub(crate) enum NodePaymentPolicyCommand {
+    Show {
+        #[arg(long)]
+        network: Option<String>,
+    },
+    Set {
+        #[arg(long)]
+        network: Option<String>,
+        #[arg(long)]
+        max_auto_abandon_bytes: u64,
+    },
+    Clear {
+        #[arg(long)]
+        network: String,
     },
 }
 
@@ -479,12 +541,30 @@ fn governance_parameter_parser(value: &str) -> std::result::Result<String, Strin
 }
 
 impl RelayHub {
-    fn production(paths: DataPaths, node_id: u64) -> Self {
-        Self {
+    fn production(
+        paths: DataPaths,
+        node_id: u64,
+        settlement_wakeup: SyncSender<()>,
+        node_name: String,
+        node_password: String,
+    ) -> Result<Self> {
+        paths.promote_active_relay_sessions(Utc::now().timestamp())?;
+        auto_abandon_lost_relay_sessions(
+            &paths,
+            &node_name,
+            &node_password,
+            node_id,
+            Utc::now().timestamp(),
+            &HashSet::new(),
+        );
+        Ok(Self {
             state: Mutex::new(HubState::default()),
             paths: Some(paths),
             node_id: Some(node_id),
-        }
+            settlement_wakeup: Some(settlement_wakeup),
+            node_name: Some(node_name),
+            node_password: Some(node_password),
+        })
     }
 
     fn register(&self, member: AuthenticatedMember, sender: SyncSender<WsMessage>) -> Result<u64> {
@@ -529,17 +609,54 @@ impl RelayHub {
                 state.member_connections.remove(&key);
             }
         }
-        let closed =
-            state
-                .routes
-                .iter()
-                .filter_map(|(channel_id, route)| {
-                    (route.source == connection_id || route.destination == connection_id)
-                        .then_some((*channel_id, route.source, route.destination))
-                })
-                .collect::<Vec<_>>();
-        for (channel_id, source, destination) in closed {
+        let closed = state
+            .routes
+            .iter()
+            .filter_map(|(channel_id, route)| {
+                (route.source == connection_id || route.destination == connection_id).then_some((
+                    *channel_id,
+                    route.source,
+                    route.destination,
+                    route.authorization.clone(),
+                    route.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        for (channel_id, source, destination, authorization, route) in closed {
             state.routes.remove(&channel_id);
+            if let (Some(paths), Some(view)) = (&self.paths, authorization)
+                && !(route.source_direction.final_receipt_persisted
+                    && route.destination_direction.final_receipt_persisted)
+            {
+                let interrupted_at = Utc::now().timestamp();
+                let authorization_id = view.authorization.authorization_id.clone();
+                state.interrupted_routes.insert(
+                    authorization_id.clone(),
+                    InterruptedRoute {
+                        authorization: view.clone(),
+                        source_sequence: route.source_sequence,
+                        destination_sequence: route.destination_sequence,
+                        source_direction: route.source_direction,
+                        destination_direction: route.destination_direction,
+                        disconnected_at: interrupted_at,
+                    },
+                );
+                let authorization = view.authorization;
+                let _ = paths.store_unsettled_relay_session(&UnsettledRelaySession {
+                    authorization_id: authorization.authorization_id,
+                    network_id: authorization.network_id,
+                    network_commitment: authorization.network_commitment,
+                    node_id: authorization.node_id,
+                    sender_member_id: authorization.sender_member_id,
+                    receiver_member_id: authorization.receiver_member_id,
+                    disconnected_at: interrupted_at,
+                });
+                let _ = paths.remove_active_relay_session(&authorization_id);
+            } else if let (Some(paths), Some(view)) = (&self.paths, &route.authorization) {
+                let authorization_id = &view.authorization.authorization_id;
+                let _ = paths.remove_active_relay_session(authorization_id);
+                let _ = paths.remove_unsettled_relay_session(authorization_id);
+            }
             let other = if source == connection_id {
                 destination
             } else {
@@ -558,6 +675,181 @@ impl RelayHub {
                 );
             }
         }
+    }
+
+    fn tick_payment_windows(&self, now: i64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::msg("relay connection state lock is poisoned"))?;
+        let mut requests = Vec::new();
+        for (channel_id, route) in &mut state.routes {
+            if route.recovery {
+                continue;
+            }
+            let Some(view) = &route.authorization else {
+                continue;
+            };
+            for (connection_id, direction, sequence, direction_state) in [
+                (
+                    route.source,
+                    RelayDirection::SenderToReceiver,
+                    route.source_sequence,
+                    &mut route.source_direction,
+                ),
+                (
+                    route.destination,
+                    RelayDirection::ReceiverToSender,
+                    route.destination_sequence,
+                    &mut route.destination_direction,
+                ),
+            ] {
+                let elapsed = direction_state.window_started_at.is_some_and(|started| {
+                    now.saturating_sub(started) >= RELAY_PAYMENT_WINDOW_SECONDS
+                });
+                if elapsed
+                    && direction_state.cumulative_bytes > direction_state.window_started_bytes
+                    && direction_state.checkpoint_request.is_none()
+                    && !direction_state.awaiting_receipt
+                {
+                    let request = schedule_checkpoint_request(
+                        view,
+                        direction,
+                        sequence,
+                        direction_state,
+                        false,
+                        now,
+                    );
+                    requests.push((connection_id, *channel_id, request));
+                }
+            }
+        }
+        for (connection_id, channel_id, request) in requests {
+            let peer = state
+                .peers
+                .get(&connection_id)
+                .ok_or_else(|| Error::msg("checkpoint sender is no longer connected"))?;
+            send_relay_frame(
+                &peer.sender,
+                RelayFrame {
+                    frame_type: FrameType::CheckpointRequest,
+                    flags: if request.final_checkpoint {
+                        RELAY_CHECKPOINT_FINAL_FLAG
+                    } else {
+                        0
+                    },
+                    channel_id,
+                    sequence: request.sequence,
+                    payload: serde_json::to_vec(&request)?,
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn tick_interrupted_routes(&self, now: i64) {
+        let (Some(paths), Some(node_name), Some(password)) =
+            (&self.paths, &self.node_name, &self.node_password)
+        else {
+            return;
+        };
+        let (candidates, in_memory_authorizations) = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.last_recovery_policy_at == now {
+                return;
+            }
+            state.last_recovery_policy_at = now;
+            let in_memory = state
+                .interrupted_routes
+                .keys()
+                .cloned()
+                .collect::<HashSet<_>>();
+            let candidates = state
+                .interrupted_routes
+                .iter()
+                .filter(|(_, route)| {
+                    now.saturating_sub(route.disconnected_at) >= RELAY_RECOVERY_GRACE_SECONDS
+                })
+                .map(|(authorization_id, route)| {
+                    let unsigned_bytes = route
+                        .source_direction
+                        .cumulative_bytes
+                        .saturating_sub(route.source_direction.window_started_bytes)
+                        .saturating_add(
+                            route
+                                .destination_direction
+                                .cumulative_bytes
+                                .saturating_sub(route.destination_direction.window_started_bytes),
+                        );
+                    (
+                        authorization_id.clone(),
+                        route.authorization.clone(),
+                        unsigned_bytes,
+                    )
+                })
+                .collect::<Vec<_>>();
+            (candidates, in_memory)
+        };
+        let pending_authorizations = match paths.pending_traffic_settlements() {
+            Ok(pending) => pending
+                .into_iter()
+                .map(|pending| pending.sender_checkpoint.authorization_id)
+                .collect::<HashSet<_>>(),
+            Err(error) => {
+                eprintln!("could not read pending Relay receipts: {error}");
+                return;
+            }
+        };
+        for (authorization_id, view, unsigned_bytes) in candidates {
+            if pending_authorizations.contains(&authorization_id) {
+                continue;
+            }
+            let config = match paths.read_node_config(node_name) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("could not read Relay auto-abandon policy: {error}");
+                    return;
+                }
+            };
+            let limit = config
+                .relay_auto_abandon
+                .max_bytes_for(&view.authorization.network_commitment);
+            if !record_auto_abandon_budget(paths, &view.authorization, unsigned_bytes, limit, now) {
+                continue;
+            }
+            match service::abandon_traffic_authorization_with_note(
+                paths,
+                node_name,
+                password,
+                &authorization_id,
+                &format!(
+                    "node automatically abandoned {unsigned_bytes} bytes after Relay recovery timeout"
+                ),
+                now,
+            ) {
+                Ok(operation_id) => {
+                    eprintln!(
+                        "Relay auto-abandoned {unsigned_bytes} bytes for {authorization_id} ({operation_id})"
+                    );
+                    if let Ok(mut state) = self.state.lock() {
+                        state.interrupted_routes.remove(&authorization_id);
+                    }
+                }
+                Err(error) => {
+                    eprintln!("Relay auto-abandon failed for {authorization_id}: {error}");
+                }
+            }
+        }
+        auto_abandon_lost_relay_sessions(
+            paths,
+            node_name,
+            password,
+            self.node_id.unwrap_or_default(),
+            now,
+            &in_memory_authorizations,
+        );
     }
 
     fn handle_frame(&self, connection_id: u64, frame: RelayFrame) -> Result<()> {
@@ -588,6 +880,8 @@ impl RelayHub {
                     );
                 }
                 let request: OpenPayload = serde_json::from_slice(&frame.payload)?;
+                let mut recovery = false;
+                let mut recovery_session = None;
                 if state.routes.values().any(|route| {
                     route.authorization.as_ref().is_some_and(|view| {
                         view.authorization.authorization_id == request.authorization_id
@@ -606,6 +900,37 @@ impl RelayHub {
                         "payment authorization has an unsettled receipt; retry after settlement",
                     ));
                 }
+                if let (Some(paths), Some(node_id)) = (&self.paths, self.node_id) {
+                    let holds = active_unsettled_relay_sessions(paths, node_id)?;
+                    let recovery_hold = holds
+                        .iter()
+                        .find(|hold| hold.authorization_id == request.authorization_id)
+                        .cloned();
+                    if recovery_hold.is_some() {
+                        recovery_session = state
+                            .interrupted_routes
+                            .get(&request.authorization_id)
+                            .cloned();
+                        if recovery_session.is_none() {
+                            return send_protocol_error(
+                                &source_peer.sender,
+                                "RECOVERY_STATE_LOST",
+                                "the Node restarted after this interrupted session; it can only be abandoned",
+                            );
+                        }
+                        recovery = true;
+                    }
+                    if holds.iter().any(|hold| {
+                        hold.network_id == source_peer.network_id
+                            && hold.authorization_id != request.authorization_id
+                    }) {
+                        return send_protocol_error(
+                            &source_peer.sender,
+                            "RECOVERY_REQUIRED",
+                            "an interrupted Relay session must be settled or abandoned before opening a new paid session",
+                        );
+                    }
+                }
                 let destination = state
                     .member_connections
                     .get(&(source_peer.network_id.clone(), request.peer_id.clone()))
@@ -614,15 +939,27 @@ impl RelayHub {
                     .ok_or_else(|| Error::msg("target member is not online"))?;
                 let destination_peer = state.peers.get(&destination).expect("online peer");
                 let authorization = match (&self.paths, self.node_id) {
-                    (Some(paths), Some(node_id)) => Some(service::validate_relay_open(
-                        paths,
-                        &request.authorization_id,
-                        node_id,
-                        &source_peer.network_id,
-                        &source_peer.member_id,
-                        &destination_peer.member_id,
-                        Utc::now().timestamp(),
-                    )?),
+                    (Some(paths), Some(node_id)) => Some(if recovery {
+                        service::validate_relay_recovery_open(
+                            paths,
+                            &request.authorization_id,
+                            node_id,
+                            &source_peer.network_id,
+                            &source_peer.member_id,
+                            &destination_peer.member_id,
+                            Utc::now().timestamp(),
+                        )?
+                    } else {
+                        service::validate_relay_open(
+                            paths,
+                            &request.authorization_id,
+                            node_id,
+                            &source_peer.network_id,
+                            &source_peer.member_id,
+                            &destination_peer.member_id,
+                            Utc::now().timestamp(),
+                        )?
+                    }),
                     _ => None,
                 };
                 let (
@@ -654,6 +991,8 @@ impl RelayHub {
                             checkpoint_due: false,
                             awaiting_receipt: false,
                             pending_checkpoint: None,
+                            checkpoint_request: None,
+                            final_receipt_persisted: settled.finalized,
                         }
                     };
                     let source_settled = authorization
@@ -666,13 +1005,30 @@ impl RelayHub {
                         .get(&RelayDirection::ReceiverToSender)
                         .cloned()
                         .unwrap_or_default();
-                    (
-                        direction_state(RelayDirection::SenderToReceiver),
-                        direction_state(RelayDirection::ReceiverToSender),
-                        source_settled.settled_sequence,
-                        destination_settled.settled_sequence,
-                        authorization.session_id.clone(),
-                    )
+                    if let Some(recovery) = &recovery_session {
+                        if recovery.source_sequence < source_settled.settled_sequence
+                            || recovery.destination_sequence < destination_settled.settled_sequence
+                        {
+                            return Err(Error::msg(
+                                "in-memory Relay recovery state is older than chain settlement",
+                            ));
+                        }
+                        (
+                            recovery.source_direction.clone(),
+                            recovery.destination_direction.clone(),
+                            recovery.source_sequence,
+                            recovery.destination_sequence,
+                            authorization.session_id.clone(),
+                        )
+                    } else {
+                        (
+                            direction_state(RelayDirection::SenderToReceiver),
+                            direction_state(RelayDirection::ReceiverToSender),
+                            source_settled.settled_sequence,
+                            destination_settled.settled_sequence,
+                            authorization.session_id.clone(),
+                        )
+                    }
                 } else {
                     (
                         DirectionState::default(),
@@ -687,6 +1043,18 @@ impl RelayHub {
                     state.next_channel_id = state.next_channel_id.wrapping_add(1).max(1);
                 }
                 let channel_id = state.next_channel_id;
+                if !recovery && let (Some(paths), Some(view)) = (&self.paths, &authorization) {
+                    let authorization = &view.authorization;
+                    paths.store_active_relay_session(&ActiveRelaySession {
+                        authorization_id: authorization.authorization_id.clone(),
+                        network_id: authorization.network_id.clone(),
+                        network_commitment: authorization.network_commitment.clone(),
+                        node_id: authorization.node_id,
+                        sender_member_id: authorization.sender_member_id.clone(),
+                        receiver_member_id: authorization.receiver_member_id.clone(),
+                        opened_at: Utc::now().timestamp(),
+                    })?;
+                }
                 state.routes.insert(
                     channel_id,
                     Route {
@@ -698,13 +1066,18 @@ impl RelayHub {
                         authorization,
                         source_direction,
                         destination_direction,
+                        recovery,
                     },
                 );
                 let incoming = IncomingPayload {
                     peer_id: source_peer.member_id,
                     authorization_id: request.authorization_id,
                     session_id,
-                    metadata: request.metadata,
+                    metadata: if recovery {
+                        "mrk-recovery-v1".to_owned()
+                    } else {
+                        request.metadata
+                    },
                 };
                 let destination_peer = state.peers.get(&destination).expect("online peer");
                 let result = send_relay_frame(
@@ -717,29 +1090,95 @@ impl RelayHub {
                         payload: serde_json::to_vec(&incoming)?,
                     },
                 );
-                if result.is_err() {
-                    state.routes.remove(&channel_id);
+                if result.is_err()
+                    && let Some(route) = state.routes.remove(&channel_id)
+                    && !route.recovery
+                    && let (Some(paths), Some(view)) = (&self.paths, route.authorization)
+                {
+                    let _ = paths.remove_active_relay_session(&view.authorization.authorization_id);
                 }
                 result
             }
             FrameType::Accept | FrameType::Reject => {
-                let route = state
-                    .routes
-                    .get_mut(&frame.channel_id)
-                    .ok_or_else(|| Error::msg("unknown relay channel"))?;
-                if route.destination != connection_id || route.accepted {
-                    return Err(Error::msg(
-                        "only the destination may answer a pending channel",
-                    ));
+                let mut checkpoint_requests = Vec::new();
+                let source = {
+                    let route = state
+                        .routes
+                        .get_mut(&frame.channel_id)
+                        .ok_or_else(|| Error::msg("unknown relay channel"))?;
+                    if route.destination != connection_id || route.accepted {
+                        return Err(Error::msg(
+                            "only the destination may answer a pending channel",
+                        ));
+                    }
+                    let source = route.source;
+                    if matches!(frame.frame_type, FrameType::Accept) {
+                        route.accepted = true;
+                        if route.recovery {
+                            let view = route.authorization.as_ref().expect("paid recovery route");
+                            if !route.source_direction.final_receipt_persisted {
+                                checkpoint_requests.push((
+                                    route.source,
+                                    schedule_checkpoint_request(
+                                        view,
+                                        RelayDirection::SenderToReceiver,
+                                        route.source_sequence,
+                                        &mut route.source_direction,
+                                        true,
+                                        Utc::now().timestamp(),
+                                    ),
+                                ));
+                            }
+                            if !route.destination_direction.final_receipt_persisted {
+                                checkpoint_requests.push((
+                                    route.destination,
+                                    schedule_checkpoint_request(
+                                        view,
+                                        RelayDirection::ReceiverToSender,
+                                        route.destination_sequence,
+                                        &mut route.destination_direction,
+                                        true,
+                                        Utc::now().timestamp(),
+                                    ),
+                                ));
+                            }
+                        }
+                    }
+                    source
+                };
+                if matches!(frame.frame_type, FrameType::Reject)
+                    && let Some(route) = state.routes.remove(&frame.channel_id)
+                    && !route.recovery
+                    && let (Some(paths), Some(view)) = (&self.paths, route.authorization)
+                {
+                    paths.remove_active_relay_session(&view.authorization.authorization_id)?;
                 }
-                let source = route.source;
-                if matches!(frame.frame_type, FrameType::Accept) {
-                    route.accepted = true;
-                } else {
-                    state.routes.remove(&frame.channel_id);
+                let source_sender = state
+                    .peers
+                    .get(&source)
+                    .expect("route source")
+                    .sender
+                    .clone();
+                let channel_id = frame.channel_id;
+                send_relay_frame(&source_sender, frame)?;
+                for (connection_id, request) in checkpoint_requests {
+                    let sender = &state
+                        .peers
+                        .get(&connection_id)
+                        .ok_or_else(|| Error::msg("recovery participant disconnected"))?
+                        .sender;
+                    send_relay_frame(
+                        sender,
+                        RelayFrame {
+                            frame_type: FrameType::CheckpointRequest,
+                            flags: RELAY_CHECKPOINT_FINAL_FLAG,
+                            channel_id,
+                            sequence: request.sequence,
+                            payload: serde_json::to_vec(&request)?,
+                        },
+                    )?;
                 }
-                let source = state.peers.get(&source).expect("route source");
-                send_relay_frame(&source.sender, frame)
+                Ok(())
             }
             FrameType::Data => {
                 let route = state
@@ -766,18 +1205,16 @@ impl RelayHub {
                 } else {
                     route.destination_sequence
                 };
-                let time_boundary_reached =
-                    current_direction.window_started_at.is_some_and(|started| {
-                        Utc::now().timestamp().saturating_sub(started)
-                            >= RELAY_PAYMENT_WINDOW_SECONDS
-                    }) && current_direction.cumulative_bytes
-                        > current_direction.window_started_bytes;
+                if route.recovery {
+                    return Err(Error::msg(
+                        "recovery channel permits checkpoint and receipt frames only",
+                    ));
+                }
                 if current_direction.awaiting_receipt
-                    || current_direction.checkpoint_due
-                    || time_boundary_reached
+                    || current_direction.checkpoint_request.is_some()
                 {
                     return Err(Error::msg(
-                        "relay direction requires a SenderCheckpoint or ReceiverReceipt",
+                        "relay direction is paused for a Node-requested checkpoint",
                     ));
                 }
                 if frame.sequence != current_sequence.saturating_add(1) {
@@ -785,8 +1222,24 @@ impl RelayHub {
                 }
                 if let Some(view) = &route.authorization {
                     let now = Utc::now().timestamp();
-                    if now >= view.authorization.valid_until {
+                    if now
+                        >= if route.recovery {
+                            view.authorization.claim_until
+                        } else {
+                            view.authorization.valid_until
+                        }
+                    {
                         return Err(Error::msg("payment authorization has expired"));
+                    }
+                    let next_window_bytes = current_direction
+                        .cumulative_bytes
+                        .saturating_sub(current_direction.window_started_bytes)
+                        .checked_add(frame.payload.len() as u64)
+                        .ok_or_else(|| Error::msg("Relay payment window overflow"))?;
+                    if next_window_bytes > RELAY_PAYMENT_WINDOW_BYTES {
+                        return Err(Error::msg(
+                            "Relay DATA frame crosses the payment window boundary",
+                        ));
                     }
                     let source_bytes = route
                         .source_direction
@@ -829,21 +1282,25 @@ impl RelayHub {
                         ));
                     }
                 }
-                let (destination, sequence, direction) = if is_source {
+                let authorization = route.authorization.clone();
+                let (destination, sequence, direction, expected_direction) = if is_source {
                     (
                         route.destination,
                         &mut route.source_sequence,
                         &mut route.source_direction,
+                        RelayDirection::SenderToReceiver,
                     )
                 } else {
                     (
                         route.source,
                         &mut route.destination_sequence,
                         &mut route.destination_direction,
+                        RelayDirection::ReceiverToSender,
                     )
                 };
                 *sequence = frame.sequence;
-                if route.authorization.is_some() {
+                let mut checkpoint_request = None;
+                if let Some(view) = &authorization {
                     let now = Utc::now().timestamp();
                     direction.window_started_at.get_or_insert(now);
                     direction.cumulative_bytes = direction
@@ -855,13 +1312,106 @@ impl RelayHub {
                         frame.sequence,
                         &frame.payload,
                     );
-                    direction.checkpoint_due = direction
-                        .cumulative_bytes
-                        .saturating_sub(direction.window_started_bytes)
-                        >= RELAY_PAYMENT_WINDOW_BYTES;
+                    if !route.recovery
+                        && direction
+                            .cumulative_bytes
+                            .saturating_sub(direction.window_started_bytes)
+                            >= RELAY_PAYMENT_WINDOW_BYTES
+                    {
+                        checkpoint_request = Some(schedule_checkpoint_request(
+                            view,
+                            expected_direction,
+                            frame.sequence,
+                            direction,
+                            false,
+                            now,
+                        ));
+                    }
                 }
                 let destination = state.peers.get(&destination).expect("route destination");
-                send_relay_frame(&destination.sender, frame)
+                send_relay_frame(&destination.sender, frame.clone())?;
+                if let Some(request) = checkpoint_request {
+                    send_relay_frame(
+                        &source_peer.sender,
+                        RelayFrame {
+                            frame_type: FrameType::CheckpointRequest,
+                            flags: 0,
+                            channel_id: frame.channel_id,
+                            sequence: request.sequence,
+                            payload: serde_json::to_vec(&request)?,
+                        },
+                    )?;
+                }
+                Ok(())
+            }
+            FrameType::CloseIntent => {
+                let route = state
+                    .routes
+                    .get_mut(&frame.channel_id)
+                    .ok_or_else(|| Error::msg("unknown relay channel"))?;
+                let view = route
+                    .authorization
+                    .as_ref()
+                    .ok_or_else(|| Error::msg("relay channel has no payment authorization"))?;
+                let intent: CloseIntent = serde_json::from_slice(&frame.payload)?;
+                let (direction, expected_direction, expected_sequence, expected_sender) =
+                    if route.source == connection_id {
+                        (
+                            &mut route.source_direction,
+                            RelayDirection::SenderToReceiver,
+                            route.source_sequence,
+                            view.authorization.sender_member_id.as_str(),
+                        )
+                    } else if route.destination == connection_id {
+                        (
+                            &mut route.destination_direction,
+                            RelayDirection::ReceiverToSender,
+                            route.destination_sequence,
+                            view.authorization.receiver_member_id.as_str(),
+                        )
+                    } else {
+                        return Err(Error::msg("connection does not own relay channel"));
+                    };
+                let now = Utc::now().timestamp();
+                if direction.awaiting_receipt
+                    || intent.authorization_id != view.authorization.authorization_id
+                    || intent.session_id != view.authorization.session_id
+                    || intent.direction != expected_direction
+                    || intent.sequence != expected_sequence
+                    || intent.cumulative_sent_bytes != direction.cumulative_bytes
+                    || intent.transcript_hash != direction.transcript_hash
+                    || intent.requested_at > now.saturating_add(30)
+                    || expected_sender != source_peer.member_id
+                {
+                    return Err(Error::msg("invalid Relay CloseIntent"));
+                }
+                let request = if let Some(request) = &direction.checkpoint_request {
+                    if !request.final_checkpoint {
+                        return Err(Error::msg(
+                            "periodic checkpoint must finish before closing Relay direction",
+                        ));
+                    }
+                    request.clone()
+                } else {
+                    schedule_checkpoint_request(
+                        view,
+                        expected_direction,
+                        expected_sequence,
+                        direction,
+                        true,
+                        now,
+                    )
+                };
+                send_relay_frame(
+                    &source_peer.sender,
+                    RelayFrame {
+                        frame_type: FrameType::CheckpointRequest,
+                        flags: RELAY_CHECKPOINT_FINAL_FLAG,
+                        channel_id: frame.channel_id,
+                        sequence: request.sequence,
+                        payload: serde_json::to_vec(&request)?,
+                    },
+                )
             }
             FrameType::SenderCheckpoint => {
                 let route = state
@@ -894,12 +1444,9 @@ impl RelayHub {
                         return Err(Error::msg("connection does not own relay channel"));
                     };
                 let now = Utc::now().timestamp();
-                let window_elapsed = direction.window_started_at.is_some_and(|started| {
-                    now.saturating_sub(started) >= RELAY_PAYMENT_WINDOW_SECONDS
-                });
-                let window_bytes = direction
-                    .cumulative_bytes
-                    .saturating_sub(direction.window_started_bytes);
+                let request = direction.checkpoint_request.as_ref().ok_or_else(|| {
+                    Error::msg("Relay SenderCheckpoint was not requested by the Node")
+                })?;
                 if direction.awaiting_receipt
                     || checkpoint.ledger_id != view.ledger_id
                     || checkpoint.protocol_version != mrk::model::PROTOCOL_VERSION
@@ -916,17 +1463,23 @@ impl RelayHub {
                         }
                     || checkpoint.cumulative_sent_bytes != direction.cumulative_bytes
                     || checkpoint.transcript_hash != direction.transcript_hash
+                    || checkpoint.sequence != request.sequence
+                    || checkpoint.cumulative_sent_bytes != request.cumulative_sent_bytes
+                    || checkpoint.transcript_hash != request.transcript_hash
+                    || checkpoint.final_checkpoint != request.final_checkpoint
+                    || checkpoint.checkpoint_at < request.requested_at
                     || checkpoint.checkpoint_at < view.authorization.created_at
-                    || checkpoint.checkpoint_at > view.authorization.valid_until
+                    || checkpoint.checkpoint_at
+                        > if route.recovery {
+                            view.authorization.claim_until
+                        } else {
+                            view.authorization.valid_until
+                        }
                     || checkpoint.checkpoint_at > now.saturating_add(30)
                     || checkpoint.final_checkpoint
                         != (frame.flags & RELAY_CHECKPOINT_FINAL_FLAG != 0)
-                    || (!direction.checkpoint_due
-                        && window_bytes < RELAY_PAYMENT_WINDOW_BYTES
-                        && !window_elapsed
-                        && frame.flags & RELAY_CHECKPOINT_FINAL_FLAG == 0)
                 {
-                    return Err(Error::msg("invalid or premature Relay SenderCheckpoint"));
+                    return Err(Error::msg("invalid Node-requested Relay SenderCheckpoint"));
                 }
                 verify_bytes(
                     public_key,
@@ -986,7 +1539,12 @@ impl RelayHub {
                     || receipt.sender_checkpoint_hash != sender_checkpoint_hash(checkpoint)?
                     || receipt.received_at < checkpoint.checkpoint_at
                     || receipt.received_at.saturating_sub(checkpoint.checkpoint_at) > 30
-                    || receipt.received_at > view.authorization.valid_until
+                    || receipt.received_at
+                        > if route.recovery {
+                            view.authorization.claim_until
+                        } else {
+                            view.authorization.valid_until
+                        }
                 {
                     return Err(Error::msg("invalid Relay ReceiverReceipt"));
                 }
@@ -1001,14 +1559,33 @@ impl RelayHub {
                         receiver_receipt: receipt,
                         submission_operation_id: None,
                     })?;
+                    if let Some(wakeup) = &self.settlement_wakeup {
+                        let _ = wakeup.try_send(());
+                    }
                 }
+                direction.final_receipt_persisted = checkpoint.final_checkpoint;
                 direction.window_started_at = None;
                 direction.window_started_bytes = direction.cumulative_bytes;
                 direction.checkpoint_due = false;
                 direction.awaiting_receipt = false;
                 direction.pending_checkpoint = None;
-                let destination = state.peers.get(&destination).expect("route destination");
-                send_relay_frame(&destination.sender, frame)
+                direction.checkpoint_request = None;
+                let fully_final = route.source_direction.final_receipt_persisted
+                    && route.destination_direction.final_receipt_persisted;
+                let authorization_id = view.authorization.authorization_id.clone();
+                if fully_final && let Some(paths) = &self.paths {
+                    paths.remove_unsettled_relay_session(&authorization_id)?;
+                }
+                let destination_sender = state
+                    .peers
+                    .get(&destination)
+                    .expect("route destination")
+                    .sender
+                    .clone();
+                if fully_final {
+                    state.interrupted_routes.remove(&authorization_id);
+                }
+                send_relay_frame(&destination_sender, frame)
             }
             FrameType::Close => {
                 let route = state
@@ -1022,6 +1599,16 @@ impl RelayHub {
                 } else {
                     return Err(Error::msg("connection does not own relay channel"));
                 };
+                if route.source_direction.final_receipt_persisted
+                    && route.destination_direction.final_receipt_persisted
+                    && let (Some(paths), Some(view)) = (&self.paths, &route.authorization)
+                {
+                    paths.remove_unsettled_relay_session(&view.authorization.authorization_id)?;
+                    paths.remove_active_relay_session(&view.authorization.authorization_id)?;
+                    state
+                        .interrupted_routes
+                        .remove(&view.authorization.authorization_id);
+                }
                 let destination = state.peers.get(&destination).expect("route destination");
                 send_relay_frame(&destination.sender, frame)
             }
@@ -1036,6 +1623,167 @@ impl RelayHub {
             _ => Err(Error::msg(
                 "relay frame type is invalid after authentication",
             )),
+        }
+    }
+}
+
+fn schedule_checkpoint_request(
+    view: &service::RelayAuthorizationView,
+    direction: RelayDirection,
+    sequence: u64,
+    state: &mut DirectionState,
+    final_checkpoint: bool,
+    requested_at: i64,
+) -> CheckpointRequest {
+    let request = CheckpointRequest {
+        authorization_id: view.authorization.authorization_id.clone(),
+        session_id: view.authorization.session_id.clone(),
+        direction,
+        sequence,
+        cumulative_sent_bytes: state.cumulative_bytes,
+        transcript_hash: state.transcript_hash.clone(),
+        requested_at,
+        final_checkpoint,
+    };
+    state.checkpoint_due = true;
+    state.checkpoint_request = Some(request.clone());
+    request
+}
+
+fn active_unsettled_relay_sessions(
+    paths: &DataPaths,
+    node_id: u64,
+) -> Result<Vec<UnsettledRelaySession>> {
+    let ledger = paths.read_ledger()?;
+    let mut active = Vec::new();
+    for session in paths.unsettled_relay_sessions()? {
+        let is_active = ledger
+            .payment_authorizations
+            .get(&session.authorization_id)
+            .is_some_and(|authorization| {
+                authorization.node_id == node_id
+                    && authorization.refunded_at.is_none()
+                    && authorization.closed_at.is_none()
+                    && authorization.reserved_remaining > 0
+            });
+        if is_active {
+            active.push(session);
+        } else {
+            paths.remove_unsettled_relay_session(&session.authorization_id)?;
+        }
+    }
+    Ok(active)
+}
+
+fn record_auto_abandon_budget(
+    paths: &DataPaths,
+    authorization: &mrk::model::PaymentAuthorizationRecord,
+    abandoned_bytes: u64,
+    limit: u64,
+    now: i64,
+) -> bool {
+    match paths.try_record_relay_auto_abandon(
+        &authorization.network_commitment,
+        &[
+            authorization.sender_member_id.as_str(),
+            authorization.receiver_member_id.as_str(),
+        ],
+        abandoned_bytes,
+        limit,
+        &authorization.authorization_id,
+        now,
+    ) {
+        Ok(recorded) => recorded,
+        Err(error) => {
+            eprintln!(
+                "could not record Relay auto-abandon budget for {}: {error}",
+                authorization.authorization_id
+            );
+            false
+        }
+    }
+}
+
+fn auto_abandon_lost_relay_sessions(
+    paths: &DataPaths,
+    node_name: &str,
+    password: &str,
+    node_id: u64,
+    now: i64,
+    excluded_authorizations: &HashSet<String>,
+) {
+    let config = match paths.read_node_config(node_name) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("could not read Relay auto-abandon policy: {error}");
+            return;
+        }
+    };
+    let ledger = match paths.read_ledger() {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            eprintln!("could not read Relay authorizations for recovery: {error}");
+            return;
+        }
+    };
+    let holds = match active_unsettled_relay_sessions(paths, node_id) {
+        Ok(holds) => holds,
+        Err(error) => {
+            eprintln!("could not read interrupted Relay sessions: {error}");
+            return;
+        }
+    };
+    let pending_authorizations = match paths.pending_traffic_settlements() {
+        Ok(pending) => pending
+            .into_iter()
+            .map(|pending| pending.sender_checkpoint.authorization_id)
+            .collect::<HashSet<_>>(),
+        Err(error) => {
+            eprintln!("could not read pending Relay receipts: {error}");
+            return;
+        }
+    };
+    for hold in holds {
+        if excluded_authorizations.contains(&hold.authorization_id)
+            || pending_authorizations.contains(&hold.authorization_id)
+        {
+            continue;
+        }
+        let Some(authorization) = ledger.payment_authorizations.get(&hold.authorization_id) else {
+            continue;
+        };
+        let limit = config
+            .relay_auto_abandon
+            .max_bytes_for(&authorization.network_commitment);
+        if limit < RELAY_UNKNOWN_TAIL_MAX_BYTES
+            || !record_auto_abandon_budget(
+                paths,
+                authorization,
+                RELAY_UNKNOWN_TAIL_MAX_BYTES,
+                limit,
+                now,
+            )
+        {
+            continue;
+        }
+        match service::abandon_traffic_authorization_with_note(
+            paths,
+            node_name,
+            password,
+            &authorization.authorization_id,
+            &format!(
+                "node automatically abandoned an unknown Relay tail bounded by {RELAY_UNKNOWN_TAIL_MAX_BYTES} bytes after restart"
+            ),
+            now,
+        ) {
+            Ok(operation_id) => eprintln!(
+                "Relay auto-abandoned unknown tail up to {RELAY_UNKNOWN_TAIL_MAX_BYTES} bytes for {} ({operation_id})",
+                authorization.authorization_id
+            ),
+            Err(error) => eprintln!(
+                "Relay auto-abandon failed for {}: {error}",
+                authorization.authorization_id
+            ),
         }
     }
 }
@@ -1498,6 +2246,134 @@ fn execute_daemon_command(
             matches!(cli.output, Output::Json),
             ClientCommand::Governance { command },
         )?,
+        DaemonCommand::Payment { command } => match command {
+            NodePaymentCommand::Unsettled => {
+                let node = service::node_record(paths, &cli.node)?;
+                let unsettled = service::unsettled_payments(paths, None, None, Some(node.node_id))?;
+                print_value(cli.output, &unsettled, || {
+                    if unsettled.is_empty() {
+                        return "No unsettled Relay sessions.".to_owned();
+                    }
+                    unsettled
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{}  network={}  sender={}  receiver={}  disconnected_at={}",
+                                item.session.authorization_id,
+                                item.session.network_commitment,
+                                item.session.sender_member_id,
+                                item.session.receiver_member_id,
+                                item.session.disconnected_at,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })?;
+            }
+            NodePaymentCommand::Abandon { authorization_id } => {
+                let password = read_password("Node Owner password: ")?;
+                let operation_id = service::abandon_traffic_authorization(
+                    paths,
+                    &cli.node,
+                    &password,
+                    &authorization_id,
+                    Utc::now().timestamp(),
+                )?;
+                print_value(
+                    cli.output,
+                    &serde_json::json!({
+                        "operation_id": operation_id,
+                        "authorization_id": authorization_id,
+                        "status": "FINALIZED",
+                    }),
+                    || {
+                        format!(
+                            "ABANDONED\nAuthorization: {authorization_id}\nRefund operation: {operation_id}"
+                        )
+                    },
+                )?;
+            }
+            NodePaymentCommand::Policy { command } => match command {
+                NodePaymentPolicyCommand::Show { network } => {
+                    let config = paths.read_node_config(&cli.node)?;
+                    let commitment = network
+                        .as_deref()
+                        .map(|network| service::network_by_alias(paths, network))
+                        .transpose()?
+                        .map(|network| network.commitment);
+                    let effective = commitment
+                        .as_deref()
+                        .map(|commitment| config.relay_auto_abandon.max_bytes_for(commitment));
+                    let value = serde_json::json!({
+                        "default_max_auto_abandon_bytes": config.relay_auto_abandon.default_max_bytes,
+                        "network": network,
+                        "network_commitment": commitment,
+                        "effective_max_auto_abandon_bytes": effective,
+                        "network_overrides": config.relay_auto_abandon.network_max_bytes,
+                    });
+                    print_value(cli.output, &value, || {
+                        if let (Some(network), Some(effective)) =
+                            (value["network"].as_str(), effective)
+                        {
+                            format!("Network: {network}\nMax auto-abandon bytes: {effective}")
+                        } else {
+                            format!(
+                                "Default max auto-abandon bytes: {}\nNetwork overrides: {}",
+                                config.relay_auto_abandon.default_max_bytes,
+                                config.relay_auto_abandon.network_max_bytes.len(),
+                            )
+                        }
+                    })?;
+                }
+                NodePaymentPolicyCommand::Set {
+                    network,
+                    max_auto_abandon_bytes,
+                } => {
+                    let mut config = paths.read_node_config(&cli.node)?;
+                    let commitment = network
+                        .as_deref()
+                        .map(|network| service::network_by_alias(paths, network))
+                        .transpose()?
+                        .map(|network| network.commitment);
+                    if let Some(commitment) = &commitment {
+                        config
+                            .relay_auto_abandon
+                            .network_max_bytes
+                            .insert(commitment.clone(), max_auto_abandon_bytes);
+                    } else {
+                        config.relay_auto_abandon.default_max_bytes = max_auto_abandon_bytes;
+                    }
+                    paths.write_node_config(&config)?;
+                    let value = serde_json::json!({
+                        "network": network,
+                        "network_commitment": commitment,
+                        "max_auto_abandon_bytes": max_auto_abandon_bytes,
+                    });
+                    print_value(cli.output, &value, || {
+                        format!("Max auto-abandon bytes: {max_auto_abandon_bytes}")
+                    })?;
+                }
+                NodePaymentPolicyCommand::Clear { network } => {
+                    let commitment = service::network_by_alias(paths, &network)?.commitment;
+                    let mut config = paths.read_node_config(&cli.node)?;
+                    config
+                        .relay_auto_abandon
+                        .network_max_bytes
+                        .remove(&commitment);
+                    let effective = config.relay_auto_abandon.default_max_bytes;
+                    paths.write_node_config(&config)?;
+                    let value = serde_json::json!({
+                        "network": network,
+                        "network_commitment": commitment,
+                        "max_auto_abandon_bytes": effective,
+                        "inherited": true,
+                    });
+                    print_value(cli.output, &value, || {
+                        format!("Network override cleared; max auto-abandon bytes: {effective}")
+                    })?;
+                }
+            },
+        },
     }
     Ok(())
 }
@@ -2271,9 +3147,19 @@ fn run_node_server(
         };
 
         if hub.is_none() {
-            hub = Some(Arc::new(RelayHub::production(paths.clone(), node_id)));
+            let settlement_wakeup = spawn_traffic_settlement_worker(
+                paths.clone(),
+                name.to_owned(),
+                password.to_owned(),
+            );
+            hub = Some(Arc::new(RelayHub::production(
+                paths.clone(),
+                node_id,
+                settlement_wakeup,
+                name.to_owned(),
+                password.to_owned(),
+            )?));
             spawn_consensus_gossip(paths.clone(), name.to_owned(), password.to_owned());
-            spawn_traffic_settlement_worker(paths.clone(), name.to_owned(), password.to_owned());
         }
 
         if public_listener.is_none() {
@@ -2356,6 +3242,12 @@ fn run_node_server(
             last_history_prune = Instant::now();
         }
 
+        if let Some(hub) = &hub {
+            let now = Utc::now().timestamp();
+            hub.tick_payment_windows(now)?;
+            hub.tick_interrupted_routes(now);
+        }
+
         let node = service::node_tick(paths, name, Utc::now().timestamp())?;
         if matches!(node.status, NodeStatus::Exited) {
             println!("Node drained and exited.");
@@ -2414,7 +3306,12 @@ fn run_node_server(
     }
 }
 
-fn spawn_traffic_settlement_worker(paths: DataPaths, name: String, password: String) {
+fn spawn_traffic_settlement_worker(
+    paths: DataPaths,
+    name: String,
+    password: String,
+) -> SyncSender<()> {
+    let (wakeup, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         loop {
             if let Err(error) = flush_pending_traffic_settlements(&paths, &name, &password)
@@ -2422,9 +3319,13 @@ fn spawn_traffic_settlement_worker(paths: DataPaths, name: String, password: Str
             {
                 eprintln!("traffic settlement flush failed: {error}");
             }
-            thread::sleep(Duration::from_secs(300));
+            match receiver.recv_timeout(Duration::from_secs(300)) {
+                Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            }
         }
     });
+    wakeup
 }
 
 fn flush_pending_traffic_settlements(paths: &DataPaths, name: &str, password: &str) -> Result<()> {
@@ -3085,6 +3986,17 @@ fn execute_public_rpc(paths: &DataPaths, request: RpcRequest) -> Result<serde_js
                 .unwrap_or(20)
                 .min(1_000) as usize;
             serde_json::to_value(service::payment_history(paths, network, member, limit)?)?
+        }
+        "payment.unsettled" => {
+            let network = request
+                .params
+                .get("network")
+                .and_then(serde_json::Value::as_str);
+            let member = request
+                .params
+                .get("member")
+                .and_then(serde_json::Value::as_str);
+            serde_json::to_value(service::unsettled_payments(paths, network, member, None)?)?
         }
         "treasury.status" => serde_json::to_value(service::treasury_status(paths, now)?)?,
         "treasury.history" => {
@@ -3764,6 +4676,75 @@ mod tests {
             .unwrap(),
         );
         assert!(hub.handle_frame(alice, open).is_err());
+    }
+
+    #[test]
+    fn relay_node_requests_checkpoint_when_time_window_expires() {
+        let hub = RelayHub::default();
+        let (alice_sender, alice_receiver) = std::sync::mpsc::sync_channel(8);
+        let (bob_sender, _bob_receiver) = std::sync::mpsc::sync_channel(8);
+        let alice = hub
+            .register(member("network", "alice"), alice_sender)
+            .unwrap();
+        let bob = hub.register(member("network", "bob"), bob_sender).unwrap();
+        let now = Utc::now().timestamp();
+        let authorization = mrk::model::PaymentAuthorizationRecord {
+            authorization_id: "authorization".to_owned(),
+            network_commitment: "commitment".to_owned(),
+            network_id: "network".to_owned(),
+            payer_address: "payer".to_owned(),
+            node_id: 1,
+            sender_member_id: "alice".to_owned(),
+            receiver_member_id: "bob".to_owned(),
+            session_id: "11".repeat(32),
+            price_per_gib: 1,
+            max_amount: 1,
+            reserved_remaining: 1,
+            settled_amount: 0,
+            created_at: now - 1_000,
+            valid_until: now + 1_000,
+            claim_until: now + 2_000,
+            refunded_at: None,
+            closed_at: None,
+            directions: std::collections::BTreeMap::new(),
+            initiator_member_id: "alice".to_owned(),
+            spending_policy_revision: 1,
+        };
+        hub.state.lock().unwrap().routes.insert(
+            7,
+            Route {
+                source: alice,
+                destination: bob,
+                accepted: true,
+                source_sequence: 1,
+                destination_sequence: 0,
+                authorization: Some(service::RelayAuthorizationView {
+                    ledger_id: "ledger".to_owned(),
+                    authorization,
+                    sender_public_key: "sender-key".to_owned(),
+                    receiver_public_key: "receiver-key".to_owned(),
+                    finalized: true,
+                }),
+                source_direction: DirectionState {
+                    cumulative_bytes: 10,
+                    transcript_hash: "transcript".to_owned(),
+                    window_started_at: Some(now - RELAY_PAYMENT_WINDOW_SECONDS),
+                    window_started_bytes: 0,
+                    ..DirectionState::default()
+                },
+                destination_direction: DirectionState::default(),
+                recovery: false,
+            },
+        );
+
+        hub.tick_payment_windows(now).unwrap();
+        let frame = queued_frame(&alice_receiver);
+        assert_eq!(frame.frame_type, FrameType::CheckpointRequest);
+        let request: CheckpointRequest = serde_json::from_slice(&frame.payload).unwrap();
+        assert_eq!(request.sequence, 1);
+        assert_eq!(request.cumulative_sent_bytes, 10);
+        assert_eq!(request.transcript_hash, "transcript");
+        assert!(!request.final_checkpoint);
     }
 
     #[test]

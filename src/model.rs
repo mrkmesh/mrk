@@ -893,11 +893,28 @@ pub struct LocalNodeConfig {
     pub bootstrap_allow_insecure_local: bool,
     #[serde(default)]
     pub bootstrap_tls_ca: Option<String>,
+    #[serde(default)]
+    pub relay_auto_abandon: RelayAutoAbandonPolicy,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RelayAutoAbandonPolicy {
+    pub default_max_bytes: u64,
+    pub network_max_bytes: BTreeMap<String, u64>,
+}
+
+impl RelayAutoAbandonPolicy {
+    pub fn max_bytes_for(&self, network_commitment: &str) -> u64 {
+        self.network_max_bytes
+            .get(network_commitment)
+            .copied()
+            .unwrap_or(self.default_max_bytes)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{LedgerSettings, LedgerState};
+    use super::{LedgerSettings, LedgerState, RelayAutoAbandonPolicy};
 
     #[test]
     fn epoch_defaults_to_thirty_minutes_and_five_hundred_mrk() {
@@ -923,5 +940,16 @@ mod tests {
             super::AvailabilityMode::Node1Trusted
         );
         assert_eq!(ledger.version, super::PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn relay_auto_abandon_policy_uses_network_override_then_node_default() {
+        let mut policy = RelayAutoAbandonPolicy {
+            default_max_bytes: 10,
+            ..Default::default()
+        };
+        policy.network_max_bytes.insert("network-a".to_owned(), 20);
+        assert_eq!(policy.max_bytes_for("network-a"), 20);
+        assert_eq!(policy.max_bytes_for("network-b"), 10);
     }
 }

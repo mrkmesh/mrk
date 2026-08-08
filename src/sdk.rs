@@ -43,12 +43,13 @@ use crate::{
         PROTOCOL_VERSION, RelayDirection, SignedOperation, UnsignedOperation,
     },
     relay::{
-        ChallengePayload, FrameType, HelloPayload, IncomingPayload, OpenPayload,
-        RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES, RELAY_PAYMENT_WINDOW_SECONDS,
-        ReceiverReceipt, RelayFrame, SenderCheckpoint, WelcomePayload, WsMessage,
-        credential_signing_bytes, hello_signing_bytes, read_ws_message_async,
-        receiver_receipt_signing_bytes, relay_transcript_initial_hash, relay_transcript_next_hash,
-        sender_checkpoint_hash, sender_checkpoint_signing_bytes, write_ws_message_async,
+        ChallengePayload, CheckpointRequest, CloseIntent, FrameType, HelloPayload, IncomingPayload,
+        OpenPayload, RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES,
+        RELAY_PAYMENT_WINDOW_SECONDS, ReceiverReceipt, RelayFrame, SenderCheckpoint,
+        WelcomePayload, WsMessage, credential_signing_bytes, hello_signing_bytes,
+        read_ws_message_async, receiver_receipt_signing_bytes, relay_transcript_initial_hash,
+        relay_transcript_next_hash, sender_checkpoint_hash, sender_checkpoint_signing_bytes,
+        write_ws_message_async,
     },
     relay_client::{BoxedIo, connect_websocket, rpc_call},
     service::{self, RelayAuthorizationView},
@@ -433,7 +434,7 @@ impl RelayConnection {
         let _guard = self.inner.open_lock.lock().await;
         let authorization_id = self.reserve_member_session(&peer_id).await?;
         let view = self
-            .resolve_authorization(&authorization_id, true, &peer_id)
+            .resolve_authorization(&authorization_id, true, &peer_id, false)
             .await?;
         let (response, receiver) = oneshot::channel();
         self.inner
@@ -441,6 +442,7 @@ impl RelayConnection {
             .send(DriverCommand::Open {
                 peer_id,
                 authorization_id,
+                recovery: false,
                 commands: self.inner.commands.clone(),
                 response,
             })
@@ -448,6 +450,74 @@ impl RelayConnection {
             .map_err(|_| RelayError::ConnectionClosed)?;
         let transport = receiver.await.map_err(|_| RelayError::ConnectionClosed)??;
         build_encrypted_stream(self.inner.clone(), transport, view, true).await
+    }
+
+    /// Reopens an existing authorization without reserving additional Network
+    /// Fund. This is used by both members to exchange final receipts after an
+    /// interrupted Relay connection.
+    pub async fn open_existing(
+        &self,
+        peer_id: impl Into<String>,
+        authorization_id: impl Into<String>,
+    ) -> Result<EncryptedStream, RelayError> {
+        let peer_id = peer_id.into();
+        let authorization_id = authorization_id.into();
+        let _guard = self.inner.open_lock.lock().await;
+        let view = self
+            .resolve_authorization(&authorization_id, true, &peer_id, true)
+            .await?;
+        let (response, receiver) = oneshot::channel();
+        self.inner
+            .commands
+            .send(DriverCommand::Open {
+                peer_id,
+                authorization_id,
+                recovery: true,
+                commands: self.inner.commands.clone(),
+                response,
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        let transport = receiver.await.map_err(|_| RelayError::ConnectionClosed)??;
+        build_encrypted_stream(self.inner.clone(), transport, view, true).await
+    }
+
+    /// Completes an interrupted authorization without replaying application DATA.
+    /// The byte limit bounds how much Node-reported traffic this restarted SDK is
+    /// willing to sign without its original in-memory transcript.
+    pub async fn recover_existing(
+        &self,
+        peer_id: impl Into<String>,
+        authorization_id: impl Into<String>,
+        max_auto_recovery_bytes: u64,
+    ) -> Result<(), RelayError> {
+        let peer_id = peer_id.into();
+        let authorization_id = authorization_id.into();
+        let _guard = self.inner.open_lock.lock().await;
+        let view = self
+            .resolve_authorization(&authorization_id, true, &peer_id, true)
+            .await?;
+        let (response, receiver) = oneshot::channel();
+        self.inner
+            .commands
+            .send(DriverCommand::Open {
+                peer_id,
+                authorization_id,
+                recovery: true,
+                commands: self.inner.commands.clone(),
+                response,
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        let transport = receiver.await.map_err(|_| RelayError::ConnectionClosed)??;
+        run_recovery_channel(
+            transport,
+            &self.inner.options.identity,
+            &view,
+            true,
+            max_auto_recovery_bytes,
+        )
+        .await
     }
 
     pub async fn accept(&self) -> Result<IncomingStream, RelayError> {
@@ -482,6 +552,7 @@ impl RelayConnection {
         authorization_id: &str,
         initiator: bool,
         peer_id: &str,
+        recovery: bool,
     ) -> Result<RelayAuthorizationView, RelayError> {
         let endpoint = self.rpc_endpoint()?;
         let value = rpc_call(
@@ -502,6 +573,7 @@ impl RelayConnection {
             authorization_id,
             peer_id,
             initiator,
+            recovery,
         )?;
         Ok(view)
     }
@@ -698,11 +770,23 @@ impl IncomingStream {
             .authorization_id
     }
 
+    pub fn is_recovery(&self) -> bool {
+        self.event
+            .as_ref()
+            .expect("pending incoming stream")
+            .recovery
+    }
+
     pub async fn accept(mut self) -> Result<EncryptedStream, RelayError> {
         let event = self.event.as_ref().expect("pending incoming stream");
         let view = self
             .connection
-            .resolve_authorization(&event.authorization_id, false, &event.peer_id)
+            .resolve_authorization(
+                &event.authorization_id,
+                false,
+                &event.peer_id,
+                event.recovery,
+            )
             .await?;
         let event = self.event.take().expect("pending incoming stream");
         let (response, receiver) = oneshot::channel();
@@ -718,6 +802,40 @@ impl IncomingStream {
             .map_err(|_| RelayError::ConnectionClosed)?;
         let transport = receiver.await.map_err(|_| RelayError::ConnectionClosed)??;
         build_encrypted_stream(self.connection.inner.clone(), transport, view, false).await
+    }
+
+    pub async fn recover(mut self, max_auto_recovery_bytes: u64) -> Result<(), RelayError> {
+        let event = self.event.as_ref().expect("pending incoming stream");
+        if !event.recovery {
+            return Err(RelayError::Protocol(
+                "ordinary Relay stream cannot be accepted as recovery".to_owned(),
+            ));
+        }
+        let view = self
+            .connection
+            .resolve_authorization(&event.authorization_id, false, &event.peer_id, true)
+            .await?;
+        let event = self.event.take().expect("pending incoming stream");
+        let (response, receiver) = oneshot::channel();
+        self.connection
+            .inner
+            .commands
+            .send(DriverCommand::Accept {
+                channel_id: event.channel_id,
+                commands: self.connection.inner.commands.clone(),
+                response,
+            })
+            .await
+            .map_err(|_| RelayError::ConnectionClosed)?;
+        let transport = receiver.await.map_err(|_| RelayError::ConnectionClosed)??;
+        run_recovery_channel(
+            transport,
+            &self.connection.inner.options.identity,
+            &view,
+            false,
+            max_auto_recovery_bytes,
+        )
+        .await
     }
 
     pub async fn reject(mut self) -> Result<(), RelayError> {
@@ -751,12 +869,14 @@ struct IncomingEvent {
     channel_id: u32,
     peer_id: String,
     authorization_id: String,
+    recovery: bool,
 }
 
 enum DriverCommand {
     Open {
         peer_id: String,
         authorization_id: String,
+        recovery: bool,
         commands: mpsc::Sender<DriverCommand>,
         response: oneshot::Sender<Result<ChannelTransport, RelayError>>,
     },
@@ -827,7 +947,7 @@ async fn run_connection_driver(
             command = commands.recv() => {
                 let Some(command) = command else { break };
                 match command {
-                    DriverCommand::Open { peer_id, authorization_id, commands, response } => {
+                    DriverCommand::Open { peer_id, authorization_id, recovery, commands, response } => {
                         if pending_open.is_some() {
                             let _ = response.send(Err(RelayError::Protocol(
                                 "another Relay OPEN is already pending".to_owned(),
@@ -839,7 +959,11 @@ async fn run_connection_driver(
                             match serde_json::to_vec(&OpenPayload {
                                 peer_id,
                                 authorization_id,
-                                metadata: String::new(),
+                                metadata: if recovery {
+                                    "mrk-recovery-v1".to_owned()
+                                } else {
+                                    String::new()
+                                },
                             }) {
                                 Ok(payload) => payload,
                                 Err(error) => {
@@ -952,11 +1076,13 @@ async fn run_connection_driver(
                                     channel_id: frame.channel_id,
                                     peer_id: payload.peer_id,
                                     authorization_id: payload.authorization_id,
+                                    recovery: payload.metadata == "mrk-recovery-v1",
                                 }).await.is_err() {
                                     break;
                                 }
                             }
                             FrameType::Data
+                            | FrameType::CheckpointRequest
                             | FrameType::SenderCheckpoint
                             | FrameType::ReceiverReceipt
                             | FrameType::Close => {
@@ -1094,6 +1220,7 @@ fn validate_authorization(
     authorization_id: &str,
     peer_id: &str,
     initiator: bool,
+    recovery: bool,
 ) -> Result<(), RelayError> {
     let authorization = &view.authorization;
     let (expected_local, expected_peer, expected_local_key) = if initiator {
@@ -1118,7 +1245,12 @@ fn validate_authorization(
         || peer_id != expected_peer
         || authorization.refunded_at.is_some()
         || authorization.reserved_remaining == 0
-        || Utc::now().timestamp() >= authorization.valid_until
+        || Utc::now().timestamp()
+            >= if recovery {
+                authorization.claim_until
+            } else {
+                authorization.valid_until
+            }
     {
         return Err(RelayError::Authorization(
             "payment authorization does not match this stream".to_owned(),
@@ -1272,7 +1404,7 @@ struct DirectionState {
     sequence: u64,
     cumulative_bytes: u64,
     transcript_hash: String,
-    window_started_at: Option<Instant>,
+    window_started_at: Option<i64>,
     window_started_bytes: u64,
     awaiting_receipt: bool,
     pending_checkpoint: Option<SenderCheckpoint>,
@@ -1725,7 +1857,9 @@ fn advance_outgoing_state(state: &mut DirectionState, payload: &[u8]) -> Result<
         .sequence
         .checked_add(1)
         .ok_or_else(|| RelayError::Protocol("Relay DATA sequence overflow".to_owned()))?;
-    state.window_started_at.get_or_insert_with(Instant::now);
+    state
+        .window_started_at
+        .get_or_insert_with(|| Utc::now().timestamp());
     state.cumulative_bytes = state
         .cumulative_bytes
         .checked_add(payload.len() as u64)
@@ -1745,7 +1879,9 @@ fn advance_incoming_state(
         ));
     }
     state.sequence = frame.sequence;
-    state.window_started_at.get_or_insert_with(Instant::now);
+    state
+        .window_started_at
+        .get_or_insert_with(|| Utc::now().timestamp());
     state.cumulative_bytes = state
         .cumulative_bytes
         .checked_add(frame.payload.len() as u64)
@@ -1934,6 +2070,291 @@ async fn build_encrypted_stream(
     })
 }
 
+async fn run_recovery_channel(
+    mut transport: ChannelTransport,
+    identity: &MemberIdentity,
+    view: &RelayAuthorizationView,
+    initiator: bool,
+    max_auto_recovery_bytes: u64,
+) -> Result<(), RelayError> {
+    let outgoing_direction = if initiator {
+        RelayDirection::SenderToReceiver
+    } else {
+        RelayDirection::ReceiverToSender
+    };
+    let incoming_direction = if initiator {
+        RelayDirection::ReceiverToSender
+    } else {
+        RelayDirection::SenderToReceiver
+    };
+    let direction_finalized = |direction| {
+        view.authorization
+            .directions
+            .get(&direction)
+            .is_some_and(|state| state.finalized)
+    };
+    let mut outgoing_done = direction_finalized(outgoing_direction);
+    let mut incoming_done = direction_finalized(incoming_direction);
+    let mut outgoing_delta = outgoing_done.then_some(0_u64);
+    let mut incoming_delta = incoming_done.then_some(0_u64);
+    let mut pending_checkpoint = None;
+
+    loop {
+        if outgoing_done && incoming_done && initiator {
+            transport
+                .send(RelayFrame {
+                    frame_type: FrameType::Close,
+                    flags: 0,
+                    channel_id: transport.channel_id,
+                    sequence: 0,
+                    payload: Vec::new(),
+                })
+                .await?;
+            return Ok(());
+        }
+        let frame = tokio::time::timeout(Duration::from_secs(30), transport.receive())
+            .await
+            .map_err(|_| {
+                RelayError::Protocol("timed out waiting for Relay recovery receipts".to_owned())
+            })??;
+        match frame.frame_type {
+            FrameType::CheckpointRequest => {
+                let request: CheckpointRequest = serde_json::from_slice(&frame.payload)
+                    .map_err(|error| RelayError::Protocol(error.to_string()))?;
+                if request.direction != outgoing_direction
+                    || !request.final_checkpoint
+                    || frame.flags & RELAY_CHECKPOINT_FINAL_FLAG == 0
+                {
+                    return Err(RelayError::Protocol(
+                        "invalid final recovery CheckpointRequest".to_owned(),
+                    ));
+                }
+                let delta = recovery_delta_for_request(&request, view)?;
+                let total = delta
+                    .checked_add(incoming_delta.unwrap_or(0))
+                    .ok_or_else(|| {
+                        RelayError::Protocol("recovery byte total overflow".to_owned())
+                    })?;
+                if total > max_auto_recovery_bytes {
+                    return Err(RelayError::Authorization(format!(
+                        "Relay recovery requires signing {total} bytes, above the configured {max_auto_recovery_bytes} byte limit"
+                    )));
+                }
+                let mut checkpoint = SenderCheckpoint {
+                    ledger_id: view.ledger_id.clone(),
+                    protocol_version: PROTOCOL_VERSION,
+                    node_id: view.authorization.node_id,
+                    authorization_id: view.authorization.authorization_id.clone(),
+                    session_id: view.authorization.session_id.clone(),
+                    direction: outgoing_direction,
+                    sequence: request.sequence,
+                    cumulative_sent_bytes: request.cumulative_sent_bytes,
+                    transcript_hash: request.transcript_hash,
+                    checkpoint_at: Utc::now().timestamp(),
+                    sender_member_id: identity.credential.member_id.clone(),
+                    final_checkpoint: true,
+                    sender_signature: String::new(),
+                };
+                checkpoint.sender_signature =
+                    identity.sign(&sender_checkpoint_signing_bytes(&checkpoint)?)?;
+                transport
+                    .send(RelayFrame {
+                        frame_type: FrameType::SenderCheckpoint,
+                        flags: RELAY_CHECKPOINT_FINAL_FLAG,
+                        channel_id: transport.channel_id,
+                        sequence: checkpoint.sequence,
+                        payload: serde_json::to_vec(&checkpoint)
+                            .map_err(|error| RelayError::Protocol(error.to_string()))?,
+                    })
+                    .await?;
+                outgoing_delta = Some(delta);
+                pending_checkpoint = Some(checkpoint);
+            }
+            FrameType::SenderCheckpoint => {
+                let checkpoint: SenderCheckpoint = serde_json::from_slice(&frame.payload)
+                    .map_err(|error| RelayError::Protocol(error.to_string()))?;
+                if checkpoint.direction != incoming_direction
+                    || !checkpoint.final_checkpoint
+                    || frame.flags & RELAY_CHECKPOINT_FINAL_FLAG == 0
+                {
+                    return Err(RelayError::Protocol(
+                        "invalid final recovery SenderCheckpoint".to_owned(),
+                    ));
+                }
+                let delta = validate_recovery_checkpoint(&checkpoint, &frame, view)?;
+                let total = delta
+                    .checked_add(outgoing_delta.unwrap_or(0))
+                    .ok_or_else(|| {
+                        RelayError::Protocol("recovery byte total overflow".to_owned())
+                    })?;
+                if total > max_auto_recovery_bytes {
+                    return Err(RelayError::Authorization(format!(
+                        "Relay recovery requires signing {total} bytes, above the configured {max_auto_recovery_bytes} byte limit"
+                    )));
+                }
+                let receipt = sign_receipt(identity, &checkpoint)?;
+                transport
+                    .send(RelayFrame {
+                        frame_type: FrameType::ReceiverReceipt,
+                        flags: RELAY_CHECKPOINT_FINAL_FLAG,
+                        channel_id: transport.channel_id,
+                        sequence: checkpoint.sequence,
+                        payload: serde_json::to_vec(&receipt)
+                            .map_err(|error| RelayError::Protocol(error.to_string()))?,
+                    })
+                    .await?;
+                incoming_delta = Some(delta);
+                incoming_done = true;
+            }
+            FrameType::ReceiverReceipt => {
+                let receipt: ReceiverReceipt = serde_json::from_slice(&frame.payload)
+                    .map_err(|error| RelayError::Protocol(error.to_string()))?;
+                let checkpoint = pending_checkpoint.as_ref().ok_or_else(|| {
+                    RelayError::Protocol(
+                        "recovery receipt arrived before the local checkpoint".to_owned(),
+                    )
+                })?;
+                validate_recovery_receipt(&receipt, checkpoint, view)?;
+                outgoing_done = true;
+            }
+            FrameType::Close if !initiator && outgoing_done && incoming_done => return Ok(()),
+            FrameType::Error => return Err(frame_error(&frame.payload)),
+            _ => {
+                return Err(RelayError::Protocol(
+                    "recovery channel carried a non-settlement frame".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn recovery_delta(
+    direction: RelayDirection,
+    sequence: u64,
+    cumulative_bytes: u64,
+    view: &RelayAuthorizationView,
+) -> Result<u64, RelayError> {
+    let settled = view
+        .authorization
+        .directions
+        .get(&direction)
+        .cloned()
+        .unwrap_or_default();
+    if sequence < settled.settled_sequence || cumulative_bytes < settled.settled_payload_bytes {
+        return Err(RelayError::Protocol(
+            "Relay recovery state predates the latest settled receipt".to_owned(),
+        ));
+    }
+    cumulative_bytes
+        .checked_sub(settled.settled_payload_bytes)
+        .ok_or_else(|| RelayError::Protocol("recovery byte delta underflow".to_owned()))
+}
+
+fn recovery_delta_for_request(
+    request: &CheckpointRequest,
+    view: &RelayAuthorizationView,
+) -> Result<u64, RelayError> {
+    if request.authorization_id != view.authorization.authorization_id
+        || request.session_id != view.authorization.session_id
+        || request.requested_at > Utc::now().timestamp().saturating_add(30)
+        || request.transcript_hash.is_empty()
+    {
+        return Err(RelayError::Protocol(
+            "recovery CheckpointRequest does not match the authorization".to_owned(),
+        ));
+    }
+    recovery_delta(
+        request.direction,
+        request.sequence,
+        request.cumulative_sent_bytes,
+        view,
+    )
+}
+
+fn validate_recovery_checkpoint(
+    checkpoint: &SenderCheckpoint,
+    frame: &RelayFrame,
+    view: &RelayAuthorizationView,
+) -> Result<u64, RelayError> {
+    let (expected_member, public_key) = match checkpoint.direction {
+        RelayDirection::SenderToReceiver => (
+            view.authorization.sender_member_id.as_str(),
+            view.sender_public_key.as_str(),
+        ),
+        RelayDirection::ReceiverToSender => (
+            view.authorization.receiver_member_id.as_str(),
+            view.receiver_public_key.as_str(),
+        ),
+    };
+    if checkpoint.ledger_id != view.ledger_id
+        || checkpoint.protocol_version != PROTOCOL_VERSION
+        || checkpoint.node_id != view.authorization.node_id
+        || checkpoint.authorization_id != view.authorization.authorization_id
+        || checkpoint.session_id != view.authorization.session_id
+        || checkpoint.sequence != frame.sequence
+        || checkpoint.sender_member_id != expected_member
+        || checkpoint.checkpoint_at > Utc::now().timestamp().saturating_add(30)
+        || checkpoint.transcript_hash.is_empty()
+    {
+        return Err(RelayError::Protocol(
+            "recovery SenderCheckpoint does not match the authorization".to_owned(),
+        ));
+    }
+    verify_bytes(
+        public_key,
+        &sender_checkpoint_signing_bytes(checkpoint)?,
+        &checkpoint.sender_signature,
+    )
+    .map_err(|error| RelayError::Authentication(error.to_string()))?;
+    recovery_delta(
+        checkpoint.direction,
+        checkpoint.sequence,
+        checkpoint.cumulative_sent_bytes,
+        view,
+    )
+}
+
+fn validate_recovery_receipt(
+    receipt: &ReceiverReceipt,
+    checkpoint: &SenderCheckpoint,
+    view: &RelayAuthorizationView,
+) -> Result<(), RelayError> {
+    let (expected_member, public_key) = match checkpoint.direction {
+        RelayDirection::SenderToReceiver => (
+            view.authorization.receiver_member_id.as_str(),
+            view.receiver_public_key.as_str(),
+        ),
+        RelayDirection::ReceiverToSender => (
+            view.authorization.sender_member_id.as_str(),
+            view.sender_public_key.as_str(),
+        ),
+    };
+    if receipt.direction != checkpoint.direction
+        || receipt.ledger_id != checkpoint.ledger_id
+        || receipt.protocol_version != PROTOCOL_VERSION
+        || receipt.node_id != checkpoint.node_id
+        || receipt.authorization_id != checkpoint.authorization_id
+        || receipt.session_id != checkpoint.session_id
+        || receipt.sequence != checkpoint.sequence
+        || receipt.cumulative_received_bytes != checkpoint.cumulative_sent_bytes
+        || receipt.transcript_hash != checkpoint.transcript_hash
+        || receipt.sender_checkpoint_hash != sender_checkpoint_hash(checkpoint)?
+        || receipt.receiver_member_id != expected_member
+        || receipt.received_at < checkpoint.checkpoint_at
+        || receipt.received_at.saturating_sub(checkpoint.checkpoint_at) > 30
+    {
+        return Err(RelayError::Protocol(
+            "invalid ReceiverReceipt for Relay recovery".to_owned(),
+        ));
+    }
+    verify_bytes(
+        public_key,
+        &receiver_receipt_signing_bytes(receipt)?,
+        &receipt.receiver_signature,
+    )
+    .map_err(|error| RelayError::Authentication(error.to_string()))
+}
+
 async fn run_stream_actor(
     mut channel: EstablishedChannel,
     actor_io: DuplexStream,
@@ -1994,6 +2415,18 @@ async fn run_stream_loop(
     let mut local_fin_receipted = false;
     let mut remote_fin_receipted = false;
     loop {
+        let window_remaining = RELAY_PAYMENT_WINDOW_BYTES.saturating_sub(
+            channel
+                .outgoing
+                .cumulative_bytes
+                .saturating_sub(channel.outgoing.window_started_bytes),
+        );
+        let read_capacity = input.len().min(
+            window_remaining
+                .saturating_sub(AEAD_OVERHEAD as u64)
+                .try_into()
+                .unwrap_or(usize::MAX),
+        );
         if channel.initiator
             && local_fin
             && remote_fin
@@ -2017,7 +2450,13 @@ async fn run_stream_loop(
             return Ok(());
         }
         tokio::select! {
-            input_result = application_input.read(&mut input), if !local_fin && !channel.outgoing.awaiting_receipt => {
+            input_result = application_input.read(&mut input[..read_capacity]), if !local_fin
+                && !channel.outgoing.awaiting_receipt
+                && read_capacity > 0
+                && channel.outgoing.window_started_at.is_none_or(|started| {
+                    Utc::now().timestamp().saturating_sub(started)
+                        < RELAY_PAYMENT_WINDOW_SECONDS
+                }) => {
                 let size = input_result.map_err(|error| RelayError::Transport(error.to_string()))?;
                 if size == 0 {
                     sdk_debug("local application write half closed; sending authenticated FIN");
@@ -2030,13 +2469,11 @@ async fn run_stream_loop(
                         &[],
                     ).await?;
                     local_fin = true;
-                    send_checkpoint(
+                    send_close_intent(
                         &channel.transport,
-                        identity,
                         view,
                         channel.outgoing_direction,
-                        &mut channel.outgoing,
-                        true,
+                        &channel.outgoing,
                     ).await?;
                     continue;
                 }
@@ -2048,18 +2485,6 @@ async fn run_stream_loop(
                     RECORD_DATA,
                     &input[..size],
                 ).await?;
-                if channel.outgoing.cumulative_bytes.saturating_sub(channel.outgoing.window_started_bytes)
-                    >= RELAY_PAYMENT_WINDOW_BYTES
-                {
-                    send_checkpoint(
-                        &channel.transport,
-                        identity,
-                        view,
-                        channel.outgoing_direction,
-                        &mut channel.outgoing,
-                        false,
-                    ).await?;
-                }
             }
             frame_result = channel.transport.receive() => {
                 let frame = frame_result?;
@@ -2102,6 +2527,19 @@ async fn run_stream_loop(
                                 ));
                             }
                         }
+                    }
+                    FrameType::CheckpointRequest => {
+                        sdk_debug("received Node CheckpointRequest");
+                        let request: CheckpointRequest = serde_json::from_slice(&frame.payload)
+                            .map_err(|error| RelayError::Protocol(error.to_string()))?;
+                        send_checkpoint(
+                            &channel.transport,
+                            identity,
+                            view,
+                            channel.outgoing_direction,
+                            &mut channel.outgoing,
+                            &request,
+                        ).await?;
                     }
                     FrameType::SenderCheckpoint => {
                         sdk_debug("received SenderCheckpoint");
@@ -2173,12 +2611,9 @@ async fn run_stream_loop(
                     }
                 }
             }
-            _ = payment_timer.tick(), if !local_fin && !channel.outgoing.awaiting_receipt && channel.outgoing.window_started_at.is_some() => {
+            _ = payment_timer.tick(), if !local_fin && !channel.outgoing.awaiting_receipt => {
                 let authorization_expiring = Utc::now().timestamp()
                     >= view.authorization.valid_until.saturating_sub(5);
-                let window_elapsed = channel.outgoing.window_started_at.is_some_and(|started| {
-                    started.elapsed() >= Duration::from_secs((RELAY_PAYMENT_WINDOW_SECONDS + 1) as u64)
-                });
                 if authorization_expiring {
                     send_encrypted_record(
                         &channel.transport,
@@ -2189,29 +2624,43 @@ async fn run_stream_loop(
                         &[],
                     ).await?;
                     local_fin = true;
-                    send_checkpoint(
+                    send_close_intent(
                         &channel.transport,
-                        identity,
                         view,
                         channel.outgoing_direction,
-                        &mut channel.outgoing,
-                        true,
-                    ).await?;
-                } else if window_elapsed
-                    && channel.outgoing.cumulative_bytes > channel.outgoing.window_started_bytes
-                {
-                    send_checkpoint(
-                        &channel.transport,
-                        identity,
-                        view,
-                        channel.outgoing_direction,
-                        &mut channel.outgoing,
-                        false,
+                        &channel.outgoing,
                     ).await?;
                 }
             }
         }
     }
+}
+
+async fn send_close_intent(
+    transport: &ChannelTransport,
+    view: &RelayAuthorizationView,
+    direction: RelayDirection,
+    state: &DirectionState,
+) -> Result<(), RelayError> {
+    let intent = CloseIntent {
+        authorization_id: view.authorization.authorization_id.clone(),
+        session_id: view.authorization.session_id.clone(),
+        direction,
+        sequence: state.sequence,
+        cumulative_sent_bytes: state.cumulative_bytes,
+        transcript_hash: state.transcript_hash.clone(),
+        requested_at: Utc::now().timestamp(),
+    };
+    transport
+        .send(RelayFrame {
+            frame_type: FrameType::CloseIntent,
+            flags: 0,
+            channel_id: transport.channel_id,
+            sequence: state.sequence,
+            payload: serde_json::to_vec(&intent)
+                .map_err(|error| RelayError::Protocol(error.to_string()))?,
+        })
+        .await
 }
 
 async fn send_checkpoint(
@@ -2220,8 +2669,20 @@ async fn send_checkpoint(
     view: &RelayAuthorizationView,
     direction: RelayDirection,
     state: &mut DirectionState,
-    final_checkpoint: bool,
+    request: &CheckpointRequest,
 ) -> Result<(), RelayError> {
+    if request.authorization_id != view.authorization.authorization_id
+        || request.session_id != view.authorization.session_id
+        || request.direction != direction
+        || request.sequence != state.sequence
+        || request.cumulative_sent_bytes != state.cumulative_bytes
+        || request.transcript_hash != state.transcript_hash
+        || state.awaiting_receipt
+    {
+        return Err(RelayError::Protocol(
+            "Node CheckpointRequest does not match local Relay traffic".to_owned(),
+        ));
+    }
     let mut checkpoint = SenderCheckpoint {
         ledger_id: view.ledger_id.clone(),
         protocol_version: PROTOCOL_VERSION,
@@ -2234,14 +2695,14 @@ async fn send_checkpoint(
         transcript_hash: state.transcript_hash.clone(),
         checkpoint_at: Utc::now().timestamp(),
         sender_member_id: identity.credential.member_id.clone(),
-        final_checkpoint,
+        final_checkpoint: request.final_checkpoint,
         sender_signature: String::new(),
     };
     checkpoint.sender_signature = identity.sign(&sender_checkpoint_signing_bytes(&checkpoint)?)?;
     transport
         .send(RelayFrame {
             frame_type: FrameType::SenderCheckpoint,
-            flags: if final_checkpoint {
+            flags: if request.final_checkpoint {
                 RELAY_CHECKPOINT_FINAL_FLAG
             } else {
                 0

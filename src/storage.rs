@@ -26,6 +26,40 @@ pub struct PendingTrafficSettlement {
     pub submission_operation_id: Option<String>,
 }
 
+/// Local Relay recovery state. This is deliberately not consensus state: the
+/// authorization is settled or refunded through the ordinary chain actions.
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct UnsettledRelaySession {
+    pub authorization_id: String,
+    pub network_id: String,
+    pub network_commitment: String,
+    pub node_id: u64,
+    pub sender_member_id: String,
+    pub receiver_member_id: String,
+    pub disconnected_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct ActiveRelaySession {
+    pub authorization_id: String,
+    pub network_id: String,
+    pub network_commitment: String,
+    pub node_id: u64,
+    pub sender_member_id: String,
+    pub receiver_member_id: String,
+    pub opened_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RelayAutoAbandonUsage {
+    pub network_commitment: String,
+    pub member_id: String,
+    pub window_started_at: i64,
+    pub abandoned_bytes: u64,
+    pub last_authorization_id: String,
+    pub updated_at: i64,
+}
+
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 pub struct PendingMemberIssue {
     pub operation_id: String,
@@ -236,6 +270,15 @@ impl DataPaths {
             .open_table(PENDING_TRAFFIC_TABLE)
             .map_err(redb_error)?;
         write
+            .open_table(UNSETTLED_RELAY_TABLE)
+            .map_err(redb_error)?;
+        write
+            .open_table(ACTIVE_RELAY_SESSION_TABLE)
+            .map_err(redb_error)?;
+        write
+            .open_table(RELAY_AUTO_ABANDON_USAGE_TABLE)
+            .map_err(redb_error)?;
+        write
             .open_table(BOOTSTRAP_CHECKPOINT_TABLE)
             .map_err(redb_error)?;
         write.commit().map_err(redb_error)?;
@@ -398,6 +441,198 @@ impl DataPaths {
         Ok(())
     }
 
+    pub fn store_unsettled_relay_session(&self, session: &UnsettledRelaySession) -> Result<()> {
+        let bytes = serde_json::to_vec(session)?;
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        {
+            let mut table = write
+                .open_table(UNSETTLED_RELAY_TABLE)
+                .map_err(redb_error)?;
+            table
+                .insert(session.authorization_id.as_str(), bytes.as_slice())
+                .map_err(redb_error)?;
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(())
+    }
+
+    pub fn unsettled_relay_sessions(&self) -> Result<Vec<UnsettledRelaySession>> {
+        let db = self.open_chain_db()?;
+        let read = db.begin_read().map_err(redb_error)?;
+        let table = read.open_table(UNSETTLED_RELAY_TABLE).map_err(redb_error)?;
+        let mut sessions: Vec<UnsettledRelaySession> = Vec::new();
+        for entry in table.iter().map_err(redb_error)? {
+            let (_, value) = entry.map_err(redb_error)?;
+            sessions.push(serde_json::from_slice(value.value())?);
+        }
+        sessions.sort_by_key(|session| std::cmp::Reverse(session.disconnected_at));
+        Ok(sessions)
+    }
+
+    pub fn remove_unsettled_relay_session(&self, authorization_id: &str) -> Result<()> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        {
+            let mut table = write
+                .open_table(UNSETTLED_RELAY_TABLE)
+                .map_err(redb_error)?;
+            table.remove(authorization_id).map_err(redb_error)?;
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(())
+    }
+
+    pub fn store_active_relay_session(&self, session: &ActiveRelaySession) -> Result<()> {
+        let bytes = serde_json::to_vec(session)?;
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        {
+            let mut table = write
+                .open_table(ACTIVE_RELAY_SESSION_TABLE)
+                .map_err(redb_error)?;
+            table
+                .insert(session.authorization_id.as_str(), bytes.as_slice())
+                .map_err(redb_error)?;
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(())
+    }
+
+    pub fn remove_active_relay_session(&self, authorization_id: &str) -> Result<()> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        {
+            let mut table = write
+                .open_table(ACTIVE_RELAY_SESSION_TABLE)
+                .map_err(redb_error)?;
+            table.remove(authorization_id).map_err(redb_error)?;
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(())
+    }
+
+    pub fn promote_active_relay_sessions(&self, disconnected_at: i64) -> Result<usize> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        let active_sessions = {
+            let table = write
+                .open_table(ACTIVE_RELAY_SESSION_TABLE)
+                .map_err(redb_error)?;
+            table
+                .iter()
+                .map_err(redb_error)?
+                .map(|entry| {
+                    let (_, value) = entry.map_err(redb_error)?;
+                    serde_json::from_slice::<ActiveRelaySession>(value.value()).map_err(Into::into)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        {
+            let mut unsettled = write
+                .open_table(UNSETTLED_RELAY_TABLE)
+                .map_err(redb_error)?;
+            let mut active = write
+                .open_table(ACTIVE_RELAY_SESSION_TABLE)
+                .map_err(redb_error)?;
+            for session in &active_sessions {
+                let unsettled_session = UnsettledRelaySession {
+                    authorization_id: session.authorization_id.clone(),
+                    network_id: session.network_id.clone(),
+                    network_commitment: session.network_commitment.clone(),
+                    node_id: session.node_id,
+                    sender_member_id: session.sender_member_id.clone(),
+                    receiver_member_id: session.receiver_member_id.clone(),
+                    disconnected_at,
+                };
+                let bytes = serde_json::to_vec(&unsettled_session)?;
+                unsettled
+                    .insert(session.authorization_id.as_str(), bytes.as_slice())
+                    .map_err(redb_error)?;
+                active
+                    .remove(session.authorization_id.as_str())
+                    .map_err(redb_error)?;
+            }
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(active_sessions.len())
+    }
+
+    pub fn try_record_relay_auto_abandon(
+        &self,
+        network_commitment: &str,
+        member_ids: &[&str],
+        abandoned_bytes: u64,
+        maximum_bytes_per_day: u64,
+        authorization_id: &str,
+        now: i64,
+    ) -> Result<bool> {
+        if maximum_bytes_per_day == 0 || abandoned_bytes > maximum_bytes_per_day {
+            return Ok(false);
+        }
+        let mut unique_members = member_ids.to_vec();
+        unique_members.sort_unstable();
+        unique_members.dedup();
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        let mut updates = Vec::new();
+        {
+            let table = write
+                .open_table(RELAY_AUTO_ABANDON_USAGE_TABLE)
+                .map_err(redb_error)?;
+            for member_id in unique_members {
+                let key = format!("{network_commitment}:{member_id}");
+                let existing = table
+                    .get(key.as_str())
+                    .map_err(redb_error)?
+                    .map(|value| serde_json::from_slice::<RelayAutoAbandonUsage>(value.value()))
+                    .transpose()?;
+                let existing =
+                    existing.filter(|usage| now.saturating_sub(usage.window_started_at) < 86_400);
+                let repeated_authorization = existing
+                    .as_ref()
+                    .is_some_and(|usage| usage.last_authorization_id == authorization_id);
+                let (window_started_at, already_abandoned) = existing.map_or((now, 0), |usage| {
+                    (usage.window_started_at, usage.abandoned_bytes)
+                });
+                let total = already_abandoned
+                    .checked_add(if repeated_authorization {
+                        0
+                    } else {
+                        abandoned_bytes
+                    })
+                    .ok_or_else(|| Error::msg("Relay auto-abandon usage overflow"))?;
+                if total > maximum_bytes_per_day {
+                    return Ok(false);
+                }
+                updates.push((
+                    key,
+                    RelayAutoAbandonUsage {
+                        network_commitment: network_commitment.to_owned(),
+                        member_id: member_id.to_owned(),
+                        window_started_at,
+                        abandoned_bytes: total,
+                        last_authorization_id: authorization_id.to_owned(),
+                        updated_at: now,
+                    },
+                ));
+            }
+        }
+        {
+            let mut table = write
+                .open_table(RELAY_AUTO_ABANDON_USAGE_TABLE)
+                .map_err(redb_error)?;
+            for (key, usage) in updates {
+                let bytes = serde_json::to_vec(&usage)?;
+                table
+                    .insert(key.as_str(), bytes.as_slice())
+                    .map_err(redb_error)?;
+            }
+        }
+        write.commit().map_err(redb_error)?;
+        Ok(true)
+    }
+
     fn open_chain_db(&self) -> Result<MutexGuard<'_, Database>> {
         match self.chain_db.get_or_init(|| {
             Database::create(self.chain_db_path())
@@ -446,6 +681,12 @@ const LEDGER_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("ledger"
 const LEDGER_STATE_KEY: &str = "state/v1";
 const PENDING_TRAFFIC_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("pending_traffic_settlements/v1");
+const UNSETTLED_RELAY_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("unsettled_relay_sessions/v1");
+const ACTIVE_RELAY_SESSION_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("active_relay_sessions/v1");
+const RELAY_AUTO_ABANDON_USAGE_TABLE: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("relay_auto_abandon_usage/v1");
 const BOOTSTRAP_CHECKPOINT_TABLE: TableDefinition<u64, &[u8]> =
     TableDefinition::new("bootstrap_checkpoints/v1");
 
@@ -656,5 +897,95 @@ mod tests {
             )
             .unwrap();
         assert!(paths.pending_traffic_settlements().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unsettled_relay_sessions_are_persistent_and_replace_by_authorization() {
+        let paths = DataPaths::in_memory_with_ledger(LedgerState::default()).unwrap();
+        let mut session = UnsettledRelaySession {
+            authorization_id: "authorization".to_owned(),
+            network_id: "network-id".to_owned(),
+            network_commitment: "network-commitment".to_owned(),
+            node_id: 1,
+            sender_member_id: "sender".to_owned(),
+            receiver_member_id: "receiver".to_owned(),
+            disconnected_at: 10,
+        };
+        paths.store_unsettled_relay_session(&session).unwrap();
+        session.disconnected_at = 20;
+        paths.store_unsettled_relay_session(&session).unwrap();
+        assert_eq!(
+            paths.unsettled_relay_sessions().unwrap(),
+            vec![session.clone()]
+        );
+        paths
+            .remove_unsettled_relay_session("authorization")
+            .unwrap();
+        assert!(paths.unsettled_relay_sessions().unwrap().is_empty());
+
+        let active = ActiveRelaySession {
+            authorization_id: session.authorization_id.clone(),
+            network_id: session.network_id.clone(),
+            network_commitment: session.network_commitment.clone(),
+            node_id: session.node_id,
+            sender_member_id: session.sender_member_id.clone(),
+            receiver_member_id: session.receiver_member_id.clone(),
+            opened_at: 25,
+        };
+        paths.store_active_relay_session(&active).unwrap();
+        assert_eq!(paths.promote_active_relay_sessions(30).unwrap(), 1);
+        let promoted = paths.unsettled_relay_sessions().unwrap();
+        assert_eq!(promoted.len(), 1);
+        assert_eq!(promoted[0].disconnected_at, 30);
+        assert_eq!(promoted[0].authorization_id, active.authorization_id);
+
+        assert!(
+            paths
+                .try_record_relay_auto_abandon(
+                    "network-commitment",
+                    &["sender", "receiver"],
+                    40,
+                    100,
+                    "authorization-1",
+                    40,
+                )
+                .unwrap()
+        );
+        assert!(
+            paths
+                .try_record_relay_auto_abandon(
+                    "network-commitment",
+                    &["sender", "receiver"],
+                    40,
+                    100,
+                    "authorization-1",
+                    41,
+                )
+                .unwrap()
+        );
+        assert!(
+            !paths
+                .try_record_relay_auto_abandon(
+                    "network-commitment",
+                    &["sender", "receiver"],
+                    70,
+                    100,
+                    "authorization-2",
+                    42,
+                )
+                .unwrap()
+        );
+        assert!(
+            paths
+                .try_record_relay_auto_abandon(
+                    "network-commitment",
+                    &["sender", "receiver"],
+                    70,
+                    100,
+                    "authorization-2",
+                    86_500,
+                )
+                .unwrap()
+        );
     }
 }

@@ -168,6 +168,10 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         .unwrap();
     let client_root = temp_root();
     copy_tree(&root, &client_root);
+    let alice_cli_root = temp_root();
+    let bob_cli_root = temp_root();
+    copy_tree(&root, &alice_cli_root);
+    copy_tree(&root, &bob_cli_root);
     drop(paths);
     let client_paths = DataPaths::new(Some(client_root.clone())).unwrap();
     client_paths
@@ -177,6 +181,16 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
             Ok(())
         })
         .unwrap();
+    for cli_root in [&alice_cli_root, &bob_cli_root] {
+        let cli_paths = DataPaths::new(Some(cli_root.clone())).unwrap();
+        cli_paths
+            .with_ledger_mut(|ledger| {
+                ledger.networks.clear();
+                ledger.network_aliases.clear();
+                Ok(())
+            })
+            .unwrap();
+    }
     let child = Command::new(env!("CARGO_BIN_EXE_mrk"))
         .arg("--data-dir")
         .arg(&root)
@@ -298,9 +312,26 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         drop(bob);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        let mut rpc_endpoint = url::Url::parse(&endpoint).unwrap();
+        rpc_endpoint.set_path("/v1/rpc");
+        let unsettled: Vec<service::UnsettledPaymentView> = serde_json::from_value(
+            tokio::task::block_in_place(|| {
+                relay_client::run_rpc_call(
+                    rpc_endpoint.as_str(),
+                    "payment.unsettled",
+                    serde_json::json!({"network": "team", "member": "alice"}),
+                    false,
+                    Some(&ca_path),
+                )
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unsettled.len(), 1);
+        assert_eq!(unsettled[0].session.authorization_id, authorization_id);
         let mut bob_cli = Command::new(env!("CARGO_BIN_EXE_mrk"))
             .arg("--data-dir")
-            .arg(&client_root)
+            .arg(&bob_cli_root)
             .arg("pipe")
             .arg("--network")
             .arg("team")
@@ -310,6 +341,8 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
             .arg(&endpoint)
             .arg("--tls-ca")
             .arg(&ca_path)
+            .arg("--max-auto-recovery-bytes")
+            .arg("1048576")
             .env("MRK_KEYSTORE_PASSWORD", password)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -319,7 +352,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         let mut alice_cli = Command::new(env!("CARGO_BIN_EXE_mrk"))
             .arg("--data-dir")
-            .arg(&client_root)
+            .arg(&alice_cli_root)
             .arg("pipe")
             .arg("--network")
             .arg("team")
@@ -331,6 +364,8 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
             .arg(&bob_credential.member_id)
             .arg("--tls-ca")
             .arg(&ca_path)
+            .arg("--max-auto-recovery-bytes")
+            .arg("1048576")
             .env("MRK_KEYSTORE_PASSWORD", password)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -358,51 +393,121 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
                 let _ = alice_eof_tx.send(bob_stdout.read_to_end(&mut trailing).map(|_| trailing));
             }
         });
+        let (bob_tx, bob_rx) = std::sync::mpsc::channel();
+        let (bob_eof_tx, bob_eof_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut bytes = [0_u8; 16];
+            let result = alice_stdout.read_exact(&mut bytes).map(|_| bytes);
+            let succeeded = result.is_ok();
+            let _ = bob_tx.send(result);
+            if succeeded {
+                let mut trailing = Vec::new();
+                let _ = bob_eof_tx.send(alice_stdout.read_to_end(&mut trailing).map(|_| trailing));
+            }
+        });
         alice_stdin.write_all(b"cli-alice-to-bob").unwrap();
         alice_stdin.write_all(&large_payload).unwrap();
         alice_stdin.flush().unwrap();
-        drop(alice_stdin);
         let from_alice = alice_rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap()
             .unwrap();
         assert_eq!(&from_alice[..16], b"cli-alice-to-bob");
         assert_eq!(&from_alice[16..], large_payload);
-
-        let (bob_tx, bob_rx) = std::sync::mpsc::channel();
-        thread::spawn(move || {
-            let mut bytes = [0_u8; 16];
-            let result = alice_stdout.read_exact(&mut bytes).and_then(|_| {
-                let mut trailing = Vec::new();
-                alice_stdout
-                    .read_to_end(&mut trailing)
-                    .map(|_| (bytes, trailing))
-            });
-            let _ = bob_tx.send(result);
-        });
         bob_stdin.write_all(b"cli-bob-to-alice").unwrap();
         bob_stdin.flush().unwrap();
-        drop(bob_stdin);
-        let (from_bob, trailing) = bob_rx
+        let from_bob = bob_rx
             .recv_timeout(Duration::from_secs(10))
             .unwrap()
             .unwrap();
         assert_eq!(&from_bob, b"cli-bob-to-alice");
+        let unsettled: Vec<service::UnsettledPaymentView> = serde_json::from_value(
+            tokio::task::block_in_place(|| {
+                relay_client::run_rpc_call(
+                    rpc_endpoint.as_str(),
+                    "payment.unsettled",
+                    serde_json::json!({"network": "team", "member": "alice"}),
+                    false,
+                    Some(&ca_path),
+                )
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(unsettled.is_empty());
+        // SAFETY: `alice_cli.id()` is the live child process spawned above.
+        assert_eq!(
+            unsafe { libc::kill(alice_cli.id() as i32, libc::SIGINT) },
+            0
+        );
+        drop(alice_stdin);
+        drop(bob_stdin);
+        let trailing = bob_eof_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap()
+            .unwrap();
         assert!(trailing.is_empty());
         let trailing = alice_eof_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Duration::from_secs(30))
             .unwrap()
             .unwrap();
         assert!(trailing.is_empty());
 
         assert!(alice_cli.wait().unwrap().success());
         assert!(bob_cli.wait().unwrap().success());
+        let mut finalized_after_cli_exit = false;
+        for _ in 0..30 {
+            let history = tokio::task::block_in_place(|| {
+                relay_client::run_rpc_call(
+                    rpc_endpoint.as_str(),
+                    "payment.history",
+                    serde_json::json!({"network": "team", "limit": 20}),
+                    false,
+                    Some(&ca_path),
+                )
+            })
+            .and_then(|value| {
+                serde_json::from_value::<service::PaymentHistoryView>(value).map_err(Into::into)
+            });
+            if history.is_ok_and(|history| {
+                history.authorizations.iter().any(|authorization| {
+                    authorization.authorization_id != authorization_id
+                        && authorization.initiator_member_id == alice_credential.member_id
+                        && authorization.reserved_remaining == 0
+                        && authorization.closed_at.is_some()
+                })
+            }) {
+                finalized_after_cli_exit = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        assert!(
+            finalized_after_cli_exit,
+            "Node should finalize persisted receipts after both pipe CLIs exit"
+        );
         proxy.abort();
     });
 
     drop(child_guard);
+    let ledger = DataPaths::new(Some(root.clone()))
+        .unwrap()
+        .read_ledger()
+        .unwrap();
+    let automatic = ledger
+        .payment_authorizations
+        .values()
+        .find(|authorization| {
+            authorization.authorization_id != authorization_id
+                && authorization.initiator_member_id == alice_credential.member_id
+        })
+        .expect("CLI pipe should create an automatic payment authorization");
+    assert_eq!(automatic.reserved_remaining, 0);
+    assert!(automatic.closed_at.is_some());
     std::fs::remove_dir_all(root).unwrap();
     std::fs::remove_dir_all(client_root).unwrap();
+    std::fs::remove_dir_all(alice_cli_root).unwrap();
+    std::fs::remove_dir_all(bob_cli_root).unwrap();
 }
 
 #[test]

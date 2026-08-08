@@ -168,6 +168,8 @@ EncryptedStream: AsyncRead + AsyncWrite
 - 成员凭证由本地固定的 Network Owner 公钥验证。双方用成员 Ed25519 密钥认证临时 X25519 握手，并通过 HKDF-SHA256 派生两个独立的 AES-256-GCM 方向密钥。
 - 加密上下文绑定 Ledger、Node、Channel、Authorization、Session、双方 Member ID 和握手 transcript；Relay 修改、重排、重放或跨通道替换密文都会认证失败。
 - `AsyncWrite::shutdown()` 发送认证 FIN 和最终累计 Checkpoint，并等待 Receipt；Relay 在认证 FIN 完成前关闭通道属于截断错误。
+- `mrk pipe` 第一次收到 Ctrl+C 时停止读取 stdin，发送加密 FIN 和 `CloseIntent`；Node 返回 final `CheckpointRequest`，双方签出普通 final receipt。Node 持久化双方 final receipt 后两侧即可退出，并在后台完成结算终局和未消费 reservation 释放。第二次 Ctrl+C 强制退出。
+- 进程崩溃或网络中断时，Node 只把未签尾部保留在内存，并持久化不含 DATA、Sequence、字节数和 Transcript 的小型 authorization hold。重启后的 `mrk pipe` 先恢复匹配会话，仅在 Node 报告的双向增量总和不超过本次 `--max-auto-recovery-bytes` 时补签；默认值为 0，该参数不上链。Node 重启后精确尾部丢失，不能补签。Node Owner 可手动提交普通 Refund，或按默认策略及具体 Network 覆盖设置 `max_auto_abandon_bytes`；自动放弃额度按 Network 和 Member 做 24 小时累计审计。
 - SDK 使用有界队列和有界字节缓冲暴露背压，不能无限占用内存。
 - 同一通道内按 `sequence` 有序；连接断开后旧通道失效，由上层应用决定是否重新建立并重放业务数据。
 - WSS 基于 TCP，存在队头阻塞。这是当前协议选择的已知取舍，上层不要把它当成无序数据报服务。
@@ -312,7 +314,7 @@ CLI 只提供余额/历史查询和治理提案，不提供国库密钥或直接
 
 Owner 先向 `NetworkEscrow` 充值并维护可随时更新或停用的 `NetworkSpendingPolicy`。默认允许 Active Member 使用共享 Fund，但每个会话必须由发起 Member 签署 `ReserveSession`，并受单会话额度、单 Member 并发预留、Node 最高报价和最长会话时间约束。状态机创建绑定 Node、双方 Member、随机 Session ID、策略 revision、固定 `price_per_gib`、限额和有效期的 `PaymentAuthorization`。授权必须最终确认后才能打开 Relay Channel，限额在创建时原子预留，但不会预付给 Node；策略更新只影响后续预留。
 
-每个方向独立累计 DATA Sequence、真实 Payload 字节和 Transcript Hash。达到 64 MiB 或自首个 DATA 起 2 分钟后，发送方签署 `SenderCheckpoint`，接收方核对本地已收到的相同前缀并签署 `ReceiverReceipt`；Node 只有验证双签名后才继续该方向。正常关闭会为不足一个窗口的尾部生成 Final Checkpoint。计费不包含 WSS/TLS/TCP 头、Padding 或控制帧。
+每个方向独立累计 DATA Sequence、真实 Payload 字节和 Transcript Hash。达到 16 MiB 或自首个 DATA 起 15 秒后，Node 暂停该方向并发送包含精确计量状态的 `CheckpointRequest`；发送方与内存状态一致时才签署 `SenderCheckpoint`，接收方核对本地已收到的相同前缀后签署 `ReceiverReceipt`。Node 只有验证并持久化双签名回执后才继续该方向。正常关闭通过 `CloseIntent` 请求不足一个窗口的 Final Checkpoint。计费不包含 WSS/TLS/TCP 头、Padding 或控制帧。
 
 Node 在本地 redb 只保留每个授权、每个方向最新的累计回执，默认每 5 分钟批量提交，重启后恢复。链上用“新累计总价减该方向已结算金额”计算增量，避免按窗口向上取整造成重复收费。双方各自签署并回签 Final Checkpoint 后，未消费预留立即退回 Network Fund；未正常关闭的授权到期后仍有 7 天领取期，之后由下一次成员预留确定性回收。
 
@@ -412,6 +414,10 @@ mrk member revoke --network team --serial 42
 
 mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>
 mrk payment history --network team [--member client-a]
+mrk payment unsettled --network team --member client-a
+mrk payment settle <AUTHORIZATION_ID> --network team --member client-a --endpoint relay.example.com
+mrk node --node default payment unsettled
+mrk node --node default payment abandon <AUTHORIZATION_ID>
 ```
 
 `member issue` 先以本机文件锁独占 `(Network, name)`，把加密 Member Key、Credential 和已签名
@@ -475,7 +481,7 @@ compaction。区块高度、父哈希、共识和治理从检查点连续运行�
 
 Node 初始化时分别生成 Owner 冷钥、Relay 热钥和 Reward Key。节点奖励领取到 Reward Key；使用账户 CLI 的 `--account node:default` 可以查询和转移该余额，不需要动用 Node Owner 冷钥。
 
-Relay 流量采用押币后的累计交付结算。Network Owner 先从 Network Escrow 锁定 `PaymentAuthorization.max_amount`；每个方向连续转发到 `64 MiB` 或 `2 分钟`边界后，只暂停新 DATA，由发送方签署累计 `SenderCheckpoint`、接收方对相同 Sequence、Payload 字节和 Transcript Hash 签署 `ReceiverReceipt`。Node 持有完整双签名回执才打开下一窗口，并可稍后仅用最新累计回执结算。链按照接收方确认的真实 DATA Payload 与授权时固定的 `price_per_gib`释放已有 MRK；Padding、协议开销和控制流量不计费。无回执不付款，未使用押币在 7 天 Claim Window 后退回，流量永不触发增发。
+Relay 流量采用押币后的累计交付结算。Network Owner 先从 Network Escrow 锁定 `PaymentAuthorization.max_amount`；每个方向连续转发到 `16 MiB` 或 `15 秒`边界后，Node 暂停新 DATA 并发送 `CheckpointRequest`。发送方和接收方在正常会话中只对与内存状态一致的累计前缀签名；异常进程重启后的有界补签必须显式配置。Node 持久化完整双签名回执后才打开下一窗口，并可稍后仅用最新累计回执结算。未签流量状态不写盘。链按照接收方确认的真实 DATA Payload 与授权时固定的 `price_per_gib`释放已有 MRK；Padding、协议开销和控制流量不计费。无回执不付款，未使用押币在 7 天 Claim Window 后退回，流量永不触发增发。
 
 `mrk node backup` 由持有 redb 的守护进程在一致读事务上生成逻辑备份，默认写入 `~/.mrk/backups/`，权限为 `0600`，包含完整 Ledger、Height、State Root 和全 Payload Checksum，并拒绝覆盖已有路径。`backup-verify` 离线校验 Checksum、元数据、完整链和可选的可信 State Root。`restore` 必须先停止守护进程，并强制从独立可信渠道提供 `--expected-state-root`；验证通过后在单个 redb 写事务中替换 Ledger，随后必须运行 `mrk node doctor` 再重启。Validator 运维必须把备份复制到异机并定期演练恢复。
 

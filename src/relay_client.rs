@@ -1,7 +1,10 @@
 use std::{
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -17,6 +20,52 @@ use tokio_rustls::TlsConnector;
 use url::Url;
 
 const RPC_PROTOCOL: &str = "mrk.rpc.v1";
+const PIPE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+static PIPE_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn record_pipe_interrupt(_: libc::c_int) {
+    PIPE_INTERRUPTED.store(true, Ordering::Release);
+}
+
+struct PipeInterruptGuard {
+    previous: libc::sighandler_t,
+}
+
+impl PipeInterruptGuard {
+    fn install() -> Result<Self> {
+        PIPE_INTERRUPTED.store(false, Ordering::Release);
+        // SAFETY: SIGINT is process-global and `record_pipe_interrupt` only performs an
+        // atomic store. `mrk pipe` installs one handler for the lifetime of this guard.
+        let previous = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                record_pipe_interrupt as *const () as libc::sighandler_t,
+            )
+        };
+        if previous == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self { previous })
+    }
+}
+
+impl Drop for PipeInterruptGuard {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was returned by the successful `signal` call above.
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous);
+        }
+    }
+}
+
+async fn wait_for_pipe_interrupt() {
+    loop {
+        if PIPE_INTERRUPTED.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 use crate::{
     Error, Result,
@@ -52,6 +101,19 @@ pub struct StdioPipeOptions {
     pub peer: Option<String>,
     pub allow_insecure_local: bool,
     pub tls_ca: Option<PathBuf>,
+    pub max_auto_recovery_bytes: u64,
+}
+
+pub struct RecoverySettlementOptions {
+    pub paths: DataPaths,
+    pub network: String,
+    pub member: String,
+    pub password: String,
+    pub endpoint: String,
+    pub authorization_id: String,
+    pub allow_insecure_local: bool,
+    pub tls_ca: Option<PathBuf>,
+    pub max_auto_recovery_bytes: u64,
 }
 
 #[derive(serde::Deserialize)]
@@ -390,6 +452,7 @@ impl RelayConnection {
 }
 
 pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
+    let _interrupt_guard = PipeInterruptGuard::install()?;
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -404,6 +467,7 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 peer,
                 allow_insecure_local,
                 tls_ca,
+                max_auto_recovery_bytes,
             } = options;
             let identity = crate::sdk::MemberIdentity::from_relay(
                 &paths,
@@ -416,6 +480,23 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
             )
             .await
             .map_err(|error| Error::msg(error.to_string()))?;
+            let unsettled = if peer.is_some() && max_auto_recovery_bytes > 0 {
+                let mut rpc_endpoint = normalize_websocket_url(&endpoint, RELAY_PATH)?;
+                rpc_endpoint.set_path(RPC_PATH);
+                rpc_endpoint.set_query(None);
+                rpc_endpoint.set_fragment(None);
+                let value = rpc_call(
+                    rpc_endpoint.as_str(),
+                    "payment.unsettled",
+                    serde_json::json!({"network": network, "member": member}),
+                    allow_insecure_local,
+                    tls_ca.as_deref(),
+                )
+                .await?;
+                serde_json::from_value::<Vec<service::UnsettledPaymentView>>(value)?
+            } else {
+                Vec::new()
+            };
             drop(paths);
             let mut client_options = crate::sdk::ClientOptions::new(&endpoint, identity)
                 .allow_insecure_local(allow_insecure_local);
@@ -426,18 +507,50 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 .await
                 .map_err(|error| Error::msg(error.to_string()))?;
             let stream = if let Some(peer_id) = peer {
+                for item in unsettled.into_iter().filter(|item| {
+                    let authorization = &item.authorization;
+                    authorization.sender_member_id == peer_id
+                        || authorization.receiver_member_id == peer_id
+                }) {
+                    eprintln!(
+                        "Recovering interrupted Relay authorization {} before opening a new session",
+                        item.session.authorization_id
+                    );
+                    connection
+                        .recover_existing(
+                            &peer_id,
+                            &item.session.authorization_id,
+                            max_auto_recovery_bytes,
+                        )
+                        .await
+                        .map_err(|error| Error::msg(error.to_string()))?;
+                }
                 connection
                     .open_auto(peer_id)
                     .await
                     .map_err(|error| Error::msg(error.to_string()))?
             } else {
-                connection
-                    .accept()
-                    .await
-                    .map_err(|error| Error::msg(error.to_string()))?
-                    .accept()
-                    .await
-                    .map_err(|error| Error::msg(error.to_string()))?
+                loop {
+                    let incoming = connection
+                        .accept()
+                        .await
+                        .map_err(|error| Error::msg(error.to_string()))?;
+                    if incoming.is_recovery() {
+                        let authorization_id = incoming.authorization_id().to_owned();
+                        incoming
+                            .recover(max_auto_recovery_bytes)
+                            .await
+                            .map_err(|error| Error::msg(error.to_string()))?;
+                        eprintln!(
+                            "Recovered interrupted Relay authorization {authorization_id}; waiting for a new session"
+                        );
+                        continue;
+                    }
+                    break incoming
+                        .accept()
+                        .await
+                        .map_err(|error| Error::msg(error.to_string()))?;
+                }
             };
             eprintln!(
                 "End-to-end encrypted Relay stream connected to member {}; piping stdin/stdout",
@@ -446,22 +559,164 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
             let (mut stream_reader, mut stream_writer) = split(stream);
             let mut stdin = tokio::io::stdin();
             let mut stdout = tokio::io::stdout();
+            let (stop_upload, mut stop_upload_receiver) = tokio::sync::watch::channel(false);
             let upload = async {
-                tokio::io::copy(&mut stdin, &mut stream_writer).await?;
+                let copy_result = tokio::select! {
+                    result = tokio::io::copy(&mut stdin, &mut stream_writer) => {
+                        result.map(|_| ())
+                    }
+                    _ = async {
+                        while !*stop_upload_receiver.borrow() {
+                            if stop_upload_receiver.changed().await.is_err() {
+                                break;
+                            }
+                        }
+                    } => Ok(()),
+                };
                 if std::env::var_os("MRK_RELAY_DEBUG").is_some() {
-                    eprintln!("pipe member {member}: stdin reached EOF");
+                    eprintln!("pipe member {member}: closing local stream input");
                 }
-                stream_writer.shutdown().await
+                let shutdown_result = stream_writer.shutdown().await;
+                copy_result?;
+                shutdown_result
             };
             let download = async {
-                tokio::io::copy(&mut stream_reader, &mut stdout).await?;
+                let copy_result = tokio::io::copy(&mut stream_reader, &mut stdout).await;
+                let _ = stop_upload.send(true);
                 if std::env::var_os("MRK_RELAY_DEBUG").is_some() {
                     eprintln!("pipe member {member}: authenticated remote EOF");
                 }
+                copy_result?;
                 stdout.flush().await
             };
-            tokio::try_join!(upload, download)
-                .map_err(|error| Error::msg(format!("pipe member {member}: {error}")))?;
+            let transfer = async { tokio::try_join!(upload, download).map(|_| ()) };
+            tokio::pin!(transfer);
+            let result = tokio::select! {
+                result = &mut transfer => result,
+                _ = wait_for_pipe_interrupt() => {
+                    eprintln!(
+                        "Ctrl+C received; closing Relay stream and settling Network Fund reservation"
+                    );
+                    let _ = stop_upload.send(true);
+                    tokio::select! {
+                        result = &mut transfer => result,
+                        _ = wait_for_pipe_interrupt() => Err(std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "second Ctrl+C forced shutdown before final receipts completed",
+                        )),
+                        _ = tokio::time::sleep(PIPE_SHUTDOWN_TIMEOUT) => Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Relay final receipt exchange did not complete within 30 seconds",
+                        )),
+                    }
+                }
+            };
+            result.map_err(|error| Error::msg(format!("pipe member {member}: {error}")))?;
+            eprintln!("Relay stream closed; final receipts persisted by Node");
+            Ok(())
+        })
+}
+
+pub fn run_recovery_settlement(options: RecoverySettlementOptions) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Io)?
+        .block_on(async move {
+            let RecoverySettlementOptions {
+                paths,
+                network,
+                member,
+                password,
+                endpoint,
+                authorization_id,
+                allow_insecure_local,
+                tls_ca,
+                max_auto_recovery_bytes,
+            } = options;
+            let identity = crate::sdk::MemberIdentity::from_relay(
+                &paths,
+                &network,
+                &member,
+                &password,
+                &endpoint,
+                allow_insecure_local,
+                tls_ca.as_deref(),
+            )
+            .await
+            .map_err(|error| Error::msg(error.to_string()))?;
+            let local_member_id = identity.credential().member_id.clone();
+            let mut rpc_endpoint = normalize_websocket_url(&endpoint, RELAY_PATH)?;
+            rpc_endpoint.set_path(RPC_PATH);
+            rpc_endpoint.set_query(None);
+            rpc_endpoint.set_fragment(None);
+            let value = rpc_call(
+                rpc_endpoint.as_str(),
+                "payment.get",
+                serde_json::json!({ "authorization_id": authorization_id }),
+                allow_insecure_local,
+                tls_ca.as_deref(),
+            )
+            .await?;
+            let authorization: service::RelayAuthorizationView = serde_json::from_value(value)?;
+            if authorization.authorization.network_id != identity.credential().network_id {
+                return Err(Error::msg(
+                    "payment authorization belongs to a different Network",
+                ));
+            }
+            let initiator = if local_member_id == authorization.authorization.sender_member_id {
+                true
+            } else if local_member_id == authorization.authorization.receiver_member_id {
+                false
+            } else {
+                return Err(Error::msg(
+                    "local Member is not a participant in this payment authorization",
+                ));
+            };
+            let peer_id = if initiator {
+                authorization.authorization.receiver_member_id.clone()
+            } else {
+                authorization.authorization.sender_member_id.clone()
+            };
+            drop(paths);
+            let mut client_options = crate::sdk::ClientOptions::new(&endpoint, identity)
+                .allow_insecure_local(allow_insecure_local);
+            if let Some(path) = &tls_ca {
+                client_options = client_options.tls_ca(path);
+            }
+            let connection = crate::sdk::RelayClient::connect(client_options)
+                .await
+                .map_err(|error| Error::msg(error.to_string()))?;
+            if initiator {
+                connection
+                    .recover_existing(&peer_id, &authorization_id, max_auto_recovery_bytes)
+                    .await
+                    .map_err(|error| Error::msg(error.to_string()))?;
+            } else {
+                loop {
+                    let incoming = connection
+                        .accept()
+                        .await
+                        .map_err(|error| Error::msg(error.to_string()))?;
+                    if incoming.authorization_id() == authorization_id
+                        && incoming.peer_id() == peer_id
+                    {
+                        incoming
+                            .recover(max_auto_recovery_bytes)
+                            .await
+                            .map_err(|error| Error::msg(error.to_string()))?;
+                        break;
+                    }
+                    incoming
+                        .reject()
+                        .await
+                        .map_err(|error| Error::msg(error.to_string()))?;
+                }
+            }
+            connection
+                .close()
+                .await
+                .map_err(|error| Error::msg(error.to_string()))?;
             Ok(())
         })
 }

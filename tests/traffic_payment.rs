@@ -4,7 +4,7 @@ use mrk::{
     model::{DEFAULT_OPERATION_VALIDITY_SECONDS, RelayDirection},
     relay::{relay_transcript_initial_hash, relay_transcript_next_hash},
     service,
-    storage::DataPaths,
+    storage::{DataPaths, UnsettledRelaySession},
 };
 
 #[test]
@@ -238,6 +238,42 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
         parse_mrk("1.5MRK").unwrap()
     );
 
+    paths
+        .store_unsettled_relay_session(&UnsettledRelaySession {
+            authorization_id: replacement_id.clone(),
+            network_id: network.network_id.clone(),
+            network_commitment: network.commitment.clone(),
+            node_id: node.node_id,
+            sender_member_id: alice.member_id.clone(),
+            receiver_member_id: bob.member_id.clone(),
+            disconnected_at: reclaim_at + 1,
+        })
+        .unwrap();
+    assert_eq!(
+        service::unsettled_payments(&paths, Some("team"), Some("alice"), None)
+            .unwrap()
+            .len(),
+        1
+    );
+    service::abandon_traffic_authorization(
+        &paths,
+        "node1",
+        password,
+        &replacement_id,
+        reclaim_at + 2,
+    )
+    .unwrap();
+    let abandoned = service::payment_authorization(&paths, &replacement_id).unwrap();
+    assert_eq!(abandoned.reserved_remaining, 0);
+    assert_eq!(abandoned.refunded_at, Some(reclaim_at + 2));
+    assert!(paths.unsettled_relay_sessions().unwrap().is_empty());
+    assert_eq!(
+        service::network_by_alias(&paths, "team")
+            .unwrap()
+            .escrow_balance,
+        parse_mrk("2MRK").unwrap()
+    );
+
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -424,6 +460,28 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         &alice.member_id,
         &bob.member_id,
         now + 6,
+    )
+    .unwrap();
+    assert!(
+        service::validate_relay_open(
+            &paths,
+            &authorization_id,
+            node.node_id,
+            &network.network_id,
+            &alice.member_id,
+            &bob.member_id,
+            now + 3605,
+        )
+        .is_err()
+    );
+    service::validate_relay_recovery_open(
+        &paths,
+        &authorization_id,
+        node.node_id,
+        &network.network_id,
+        &alice.member_id,
+        &bob.member_id,
+        now + 3605,
     )
     .unwrap();
     let authorization = service::payment_authorization(&paths, &authorization_id).unwrap();

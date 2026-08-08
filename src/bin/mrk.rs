@@ -93,6 +93,8 @@ enum Command {
         allow_insecure_local: bool,
         #[arg(long)]
         tls_ca: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        max_auto_recovery_bytes: u64,
     },
     Block {
         #[command(subcommand)]
@@ -298,6 +300,27 @@ enum PaymentCommand {
         authorization_id: String,
         #[arg(long, default_value = "default")]
         account: String,
+    },
+    Unsettled {
+        #[arg(long)]
+        network: String,
+        #[arg(long)]
+        member: String,
+    },
+    Settle {
+        authorization_id: String,
+        #[arg(long)]
+        network: String,
+        #[arg(long)]
+        member: String,
+        #[arg(long)]
+        endpoint: String,
+        #[arg(long)]
+        allow_insecure_local: bool,
+        #[arg(long)]
+        tls_ca: Option<PathBuf>,
+        #[arg(long, default_value_t = 0)]
+        max_auto_recovery_bytes: u64,
     },
 }
 
@@ -829,6 +852,76 @@ fn run() -> Result<()> {
                 )?;
                 print_rpc_value(cli.output, &result)?;
             }
+            PaymentCommand::Unsettled { network, member } => {
+                let local_member_id =
+                    service::member_credential(&paths, &network, &member)?.member_id;
+                let value = rpc.call(
+                    "payment.unsettled",
+                    serde_json::json!({
+                        "network": network,
+                        "member": member,
+                    }),
+                )?;
+                let unsettled: Vec<service::UnsettledPaymentView> =
+                    serde_json::from_value(value.clone())?;
+                print_value(cli.output, &value, || {
+                    if unsettled.is_empty() {
+                        return "No unsettled Relay sessions.".to_owned();
+                    }
+                    unsettled
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "{}  node={}  peer={}  reserved={}  disconnected_at={}",
+                                item.session.authorization_id,
+                                item.session.node_id,
+                                if item.authorization.sender_member_id == local_member_id {
+                                    &item.authorization.receiver_member_id
+                                } else {
+                                    &item.authorization.sender_member_id
+                                },
+                                format_mrk(item.authorization.reserved_remaining),
+                                item.session.disconnected_at,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })?;
+            }
+            PaymentCommand::Settle {
+                authorization_id,
+                network,
+                member,
+                endpoint,
+                allow_insecure_local,
+                tls_ca,
+                max_auto_recovery_bytes,
+            } => {
+                let password = read_password("Member keystore password: ")?;
+                relay_client::run_recovery_settlement(relay_client::RecoverySettlementOptions {
+                    paths,
+                    network,
+                    member,
+                    password,
+                    endpoint,
+                    authorization_id: authorization_id.clone(),
+                    allow_insecure_local,
+                    tls_ca,
+                    max_auto_recovery_bytes,
+                })?;
+                print_value(
+                    cli.output,
+                    &serde_json::json!({
+                        "authorization_id": authorization_id,
+                        "status": "RECEIPTS_PERSISTED",
+                    }),
+                    || {
+                        format!(
+                            "SETTLED\nAuthorization: {authorization_id}\nFinal receipts persisted by Node"
+                        )
+                    },
+                )?;
+            }
         },
         Command::Pipe {
             network,
@@ -837,6 +930,7 @@ fn run() -> Result<()> {
             peer,
             allow_insecure_local,
             tls_ca,
+            max_auto_recovery_bytes,
         } => {
             let password = read_password("Member keystore password: ")?;
             relay_client::run_stdio_pipe(relay_client::StdioPipeOptions {
@@ -848,6 +942,7 @@ fn run() -> Result<()> {
                 peer,
                 allow_insecure_local,
                 tls_ca,
+                max_auto_recovery_bytes,
             })?;
         }
         Command::Block { command } => match command {

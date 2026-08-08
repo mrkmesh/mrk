@@ -15,10 +15,33 @@ pub const RELAY_PROTOCOL: &str = "mrk.relay.v1";
 pub const FRAME_VERSION: u8 = 1;
 pub const FRAME_HEADER_LEN: usize = 20;
 pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
-pub const RELAY_PAYMENT_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
-pub const RELAY_PAYMENT_WINDOW_SECONDS: i64 = 120;
+pub const RELAY_PAYMENT_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+pub const RELAY_PAYMENT_WINDOW_SECONDS: i64 = 15;
 pub const RELAY_PAYMENT_CLAIM_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const RELAY_CHECKPOINT_FINAL_FLAG: u16 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckpointRequest {
+    pub authorization_id: String,
+    pub session_id: String,
+    pub direction: RelayDirection,
+    pub sequence: u64,
+    pub cumulative_sent_bytes: u64,
+    pub transcript_hash: String,
+    pub requested_at: i64,
+    pub final_checkpoint: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CloseIntent {
+    pub authorization_id: String,
+    pub session_id: String,
+    pub direction: RelayDirection,
+    pub sequence: u64,
+    pub cumulative_sent_bytes: u64,
+    pub transcript_hash: String,
+    pub requested_at: i64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SenderCheckpoint {
@@ -222,6 +245,8 @@ pub enum FrameType {
     Error = 12,
     SenderCheckpoint = 13,
     ReceiverReceipt = 14,
+    CheckpointRequest = 15,
+    CloseIntent = 16,
 }
 
 impl TryFrom<u8> for FrameType {
@@ -243,6 +268,8 @@ impl TryFrom<u8> for FrameType {
             12 => Ok(Self::Error),
             13 => Ok(Self::SenderCheckpoint),
             14 => Ok(Self::ReceiverReceipt),
+            15 => Ok(Self::CheckpointRequest),
+            16 => Ok(Self::CloseIntent),
             _ => Err(Error::msg(format!("unknown relay frame type {value}"))),
         }
     }

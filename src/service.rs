@@ -41,7 +41,7 @@ use crate::{
         SenderCheckpoint, credential_signing_bytes, hello_signing_bytes,
         receiver_receipt_signing_bytes, sender_checkpoint_hash, sender_checkpoint_signing_bytes,
     },
-    storage::{DataPaths, atomic_write_json, read_json, validate_name},
+    storage::{DataPaths, UnsettledRelaySession, atomic_write_json, read_json, validate_name},
 };
 
 pub const GOVERNANCE_NODE_THRESHOLD: usize = 20;
@@ -2014,18 +2014,32 @@ pub fn submit_signed_network_operation(
             ("TrafficPayment", "Refund") => {
                 let authorization_id =
                     payload_str(&operation.unsigned.payload, "authorization_id")?.to_owned();
-                let authorization = ledger
+                let authorization_snapshot = ledger
                     .payment_authorizations
-                    .get_mut(&authorization_id)
+                    .get(&authorization_id)
+                    .cloned()
                     .ok_or_else(|| Error::msg("payment authorization was not found"))?;
-                if authorization.payer_address != operation.unsigned.signer {
-                    return Err(Error::msg("only the payment owner can request a refund"));
+                let node_owner = ledger
+                    .nodes
+                    .get(&authorization_snapshot.node_id)
+                    .map(|node| node.owner_address.as_str());
+                let payer_requested =
+                    authorization_snapshot.payer_address == operation.unsigned.signer;
+                let node_abandoned = node_owner == Some(operation.unsigned.signer.as_str());
+                if !payer_requested && !node_abandoned {
+                    return Err(Error::msg(
+                        "only the payment owner or serving Node Owner can request a refund",
+                    ));
                 }
-                if submitted_at <= authorization.claim_until {
+                if payer_requested && submitted_at <= authorization_snapshot.claim_until {
                     return Err(Error::msg(
                         "payment authorization claim window is still open",
                     ));
                 }
+                let authorization = ledger
+                    .payment_authorizations
+                    .get_mut(&authorization_id)
+                    .expect("authorization snapshot exists");
                 if authorization.refunded_at.is_some() {
                     return Err(Error::msg("payment authorization was already refunded"));
                 }
@@ -3479,6 +3493,74 @@ pub struct PaymentHistoryView {
     pub authorizations: Vec<PaymentAuthorizationRecord>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct UnsettledPaymentView {
+    pub session: UnsettledRelaySession,
+    pub authorization: PaymentAuthorizationRecord,
+}
+
+pub fn unsettled_payments(
+    paths: &DataPaths,
+    network_alias: Option<&str>,
+    member: Option<&str>,
+    node_id: Option<u64>,
+) -> Result<Vec<UnsettledPaymentView>> {
+    let ledger = paths.read_ledger()?;
+    let commitment = network_alias
+        .map(|alias| resolve_network(&ledger, alias))
+        .transpose()?;
+    let member_id = match (&commitment, member) {
+        (Some(commitment), Some(member)) => {
+            let network = ledger.networks.get(commitment).expect("resolved Network");
+            Some(
+                network
+                    .members
+                    .get(member)
+                    .or_else(|| {
+                        network
+                            .members
+                            .values()
+                            .find(|record| record.member_id == member)
+                    })
+                    .map(|record| record.member_id.clone())
+                    .ok_or_else(|| Error::msg("unsettled payment Member was not found"))?,
+            )
+        }
+        (None, Some(_)) => {
+            return Err(Error::msg(
+                "an unsettled payment Member filter requires a Network",
+            ));
+        }
+        (_, None) => None,
+    };
+    let mut unsettled = paths
+        .unsettled_relay_sessions()?
+        .into_iter()
+        .filter_map(|session| {
+            let authorization = ledger
+                .payment_authorizations
+                .get(&session.authorization_id)?;
+            (authorization.refunded_at.is_none()
+                && authorization.closed_at.is_none()
+                && authorization.reserved_remaining > 0
+                && commitment
+                    .as_ref()
+                    .is_none_or(|value| authorization.network_commitment == *value)
+                && node_id.is_none_or(|value| authorization.node_id == value)
+                && member_id.as_ref().is_none_or(|value| {
+                    authorization.sender_member_id == *value
+                        || authorization.receiver_member_id == *value
+                }))
+            .then(|| UnsettledPaymentView {
+                session,
+                authorization: authorization.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    unsettled.sort_by_key(|item| std::cmp::Reverse(item.session.disconnected_at));
+    Ok(unsettled)
+}
+
 pub fn payment_history(
     paths: &DataPaths,
     network_alias: &str,
@@ -3593,6 +3675,53 @@ pub fn validate_relay_open(
     destination_member_id: &str,
     now: i64,
 ) -> Result<RelayAuthorizationView> {
+    let view = validate_relay_open_participants(
+        paths,
+        authorization_id,
+        node_id,
+        network_id,
+        source_member_id,
+        destination_member_id,
+    )?;
+    if now < view.authorization.created_at || now >= view.authorization.valid_until {
+        return Err(Error::msg("payment authorization is not active"));
+    }
+    Ok(view)
+}
+
+pub fn validate_relay_recovery_open(
+    paths: &DataPaths,
+    authorization_id: &str,
+    node_id: u64,
+    network_id: &str,
+    source_member_id: &str,
+    destination_member_id: &str,
+    now: i64,
+) -> Result<RelayAuthorizationView> {
+    let view = validate_relay_open_participants(
+        paths,
+        authorization_id,
+        node_id,
+        network_id,
+        source_member_id,
+        destination_member_id,
+    )?;
+    if now < view.authorization.created_at || now >= view.authorization.claim_until {
+        return Err(Error::msg(
+            "payment authorization recovery window has expired",
+        ));
+    }
+    Ok(view)
+}
+
+fn validate_relay_open_participants(
+    paths: &DataPaths,
+    authorization_id: &str,
+    node_id: u64,
+    network_id: &str,
+    source_member_id: &str,
+    destination_member_id: &str,
+) -> Result<RelayAuthorizationView> {
     let view = relay_authorization_view(paths, authorization_id)?;
     let authorization = &view.authorization;
     if !view.finalized {
@@ -3607,11 +3736,7 @@ pub fn validate_relay_open(
             "payment authorization does not match this Relay channel",
         ));
     }
-    if authorization.refunded_at.is_some()
-        || authorization.reserved_remaining == 0
-        || now < authorization.created_at
-        || now >= authorization.valid_until
-    {
+    if authorization.refunded_at.is_some() || authorization.reserved_remaining == 0 {
         return Err(Error::msg("payment authorization is not active"));
     }
     Ok(view)
@@ -3648,6 +3773,77 @@ pub fn submit_traffic_settlement(
     )?;
     let operation_id_value = operation_id(&operation)?;
     submit_signed_node_operation(paths, &owner_file.public_key, operation, now)?;
+    Ok(operation_id_value)
+}
+
+pub fn abandon_traffic_authorization(
+    paths: &DataPaths,
+    node_name: &str,
+    password: &str,
+    authorization_id: &str,
+    now: i64,
+) -> Result<String> {
+    abandon_traffic_authorization_with_note(
+        paths,
+        node_name,
+        password,
+        authorization_id,
+        "node abandoned interrupted Relay session",
+        now,
+    )
+}
+
+pub fn abandon_traffic_authorization_with_note(
+    paths: &DataPaths,
+    node_name: &str,
+    password: &str,
+    authorization_id: &str,
+    note: &str,
+    now: i64,
+) -> Result<String> {
+    let owner_file = paths.read_keyfile(&paths.node_owner_key_path(node_name)?)?;
+    let ledger = paths.read_ledger()?;
+    let authorization = ledger
+        .payment_authorizations
+        .get(authorization_id)
+        .ok_or_else(|| Error::msg("payment authorization was not found"))?;
+    let node = ledger
+        .nodes
+        .get(&authorization.node_id)
+        .ok_or_else(|| Error::msg("serving Node was not found"))?;
+    if node.name != node_name || node.owner_address != owner_file.address {
+        return Err(Error::msg(
+            "payment authorization does not belong to this Node",
+        ));
+    }
+    if authorization.refunded_at.is_some()
+        || authorization.closed_at.is_some()
+        || authorization.reserved_remaining == 0
+    {
+        return Err(Error::msg("payment authorization is already closed"));
+    }
+    let nonce = ledger
+        .accounts
+        .get(&owner_file.address)
+        .map_or(1, |account| account.nonce.saturating_add(1));
+    let operation = sign_public_operation(
+        &owner_file,
+        password,
+        PublicOperationSigningRequest {
+            ledger_id: &ledger.ledger_id,
+            module: "TrafficPayment",
+            action: "Refund",
+            nonce,
+            valid_until: now + DEFAULT_OPERATION_VALIDITY_SECONDS,
+            payload: json!({
+                "authorization_id": authorization_id,
+                "note": note,
+            }),
+        },
+    )?;
+    let operation_id_value = operation_id(&operation)?;
+    submit_signed_network_operation(paths, &owner_file.public_key, operation, now)?;
+    paths.remove_unsettled_relay_session(authorization_id)?;
     Ok(operation_id_value)
 }
 
@@ -4053,6 +4249,7 @@ pub fn init_node_with_storage_mode(
         trusted_checkpoint_height: None,
         bootstrap_allow_insecure_local: false,
         bootstrap_tls_ca: None,
+        relay_auto_abandon: Default::default(),
     };
     std::fs::create_dir(&directory)?;
     let write_result = (|| {
