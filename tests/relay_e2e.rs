@@ -161,6 +161,13 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
     copy_tree(&root, &client_root);
     drop(paths);
     let client_paths = DataPaths::new(Some(client_root.clone())).unwrap();
+    client_paths
+        .with_ledger_mut(|ledger| {
+            ledger.networks.clear();
+            ledger.network_aliases.clear();
+            Ok(())
+        })
+        .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_mrk"))
         .arg("--data-dir")
         .arg(&root)

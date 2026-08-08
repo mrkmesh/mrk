@@ -153,8 +153,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let paths = DataPaths::new(None)?;
     let password = std::env::var("MRK_KEYSTORE_PASSWORD")?;
-    let identity = MemberIdentity::from_data_paths(&paths, "team", "client-a", &password)?;
-    let connection = RelayClient::connect(ClientOptions::new("relay.example.com", identity)).await?;
+    let endpoint = "relay.example.com";
+    let identity = MemberIdentity::from_relay(
+        &paths, "team", "client-a", &password, endpoint, false, None,
+    ).await?;
+    let connection = RelayClient::connect(ClientOptions::new(endpoint, identity)).await?;
     let mut stream = connection.open("<CLIENT_B_MEMBER_ID>", "<AUTHORIZATION_ID>").await?;
 
     stream.write_all(b"hello").await?;

@@ -407,9 +407,17 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 allow_insecure_local,
                 tls_ca,
             } = options;
-            let identity =
-                crate::sdk::MemberIdentity::from_data_paths(&paths, &network, &member, &password)
-                    .map_err(|error| Error::msg(error.to_string()))?;
+            let identity = crate::sdk::MemberIdentity::from_relay(
+                &paths,
+                &network,
+                &member,
+                &password,
+                &endpoint,
+                allow_insecure_local,
+                tls_ca.as_deref(),
+            )
+            .await
+            .map_err(|error| Error::msg(error.to_string()))?;
             drop(paths);
             let mut client_options = crate::sdk::ClientOptions::new(&endpoint, identity)
                 .allow_insecure_local(allow_insecure_local);

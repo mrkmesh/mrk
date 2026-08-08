@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     fmt::{Display, Formatter},
     io,
-    path::PathBuf,
+    path::{Path, PathBuf},
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
@@ -35,7 +35,7 @@ use tokio::{
 use crate::{
     Error,
     crypto::{EncryptedKeyFile, decrypt_key, sha256_full_id, verify_bytes},
-    model::{MemberCredential, PROTOCOL_VERSION, RelayDirection},
+    model::{MemberCredential, NetworkRecord, PROTOCOL_VERSION, RelayDirection},
     relay::{
         ChallengePayload, FrameType, HelloPayload, IncomingPayload, OpenPayload,
         RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES, RELAY_PAYMENT_WINDOW_SECONDS,
@@ -176,8 +176,61 @@ impl MemberIdentity {
         member: &str,
         password: &str,
     ) -> Result<Self, RelayError> {
+        let network_record = service::network_by_alias(paths, network)
+            .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
+        Self::from_data_paths_with_network_record(paths, network, member, password, &network_record)
+    }
+
+    pub async fn from_relay(
+        paths: &DataPaths,
+        network: &str,
+        member: &str,
+        password: &str,
+        endpoint: &str,
+        allow_insecure_local: bool,
+        tls_ca: Option<&Path>,
+    ) -> Result<Self, RelayError> {
+        let mut rpc_endpoint =
+            crate::endpoint::normalize_websocket_url(endpoint, crate::endpoint::RELAY_PATH)
+                .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
+        rpc_endpoint.set_path(crate::endpoint::RPC_PATH);
+        rpc_endpoint.set_query(None);
+        rpc_endpoint.set_fragment(None);
+        let value = rpc_call(
+            rpc_endpoint.as_str(),
+            "network.get",
+            serde_json::json!({ "alias": network }),
+            allow_insecure_local,
+            tls_ca,
+        )
+        .await
+        .map_err(|error| {
+            RelayError::InvalidConfig(format!(
+                "could not load Network '{network}' from Relay RPC: {error}"
+            ))
+        })?;
+        let network_record: NetworkRecord = serde_json::from_value(value).map_err(|error| {
+            RelayError::InvalidConfig(format!(
+                "Relay RPC returned an invalid Network '{network}': {error}"
+            ))
+        })?;
+        Self::from_data_paths_with_network_record(paths, network, member, password, &network_record)
+    }
+
+    pub fn from_data_paths_with_network_record(
+        paths: &DataPaths,
+        network: &str,
+        member: &str,
+        password: &str,
+        network_record: &NetworkRecord,
+    ) -> Result<Self, RelayError> {
         let credential = service::member_credential(paths, network, member)
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
+        if network_record.alias != network || network_record.network_id != credential.network_id {
+            return Err(RelayError::InvalidConfig(format!(
+                "Network '{network}' does not match the local member credential"
+            )));
+        }
         let keyfile = paths
             .read_keyfile(
                 &paths
@@ -185,10 +238,8 @@ impl MemberIdentity {
                     .map_err(|error| RelayError::InvalidConfig(error.to_string()))?,
             )
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
-        let network = service::network_by_alias(paths, network)
-            .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
         let signer = Arc::new(KeystoreSigner::unlock(&keyfile, password)?);
-        Self::new(credential, network.owner_public_key, signer)
+        Self::new(credential, network_record.owner_public_key.clone(), signer)
     }
 
     pub fn credential(&self) -> &MemberCredential {
@@ -2146,6 +2197,65 @@ mod tests {
     use super::*;
 
     const SHARED_SECRET: [u8; 32] = [0x5a; 32];
+
+    #[test]
+    fn member_identity_accepts_a_remote_network_record_without_local_network_state() {
+        let random = crate::crypto::random_bytes::<8>().unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "mrk-sdk-remote-network-{}",
+            crate::crypto::hex_lower(&random)
+        ));
+        let paths = DataPaths::new(Some(root.clone())).unwrap();
+        let password = "sdk-remote-network-password";
+        service::create_account(&paths, "owner", password).unwrap();
+        let network_record =
+            service::create_network(&paths, "owner", password, "team", Utc::now().timestamp())
+                .unwrap();
+        let (credential, _) = service::issue_member(
+            &paths,
+            "owner",
+            password,
+            "team",
+            "alice",
+            7,
+            Utc::now().timestamp(),
+        )
+        .unwrap();
+        paths
+            .with_ledger_mut(|ledger| {
+                ledger.networks.clear();
+                ledger.network_aliases.clear();
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(MemberIdentity::from_data_paths(&paths, "team", "alice", password).is_err());
+        let identity = MemberIdentity::from_data_paths_with_network_record(
+            &paths,
+            "team",
+            "alice",
+            password,
+            &network_record,
+        )
+        .unwrap();
+        assert_eq!(identity.credential().member_id, credential.member_id);
+
+        let mut wrong_network = network_record;
+        wrong_network.network_id = "different-network".to_owned();
+        assert!(
+            MemberIdentity::from_data_paths_with_network_record(
+                &paths,
+                "team",
+                "alice",
+                password,
+                &wrong_network,
+            )
+            .is_err()
+        );
+
+        drop(paths);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn stream_cipher_round_trips_both_directions_without_plaintext() {
