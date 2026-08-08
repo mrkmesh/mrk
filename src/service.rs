@@ -1219,7 +1219,7 @@ pub fn transfer(
         let signed = sign_operation(
             ledger,
             (&keyfile, &key_pair),
-            "MRKAsset",
+            "Asset",
             "Transfer",
             preview.nonce,
             preview.valid_until,
@@ -1330,7 +1330,7 @@ pub fn sign_transfer_for_submission(
     let unsigned = UnsignedOperation {
         ledger_id: request.ledger_id.to_owned(),
         protocol_version: PROTOCOL_VERSION,
-        module: "MRKAsset".to_owned(),
+        module: "Asset".to_owned(),
         action: "Transfer".to_owned(),
         signer: keyfile.address.clone(),
         account_nonce: request.nonce,
@@ -1369,7 +1369,7 @@ pub fn submit_signed_transfer(
     }
     verify_operation(&operation, public_key)?;
     if operation.unsigned.protocol_version != PROTOCOL_VERSION
-        || operation.unsigned.module != "MRKAsset"
+        || operation.unsigned.module != "Asset"
         || operation.unsigned.action != "Transfer"
     {
         return Err(Error::msg("unsupported signed operation"));
@@ -2223,7 +2223,7 @@ fn submit_consensus_operation_strict(
         envelope.operation.unsigned.module.as_str(),
         envelope.operation.unsigned.action.as_str(),
     ) {
-        ("MRKAsset", "Transfer") => {
+        ("Asset", "Transfer") => {
             submit_signed_transfer(paths, &envelope.public_key, envelope.operation, now).map(|_| ())
         }
         ("NetworkRegistry", _)
@@ -2298,7 +2298,7 @@ fn stage_consensus_candidate(
             operation.unsigned.module.as_str(),
             operation.unsigned.action.as_str()
         ),
-        ("MRKAsset", "Transfer")
+        ("Asset", "Transfer")
             | (
                 "NetworkRegistry",
                 "CreateNetwork" | "RevokeMember" | "IssueMember"

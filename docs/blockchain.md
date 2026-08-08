@@ -544,7 +544,7 @@ Treasury 支出强制属于 Critical 提案，且治理快照只包含累计合�
 
 MSL 只包含以下固定模块：
 
-- `MRKAsset`：余额、转账、销毁和硬供应上限；
+- `Asset`：余额、转账、销毁和硬供应上限；
 - `NodeEmissionController`：Epoch 节点预算、Node Seconds 和唯一铸币入口；
 - `NodeRegistry`：Node、Owner/Relay 密钥、端点、状态和报价；
 - `StakeVault`：Service/Validator/Governance Bond；

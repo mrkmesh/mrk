@@ -232,6 +232,7 @@ fn externally_signed_transfer_is_verified_and_committed_by_database_owner() {
         },
     )
     .unwrap();
+    assert_eq!(operation.unsigned.module, "Asset");
     let receipt =
         service::submit_signed_transfer(&paths, &public_key, operation, Utc::now().timestamp())
             .unwrap();
