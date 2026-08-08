@@ -30,10 +30,11 @@ use crate::{
         GovernanceActionRecord, GovernanceProposalAction, GovernanceProposalKind,
         GovernanceProposalRecord, GovernanceProposalStatus, GovernanceValidatorVoteRecord,
         GovernanceVoteChoice, GovernanceVoteRecord, IpSlotRecord, LedgerSettings, LedgerState,
-        LocalNodeConfig, MemberCredential, MemberRecord, NetworkRecord, NodeRecord, NodeStatus,
-        NodeStorageMode, OperationRecord, OperationStatus, PROTOCOL_VERSION,
-        PaymentAuthorizationRecord, RelayDirection, RewardVestingSchedule, SignedOperation,
-        TRANSFER_FEE, TrafficDirectionSettlement, TreasurySpendRecord, UnsignedOperation,
+        LocalNodeConfig, MemberCredential, MemberRecord, NetworkRecord, NetworkSpendingPolicy,
+        NodeRecord, NodeStatus, NodeStorageMode, OperationRecord, OperationStatus,
+        PROTOCOL_VERSION, PaymentAuthorizationRecord, RelayDirection, RewardVestingSchedule,
+        SignedOperation, TRANSFER_FEE, TrafficDirectionSettlement, TreasurySpendRecord,
+        UnsignedOperation,
     },
     relay::{
         ChallengePayload, HelloPayload, ProbePayload, RELAY_PAYMENT_CLAIM_SECONDS, ReceiverReceipt,
@@ -1556,80 +1557,6 @@ pub fn store_member_files(
     Ok(credential_path)
 }
 
-pub struct PaymentAuthorizationSigningRequest<'a> {
-    pub ledger_id: &'a str,
-    pub network: &'a NetworkRecord,
-    pub node_id: u64,
-    pub sender_member_name: &'a str,
-    pub receiver_member_name: &'a str,
-    pub max_amount_text: &'a str,
-    pub valid_minutes: i64,
-    pub nonce: u64,
-    pub now: i64,
-}
-
-pub fn prepare_payment_authorization(
-    owner_file: &EncryptedKeyFile,
-    password: &str,
-    request: PaymentAuthorizationSigningRequest<'_>,
-) -> Result<(String, SignedOperation)> {
-    if request.network.owner_address != owner_file.address {
-        return Err(Error::msg(
-            "only the Network Owner can authorize Relay payment",
-        ));
-    }
-    if !(1..=30 * 24 * 60).contains(&request.valid_minutes) {
-        return Err(Error::msg(
-            "payment authorization validity must be between 1 minute and 30 days",
-        ));
-    }
-    let sender = request
-        .network
-        .members
-        .get(request.sender_member_name)
-        .ok_or_else(|| Error::msg("payment sender Member was not found"))?;
-    let receiver = request
-        .network
-        .members
-        .get(request.receiver_member_name)
-        .ok_or_else(|| Error::msg("payment receiver Member was not found"))?;
-    let max_amount = parse_mrk(request.max_amount_text)?;
-    if max_amount == 0 {
-        return Err(Error::msg(
-            "payment maximum amount must be greater than zero",
-        ));
-    }
-    if request.network.escrow_balance < max_amount {
-        return Err(Error::msg("insufficient Network Escrow"));
-    }
-    let session_id = hex_lower(&random_bytes::<32>()?);
-    let authorization_valid_until = request
-        .now
-        .checked_add(request.valid_minutes.saturating_mul(60))
-        .ok_or_else(|| Error::msg("payment authorization expiry overflow"))?;
-    let operation = sign_public_operation(
-        owner_file,
-        password,
-        PublicOperationSigningRequest {
-            ledger_id: request.ledger_id,
-            module: "TrafficPayment",
-            action: "Authorize",
-            nonce: request.nonce,
-            valid_until: request.now + DEFAULT_OPERATION_VALIDITY_SECONDS,
-            payload: json!({
-                "network": request.network.alias,
-                "node_id": request.node_id,
-                "sender_member_id": sender.member_id,
-                "receiver_member_id": receiver.member_id,
-                "session_id": session_id,
-                "max_amount_base_units": max_amount.to_string(),
-                "authorization_valid_until": authorization_valid_until,
-            }),
-        },
-    )?;
-    Ok((session_id, operation))
-}
-
 pub struct SenderCheckpointSigningRequest<'a> {
     pub ledger_id: &'a str,
     pub node_id: u64,
@@ -1648,6 +1575,27 @@ pub fn sign_sender_checkpoint(
     member_name: &str,
     password: &str,
     request: SenderCheckpointSigningRequest<'_>,
+) -> Result<SenderCheckpoint> {
+    sign_sender_checkpoint_with_final(paths, network_name, member_name, password, request, false)
+}
+
+pub fn sign_final_sender_checkpoint(
+    paths: &DataPaths,
+    network_name: &str,
+    member_name: &str,
+    password: &str,
+    request: SenderCheckpointSigningRequest<'_>,
+) -> Result<SenderCheckpoint> {
+    sign_sender_checkpoint_with_final(paths, network_name, member_name, password, request, true)
+}
+
+fn sign_sender_checkpoint_with_final(
+    paths: &DataPaths,
+    network_name: &str,
+    member_name: &str,
+    password: &str,
+    request: SenderCheckpointSigningRequest<'_>,
+    final_checkpoint: bool,
 ) -> Result<SenderCheckpoint> {
     let credential = member_credential(paths, network_name, member_name)?;
     let keyfile = paths.read_keyfile(&paths.member_key_path(network_name, member_name)?)?;
@@ -1669,6 +1617,7 @@ pub fn sign_sender_checkpoint(
         transcript_hash: request.transcript_hash.to_owned(),
         checkpoint_at: request.checkpoint_at,
         sender_member_id: credential.member_id,
+        final_checkpoint,
         sender_signature: String::new(),
     };
     checkpoint.sender_signature = sign_bytes(&key, &sender_checkpoint_signing_bytes(&checkpoint)?);
@@ -1783,6 +1732,7 @@ pub fn submit_signed_network_operation(
                     escrow_balance: 0,
                     next_member_serial: 1,
                     members: BTreeMap::new(),
+                    spending_policy: Default::default(),
                 };
                 ledger.network_aliases.insert(alias, commitment.clone());
                 ledger.networks.insert(commitment, record.clone());
@@ -1813,9 +1763,90 @@ pub fn submit_signed_network_operation(
                     .escrow_balance += amount;
                 json!({ "operation_id": operation_id, "status": "PENDING" })
             }
-            ("TrafficPayment", "Authorize") => {
+            ("NetworkEscrow", "SetSpendingPolicy") => {
                 let alias = payload_str(&operation.unsigned.payload, "network")?;
                 let commitment = resolve_network(ledger, alias)?;
+                let revision = operation
+                    .unsigned
+                    .payload
+                    .get("revision")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::msg("spending policy revision is invalid"))?;
+                let enabled = operation
+                    .unsigned
+                    .payload
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| Error::msg("spending policy enabled flag is invalid"))?;
+                let max_session_amount = parse_payload_u128(
+                    &operation.unsigned.payload,
+                    "max_session_amount_base_units",
+                )?;
+                let max_member_reserved = parse_payload_u128(
+                    &operation.unsigned.payload,
+                    "max_member_reserved_base_units",
+                )?;
+                let max_node_price_per_gib = parse_payload_u128(
+                    &operation.unsigned.payload,
+                    "max_node_price_per_gib_base_units",
+                )?;
+                let max_session_minutes = operation
+                    .unsigned
+                    .payload
+                    .get("max_session_minutes")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or_else(|| Error::msg("spending policy session duration is invalid"))?;
+                let network = ledger.networks.get_mut(&commitment).expect("network");
+                if network.owner_address != operation.unsigned.signer
+                    || network.owner_public_key != public_key
+                {
+                    return Err(Error::msg(
+                        "only the Network Owner can update its spending policy",
+                    ));
+                }
+                if revision != network.spending_policy.revision.saturating_add(1) {
+                    return Err(Error::msg("spending policy revision is stale"));
+                }
+                let policy = NetworkSpendingPolicy {
+                    revision,
+                    enabled,
+                    max_session_amount,
+                    max_member_reserved,
+                    max_node_price_per_gib,
+                    max_session_minutes,
+                };
+                validate_network_spending_policy(&policy)?;
+                network.spending_policy = policy.clone();
+                serde_json::to_value(policy)?
+            }
+            ("TrafficPayment", "ReserveSession") => {
+                let alias = payload_str(&operation.unsigned.payload, "network")?;
+                let commitment = resolve_network(ledger, alias)?;
+                let reclaimed = ledger
+                    .payment_authorizations
+                    .values_mut()
+                    .filter(|authorization| {
+                        authorization.network_commitment == commitment
+                            && authorization.refunded_at.is_none()
+                            && authorization.closed_at.is_none()
+                            && submitted_at > authorization.claim_until
+                    })
+                    .try_fold(0_u128, |total, authorization| {
+                        let amount = authorization.reserved_remaining;
+                        authorization.reserved_remaining = 0;
+                        authorization.refunded_at = Some(submitted_at);
+                        total
+                            .checked_add(amount)
+                            .ok_or_else(|| Error::msg("automatic reservation reclaim overflow"))
+                    })?;
+                if reclaimed > 0 {
+                    let network = ledger.networks.get_mut(&commitment).expect("network");
+                    network.escrow_balance = network
+                        .escrow_balance
+                        .checked_add(reclaimed)
+                        .ok_or_else(|| Error::msg("Network Fund overflow during reclaim"))?;
+                }
                 let node_id = operation
                     .unsigned
                     .payload
@@ -1832,15 +1863,7 @@ pub fn submit_signed_network_operation(
                         "payment sender and receiver must be different members",
                     ));
                 }
-                if session_id.len() != 64
-                    || !session_id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-                {
-                    return Err(Error::msg(
-                        "payment Session ID must be 32-byte lowercase hex",
-                    ));
-                }
+                validate_payment_session_id(&session_id)?;
                 if ledger
                     .payment_authorizations
                     .values()
@@ -1848,9 +1871,9 @@ pub fn submit_signed_network_operation(
                 {
                     return Err(Error::msg("payment Session ID is already in use"));
                 }
-                let max_amount =
+                let requested_max_amount =
                     parse_payload_u128(&operation.unsigned.payload, "max_amount_base_units")?;
-                if max_amount == 0 {
+                if requested_max_amount == 0 {
                     return Err(Error::msg(
                         "payment maximum amount must be greater than zero",
                     ));
@@ -1861,13 +1884,12 @@ pub fn submit_signed_network_operation(
                     .get("authorization_valid_until")
                     .and_then(Value::as_i64)
                     .ok_or_else(|| Error::msg("payment authorization expiry is invalid"))?;
-                if authorization_valid_until <= submitted_at
-                    || authorization_valid_until.saturating_sub(submitted_at) > 30 * 86_400
-                {
-                    return Err(Error::msg(
-                        "payment authorization must expire within 30 days",
-                    ));
-                }
+                let expected_policy_revision = operation
+                    .unsigned
+                    .payload
+                    .get("spending_policy_revision")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::msg("spending policy revision is invalid"))?;
                 let node = ledger
                     .nodes
                     .get(&node_id)
@@ -1879,12 +1901,39 @@ pub fn submit_signed_network_operation(
                     return Err(Error::msg("payment Node is not accepting new sessions"));
                 }
                 let price_per_gib = node.price_per_gib;
-                let network = ledger.networks.get_mut(&commitment).expect("network");
-                if network.owner_address != operation.unsigned.signer
-                    || network.owner_public_key != public_key
+                let network = ledger.networks.get(&commitment).expect("network");
+                let policy = &network.spending_policy;
+                if !policy.enabled {
+                    return Err(Error::msg("member spending is disabled for this Network"));
+                }
+                if policy.revision != expected_policy_revision {
+                    return Err(Error::msg("spending policy revision is stale"));
+                }
+                if price_per_gib > policy.max_node_price_per_gib {
+                    return Err(Error::msg("Relay Node price exceeds the Network policy"));
+                }
+                if authorization_valid_until <= submitted_at
+                    || authorization_valid_until.saturating_sub(submitted_at)
+                        > i64::from(policy.max_session_minutes).saturating_mul(60)
                 {
                     return Err(Error::msg(
-                        "only the Network Owner can authorize Relay payment",
+                        "payment authorization exceeds the Network session duration policy",
+                    ));
+                }
+                let sender = network
+                    .members
+                    .values()
+                    .find(|member| member.member_id == sender_member_id)
+                    .ok_or_else(|| Error::msg("payment sender member is not registered"))?;
+                if sender.public_key != public_key
+                    || address_from_public_key(
+                        &STANDARD
+                            .decode(&sender.public_key)
+                            .map_err(|_| Error::msg("member public key is not valid base64"))?,
+                    ) != operation.unsigned.signer
+                {
+                    return Err(Error::msg(
+                        "only the initiating Network member can reserve a session",
                     ));
                 }
                 for member_id in [&sender_member_id, &receiver_member_id] {
@@ -1900,9 +1949,30 @@ pub fn submit_signed_network_operation(
                         ));
                     }
                 }
-                if network.escrow_balance < max_amount {
-                    return Err(Error::msg("insufficient Network Escrow"));
+                let member_reserved = ledger
+                    .payment_authorizations
+                    .values()
+                    .filter(|authorization| {
+                        authorization.network_commitment == commitment
+                            && authorization.initiator_member_id == sender_member_id
+                            && authorization.refunded_at.is_none()
+                    })
+                    .try_fold(0_u128, |total, authorization| {
+                        total
+                            .checked_add(authorization.reserved_remaining)
+                            .ok_or_else(|| Error::msg("member reservation total overflow"))
+                    })?;
+                let member_capacity = policy.max_member_reserved.saturating_sub(member_reserved);
+                let max_amount = requested_max_amount
+                    .min(policy.max_session_amount)
+                    .min(member_capacity)
+                    .min(network.escrow_balance);
+                if max_amount == 0 {
+                    return Err(Error::msg(
+                        "Network Fund or member reservation capacity is exhausted",
+                    ));
                 }
+                let network = ledger.networks.get_mut(&commitment).expect("network");
                 network.escrow_balance -= max_amount;
                 let mut directions = BTreeMap::new();
                 directions.insert(
@@ -1917,9 +1987,9 @@ pub fn submit_signed_network_operation(
                     authorization_id: operation_id.clone(),
                     network_commitment: commitment,
                     network_id: network.network_id.clone(),
-                    payer_address: operation.unsigned.signer.clone(),
+                    payer_address: network.owner_address.clone(),
                     node_id,
-                    sender_member_id,
+                    sender_member_id: sender_member_id.clone(),
                     receiver_member_id,
                     session_id,
                     price_per_gib,
@@ -1931,7 +2001,10 @@ pub fn submit_signed_network_operation(
                     claim_until: authorization_valid_until
                         .saturating_add(RELAY_PAYMENT_CLAIM_SECONDS),
                     refunded_at: None,
+                    closed_at: None,
                     directions,
+                    initiator_member_id: sender_member_id,
+                    spending_policy_revision: expected_policy_revision,
                 };
                 ledger
                     .payment_authorizations
@@ -2061,6 +2134,40 @@ fn payload_str<'a>(payload: &'a Value, name: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::msg(format!("signed operation is missing '{name}'")))
 }
 
+fn validate_network_spending_policy(policy: &NetworkSpendingPolicy) -> Result<()> {
+    if policy.max_session_amount == 0
+        || policy.max_session_amount > MAX_SUPPLY
+        || policy.max_member_reserved < policy.max_session_amount
+        || policy.max_member_reserved > MAX_SUPPLY
+    {
+        return Err(Error::msg(
+            "spending policy amounts must be positive and member capacity must cover one session",
+        ));
+    }
+    if policy.max_node_price_per_gib == 0 || policy.max_node_price_per_gib > MAX_SUPPLY {
+        return Err(Error::msg("spending policy Node price limit is invalid"));
+    }
+    if !(1..=30 * 24 * 60).contains(&policy.max_session_minutes) {
+        return Err(Error::msg(
+            "spending policy session duration must be between 1 minute and 30 days",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_payment_session_id(session_id: &str) -> Result<()> {
+    if session_id.len() != 64
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(Error::msg(
+            "payment Session ID must be 32-byte lowercase hex",
+        ));
+    }
+    Ok(())
+}
+
 pub fn operation(paths: &DataPaths, operation_id: &str) -> Result<OperationRecord> {
     paths
         .read_ledger()?
@@ -2121,7 +2228,7 @@ fn submit_consensus_operation_strict(
         }
         ("NetworkRegistry", _)
         | ("NetworkEscrow", _)
-        | ("TrafficPayment", "Authorize" | "Refund") => {
+        | ("TrafficPayment", "ReserveSession" | "Refund") => {
             submit_signed_network_operation(paths, &envelope.public_key, envelope.operation, now)
                 .map(|_| ())
         }
@@ -2154,13 +2261,13 @@ pub fn submit_consensus_operation(
     match submit_consensus_operation_strict(paths, envelope.clone(), now) {
         Ok(operation_id_value) => Ok(operation_id_value),
         Err(application_error) => {
-            if envelope.operation.unsigned.module == "TrafficPayment"
-                && envelope.operation.unsigned.action == "Authorize"
-                && matches!(
-                    &application_error,
-                    Error::Message(message) if message == "insufficient Network Escrow"
-                )
-            {
+            let module = envelope.operation.unsigned.module.as_str();
+            let action = envelope.operation.unsigned.action.as_str();
+            let reject_refund = module == "TrafficPayment" && action == "Refund";
+            let reject_member_reservation =
+                module == "TrafficPayment" && action == "ReserveSession";
+            let reject_policy_update = module == "NetworkEscrow" && action == "SetSpendingPolicy";
+            if reject_refund || reject_member_reservation || reject_policy_update {
                 return Err(application_error);
             }
             stage_consensus_candidate(paths, envelope, now).map_err(|_| application_error)
@@ -2196,8 +2303,8 @@ fn stage_consensus_candidate(
                 "NetworkRegistry",
                 "CreateNetwork" | "RevokeMember" | "IssueMember"
             )
-            | ("NetworkEscrow", "FundNetwork")
-            | ("TrafficPayment", "Authorize" | "Refund" | "Settle")
+            | ("NetworkEscrow", "FundNetwork" | "SetSpendingPolicy")
+            | ("TrafficPayment", "ReserveSession" | "Refund" | "Settle")
             | (
                 "Governance",
                 "SetParameter"
@@ -2243,6 +2350,48 @@ fn stage_consensus_candidate(
         }
         if ledger.operations.contains_key(&operation_id_value) {
             return Ok(operation_id_value.clone());
+        }
+        if ledger.pending_operation_ids.iter().any(|pending_id| {
+            ledger.operations.get(pending_id).is_some_and(|pending| {
+                pending.signer == operation.unsigned.signer
+                    && pending.nonce == operation.unsigned.account_nonce
+            })
+        }) {
+            return Err(Error::msg(
+                "another pending operation already uses this signer nonce",
+            ));
+        }
+        if operation.unsigned.module == "NetworkRegistry"
+            && operation.unsigned.action == "IssueMember"
+        {
+            let network = payload_str(&operation.unsigned.payload, "network")?;
+            let member_name = payload_str(&operation.unsigned.payload, "member_name")?;
+            let serial = operation
+                .unsigned
+                .payload
+                .get("credential")
+                .and_then(|credential| credential.get("serial"))
+                .and_then(Value::as_u64)
+                .ok_or_else(|| Error::msg("member credential serial is invalid"))?;
+            let conflict = ledger.pending_operation_ids.iter().any(|pending_id| {
+                ledger.operations.get(pending_id).is_some_and(|pending| {
+                    pending.kind == "NetworkRegistry.IssueMember"
+                        && pending.payload.get("network").and_then(Value::as_str) == Some(network)
+                        && (pending.payload.get("member_name").and_then(Value::as_str)
+                            == Some(member_name)
+                            || pending
+                                .payload
+                                .get("credential")
+                                .and_then(|credential| credential.get("serial"))
+                                .and_then(Value::as_u64)
+                                == Some(serial))
+                })
+            });
+            if conflict {
+                return Err(Error::msg(
+                    "another pending member issue already uses this name or serial",
+                ));
+            }
         }
         if operation.unsigned.module == "NetworkRegistry"
             && operation.unsigned.action == "CreateNetwork"
@@ -3037,7 +3186,9 @@ fn apply_traffic_settlement(
             "traffic sender checkpoint and receiver receipt do not describe the same prefix",
         ));
     }
-    if checkpoint.sequence == 0 || checkpoint.cumulative_sent_bytes == 0 {
+    if !checkpoint.final_checkpoint
+        && (checkpoint.sequence == 0 || checkpoint.cumulative_sent_bytes == 0)
+    {
         return Err(Error::msg(
             "traffic settlement cannot contain an empty prefix",
         ));
@@ -3145,9 +3296,11 @@ fn apply_traffic_settlement(
         .get(&checkpoint.direction)
         .cloned()
         .unwrap_or_default();
-    if checkpoint.sequence <= previous.settled_sequence
-        || checkpoint.cumulative_sent_bytes <= previous.settled_payload_bytes
-    {
+    let moved_backwards = checkpoint.sequence < previous.settled_sequence
+        || checkpoint.cumulative_sent_bytes < previous.settled_payload_bytes;
+    let did_not_advance = checkpoint.sequence == previous.settled_sequence
+        && checkpoint.cumulative_sent_bytes == previous.settled_payload_bytes;
+    if moved_backwards || (!checkpoint.final_checkpoint && did_not_advance) || previous.finalized {
         return Err(Error::msg(
             "traffic settlement is not a strictly newer prefix",
         ));
@@ -3190,8 +3343,31 @@ fn apply_traffic_settlement(
             settled_transcript_hash: Some(checkpoint.transcript_hash.clone()),
             last_receipt_hash: Some(receipt_hash),
             last_receipt_at: Some(receipt.received_at),
+            finalized: checkpoint.final_checkpoint,
         },
     );
+    let released = if authorization
+        .directions
+        .values()
+        .all(|direction| direction.finalized)
+    {
+        let released = authorization.reserved_remaining;
+        authorization.reserved_remaining = 0;
+        authorization.closed_at = Some(executed_at);
+        released
+    } else {
+        0
+    };
+    if released > 0 {
+        let network = ledger
+            .networks
+            .get_mut(&authorization.network_commitment)
+            .expect("validated payment Network");
+        network.escrow_balance = network
+            .escrow_balance
+            .checked_add(released)
+            .ok_or_else(|| Error::msg("Network Fund overflow while closing Relay session"))?;
+    }
     let reward_address = node.reward_address;
     ledger
         .accounts
@@ -3235,7 +3411,7 @@ pub struct RelayAuthorizationView {
     pub finalized: bool,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaymentAuthorizationStatusView {
     pub authorization_id: String,
     pub session_id: String,
@@ -3274,10 +3450,10 @@ pub fn payment_authorization_status(
     let operation = ledger
         .operations
         .get(authorization_id_or_session_id)
-        .filter(|operation| operation.kind == "TrafficPayment.Authorize")
+        .filter(|operation| operation.kind == "TrafficPayment.ReserveSession")
         .or_else(|| {
             ledger.operations.values().find(|operation| {
-                operation.kind == "TrafficPayment.Authorize"
+                operation.kind == "TrafficPayment.ReserveSession"
                     && operation.payload.get("session_id").and_then(Value::as_str)
                         == Some(authorization_id_or_session_id)
             })
@@ -3290,6 +3466,80 @@ pub fn payment_authorization_status(
         status: operation.status.clone(),
         block_height: operation.block_height,
         authorization: None,
+    })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PaymentHistoryView {
+    pub network: String,
+    pub network_commitment: String,
+    pub fund_balance: u128,
+    pub total_settled: u128,
+    pub total_reserved: u128,
+    pub authorizations: Vec<PaymentAuthorizationRecord>,
+}
+
+pub fn payment_history(
+    paths: &DataPaths,
+    network_alias: &str,
+    member: Option<&str>,
+    limit: usize,
+) -> Result<PaymentHistoryView> {
+    let ledger = paths.read_ledger()?;
+    let commitment = resolve_network(&ledger, network_alias)?;
+    let network = ledger.networks.get(&commitment).expect("resolved Network");
+    let member_id = member
+        .map(|member| {
+            network
+                .members
+                .get(member)
+                .or_else(|| {
+                    network
+                        .members
+                        .values()
+                        .find(|record| record.member_id == member)
+                })
+                .map(|record| record.member_id.clone())
+                .ok_or_else(|| Error::msg("payment history member was not found"))
+        })
+        .transpose()?;
+    let mut authorizations: Vec<_> = ledger
+        .payment_authorizations
+        .values()
+        .filter(|authorization| {
+            authorization.network_commitment == commitment
+                && member_id.as_ref().is_none_or(|member_id| {
+                    authorization.sender_member_id == *member_id
+                        || authorization.receiver_member_id == *member_id
+                        || authorization.initiator_member_id == *member_id
+                })
+        })
+        .cloned()
+        .collect();
+    let total_settled = authorizations.iter().try_fold(0_u128, |total, item| {
+        total
+            .checked_add(item.settled_amount)
+            .ok_or_else(|| Error::msg("payment history settled total overflow"))
+    })?;
+    let total_reserved = authorizations.iter().try_fold(0_u128, |total, item| {
+        total
+            .checked_add(item.reserved_remaining)
+            .ok_or_else(|| Error::msg("payment history reservation total overflow"))
+    })?;
+    authorizations.sort_by(|left, right| {
+        right
+            .created_at
+            .cmp(&left.created_at)
+            .then_with(|| right.authorization_id.cmp(&left.authorization_id))
+    });
+    authorizations.truncate(limit.min(1_000));
+    Ok(PaymentHistoryView {
+        network: network.alias.clone(),
+        network_commitment: commitment,
+        fund_balance: network.escrow_balance,
+        total_settled,
+        total_reserved,
+        authorizations,
     })
 }
 
@@ -3463,6 +3713,7 @@ pub fn create_network(
             escrow_balance: 0,
             next_member_serial: 1,
             members: BTreeMap::new(),
+            spending_policy: Default::default(),
         };
         ledger
             .network_aliases

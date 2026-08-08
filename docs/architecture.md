@@ -151,7 +151,7 @@ FrameHeader {
 ```text
 RelayClient::connect(options).await -> RelayConnection
 
-RelayConnection::open(peer_id, authorization_id).await -> EncryptedStream
+RelayConnection::open_auto(peer_id).await -> EncryptedStream
 RelayConnection::accept().await -> IncomingStream
 IncomingStream::accept().await -> EncryptedStream
 IncomingStream::reject().await
@@ -310,11 +310,11 @@ CLI 只提供余额/历史查询和治理提案，不提供国库密钥或直接
 
 ### 6.3 累计双签名流量回执
 
-Owner 先向 `NetworkEscrow` 充值，再创建绑定 Node、双方 Member、随机 Session ID、固定 `price_per_gib`、限额和有效期的 `PaymentAuthorization`。授权必须最终确认后才能打开 Relay Channel，限额在创建时原子预留，但不会预付给 Node。
+Owner 先向 `NetworkEscrow` 充值并维护可随时更新或停用的 `NetworkSpendingPolicy`。默认允许 Active Member 使用共享 Fund，但每个会话必须由发起 Member 签署 `ReserveSession`，并受单会话额度、单 Member 并发预留、Node 最高报价和最长会话时间约束。状态机创建绑定 Node、双方 Member、随机 Session ID、策略 revision、固定 `price_per_gib`、限额和有效期的 `PaymentAuthorization`。授权必须最终确认后才能打开 Relay Channel，限额在创建时原子预留，但不会预付给 Node；策略更新只影响后续预留。
 
 每个方向独立累计 DATA Sequence、真实 Payload 字节和 Transcript Hash。达到 64 MiB 或自首个 DATA 起 2 分钟后，发送方签署 `SenderCheckpoint`，接收方核对本地已收到的相同前缀并签署 `ReceiverReceipt`；Node 只有验证双签名后才继续该方向。正常关闭会为不足一个窗口的尾部生成 Final Checkpoint。计费不包含 WSS/TLS/TCP 头、Padding 或控制帧。
 
-Node 在本地 redb 只保留每个授权、每个方向最新的累计回执，默认每 5 分钟批量提交，重启后恢复。链上用“新累计总价减该方向已结算金额”计算增量，避免按窗口向上取整造成重复收费。授权到期后有 7 天领取期，余款随后退回 Network Escrow。
+Node 在本地 redb 只保留每个授权、每个方向最新的累计回执，默认每 5 分钟批量提交，重启后恢复。链上用“新累计总价减该方向已结算金额”计算增量，避免按窗口向上取整造成重复收费。双方各自签署并回签 Final Checkpoint 后，未消费预留立即退回 Network Fund；未正常关闭的授权到期后仍有 7 天领取期，之后由下一次成员预留确定性回收。
 
 客户端根据自己的累计发送量和报价复算金额后才签名。未按时更新凭证时，Relay 暂停该连接的 `DATA` 转发；最大信用风险限制为一个计费步长。
 
@@ -403,15 +403,21 @@ mrk account history --account default --limit 20
 mrk network create --name team
 mrk network fund --network team --amount 100MRK
 mrk network show --network team
+mrk network policy show --network team
+mrk network policy set --network team --max-session-amount 1MRK \
+  --max-member-reserved 10MRK --max-node-price-per-gib 100MRK
 mrk member issue --network team --name client-a
 mrk member show --network team --name client-a
 mrk member revoke --network team --serial 42
 
-mrk payment authorize --network team --node-id 7 \
-  --sender client-a --receiver client-b \
-  --max-amount 10MRK --valid-minutes 1440
 mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>
+mrk payment history --network team [--member client-a]
 ```
+
+`member issue` 先以本机文件锁独占 `(Network, name)`，把加密 Member Key、Credential 和已签名
+Operation 写入私有 pending 文件；只有 Operation 终局且链上 Member ID、Serial、公钥和签名全部
+匹配时才原子提升为正式文件。超时保留 pending 供同一命令恢复，Rejected/Expired 清理 pending，
+并发同名签发不会覆盖密钥。
 
 成员侧把不透明字节流接到 stdin/stdout。接收方省略 `--peer` 并接受第一个入站通道；发起方指定目标随机 `member_id`：
 
@@ -421,8 +427,7 @@ mrk pipe --network team --member client-b \
 
 mrk pipe --network team --member client-a \
   --endpoint relay.example.com \
-  --peer <CLIENT_B_MEMBER_ID> \
-  --authorization <AUTHORIZATION_ID>
+  --peer <CLIENT_B_MEMBER_ID>
 ```
 
 通道建立后，双方使用成员 Ed25519 密钥认证临时 X25519 密钥交换，并以两个独立的 AES-256-GCM 方向密钥端到端加密全部 stdin 数据，不支持明文降级。Relay 继续把 `DATA` payload 当作不透明字节进行转发、流量哈希和计费，因此无法读取内容，但仍可观察成员标识、密文长度和传输时序；密钥交换与 AEAD 开销计入实际 Relay 流量。

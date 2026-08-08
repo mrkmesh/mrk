@@ -651,6 +651,35 @@ pub struct NetworkRecord {
     pub escrow_balance: u128,
     pub next_member_serial: u64,
     pub members: BTreeMap<String, MemberRecord>,
+    pub spending_policy: NetworkSpendingPolicy,
+}
+
+pub const DEFAULT_MEMBER_SESSION_AMOUNT: u128 = MRK_SCALE;
+pub const DEFAULT_MEMBER_RESERVED_AMOUNT: u128 = 10 * MRK_SCALE;
+pub const DEFAULT_MEMBER_NODE_PRICE_PER_GIB: u128 = 100 * MRK_SCALE;
+pub const DEFAULT_MEMBER_SESSION_MINUTES: u32 = 24 * 60;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkSpendingPolicy {
+    pub revision: u64,
+    pub enabled: bool,
+    pub max_session_amount: u128,
+    pub max_member_reserved: u128,
+    pub max_node_price_per_gib: u128,
+    pub max_session_minutes: u32,
+}
+
+impl Default for NetworkSpendingPolicy {
+    fn default() -> Self {
+        Self {
+            revision: 1,
+            enabled: true,
+            max_session_amount: DEFAULT_MEMBER_SESSION_AMOUNT,
+            max_member_reserved: DEFAULT_MEMBER_RESERVED_AMOUNT,
+            max_node_price_per_gib: DEFAULT_MEMBER_NODE_PRICE_PER_GIB,
+            max_session_minutes: DEFAULT_MEMBER_SESSION_MINUTES,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
@@ -669,6 +698,7 @@ pub struct TrafficDirectionSettlement {
     pub settled_transcript_hash: Option<String>,
     pub last_receipt_hash: Option<String>,
     pub last_receipt_at: Option<i64>,
+    pub finalized: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -689,7 +719,10 @@ pub struct PaymentAuthorizationRecord {
     pub valid_until: i64,
     pub claim_until: i64,
     pub refunded_at: Option<i64>,
+    pub closed_at: Option<i64>,
     pub directions: BTreeMap<RelayDirection, TrafficDirectionSettlement>,
+    pub initiator_member_id: String,
+    pub spending_policy_revision: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

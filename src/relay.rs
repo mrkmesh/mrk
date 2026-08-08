@@ -33,6 +33,7 @@ pub struct SenderCheckpoint {
     pub transcript_hash: String,
     pub checkpoint_at: i64,
     pub sender_member_id: String,
+    pub final_checkpoint: bool,
     pub sender_signature: String,
 }
 
@@ -66,6 +67,7 @@ pub fn sender_checkpoint_signing_bytes(checkpoint: &SenderCheckpoint) -> Result<
         "transcript_hash": checkpoint.transcript_hash,
         "checkpoint_at": checkpoint.checkpoint_at,
         "sender_member_id": checkpoint.sender_member_id,
+        "final_checkpoint": checkpoint.final_checkpoint,
     }))?)
 }
 

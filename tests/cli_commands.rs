@@ -472,6 +472,109 @@ fn account_and_node_cli_commands_emit_json() {
     assert!(network_text.contains("Network:      team"));
     assert!(network_text.contains("Fund balance: 0 MRK"));
 
+    let issue = Command::new(env!("CARGO_BIN_EXE_mrk"))
+        .arg("--data-dir")
+        .arg(&root)
+        .arg("--output")
+        .arg("json")
+        .arg("--rpc-endpoint")
+        .arg(format!("ws://127.0.0.1:{port}/v1/rpc"))
+        .arg("--rpc-allow-insecure-local")
+        .args([
+            "member",
+            "issue",
+            "--network",
+            "team",
+            "--name",
+            "client-a",
+            "--account",
+            "default",
+        ])
+        .env("MRK_KEYSTORE_PASSWORD", "cli-integration-password")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pending_path = root.join("networks/team/.client-a.issue.pending.json");
+    for _ in 0..100 {
+        if pending_path.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(pending_path.exists());
+    let pending: mrk::storage::PendingMemberIssue =
+        serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
+    for _ in 0..100 {
+        let status = run_mrk_rpc(
+            &root,
+            port,
+            &["block", "operation", "status", &pending.operation_id],
+        );
+        if status.status.success() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    let duplicate_issue = run_mrk_rpc(
+        &root,
+        port,
+        &[
+            "member",
+            "issue",
+            "--network",
+            "team",
+            "--name",
+            "client-a",
+            "--account",
+            "default",
+        ],
+    );
+    assert!(!duplicate_issue.status.success());
+    assert!(
+        String::from_utf8_lossy(&duplicate_issue.stderr)
+            .contains("already being issued by another local process")
+    );
+    let produced = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "block", "produce"],
+    );
+    assert!(
+        produced.status.success(),
+        "{}",
+        String::from_utf8_lossy(&produced.stderr)
+    );
+    let issued = issue.wait_with_output().unwrap();
+    assert!(
+        issued.status.success(),
+        "{}",
+        String::from_utf8_lossy(&issued.stderr)
+    );
+    let issued_json: serde_json::Value = serde_json::from_slice(&issued.stdout).unwrap();
+    assert_eq!(issued_json["status"], "FINALIZED");
+    assert!(!pending_path.exists());
+    assert!(root.join("networks/team/client-a.key.json").exists());
+    assert!(root.join("networks/team/client-a.credential.json").exists());
+
+    let overwrite = run_mrk_rpc(
+        &root,
+        port,
+        &[
+            "member",
+            "issue",
+            "--network",
+            "team",
+            "--name",
+            "client-a",
+            "--account",
+            "default",
+        ],
+    );
+    assert!(!overwrite.status.success());
+    assert!(String::from_utf8_lossy(&overwrite.stderr).contains("already exists"));
+
     let history_text = Command::new(env!("CARGO_BIN_EXE_mrk"))
         .arg("--data-dir")
         .arg(&root)
@@ -487,7 +590,7 @@ fn account_and_node_cli_commands_emit_json() {
         String::from_utf8_lossy(&history_text.stderr)
     );
     let history_text = String::from_utf8_lossy(&history_text.stdout);
-    assert!(history_text.contains("Operations: 1"));
+    assert!(history_text.contains("Operations: 2"));
     assert!(history_text.contains("FINALIZED  NetworkRegistry.CreateNetwork"));
     assert!(history_text.contains("Details:   {\"alias\":\"team\""));
 

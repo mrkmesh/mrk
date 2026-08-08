@@ -120,20 +120,29 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         .unwrap();
     service::fund_network(&paths, "owner", password, "team", "2MRK", now + 4).unwrap();
     let network = service::network_by_alias(&paths, "team").unwrap();
-    let nonce = paths.read_ledger().unwrap().accounts[&owner.address].nonce + 1;
-    let (_, authorization_operation) = service::prepare_payment_authorization(
-        &owner,
+    let alice_key = paths
+        .read_keyfile(&paths.member_key_path("team", "alice").unwrap())
+        .unwrap();
+    let session_id = mrk::crypto::hex_lower(&mrk::crypto::random_bytes::<32>().unwrap());
+    let authorization_operation = service::sign_public_operation(
+        &alice_key,
         password,
-        service::PaymentAuthorizationSigningRequest {
+        service::PublicOperationSigningRequest {
             ledger_id: &paths.read_ledger().unwrap().ledger_id,
-            network: &network,
-            node_id: node.node_id,
-            sender_member_name: "alice",
-            receiver_member_name: "bob",
-            max_amount_text: "1MRK",
-            valid_minutes: 60,
-            nonce,
-            now: now + 5,
+            module: "TrafficPayment",
+            action: "ReserveSession",
+            nonce: 1,
+            valid_until: now + 5 + mrk::model::DEFAULT_OPERATION_VALIDITY_SECONDS,
+            payload: serde_json::json!({
+                "network": "team",
+                "node_id": node.node_id,
+                "sender_member_id": alice_credential.member_id,
+                "receiver_member_id": bob_credential.member_id,
+                "session_id": session_id,
+                "max_amount_base_units": MRK_SCALE.to_string(),
+                "authorization_valid_until": now + 3605,
+                "spending_policy_revision": network.spending_policy.revision,
+            }),
         },
     )
     .unwrap();
@@ -141,7 +150,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         mrk::crypto::sha256_id("op", &serde_json::to_vec(&authorization_operation).unwrap());
     service::submit_signed_network_operation(
         &paths,
-        &owner.public_key,
+        &alice_key.public_key,
         authorization_operation,
         now + 5,
     )
@@ -320,8 +329,6 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
             .arg(&endpoint)
             .arg("--peer")
             .arg(&bob_credential.member_id)
-            .arg("--authorization")
-            .arg(&authorization_id)
             .arg("--tls-ca")
             .arg(&ca_path)
             .env("MRK_KEYSTORE_PASSWORD", password)

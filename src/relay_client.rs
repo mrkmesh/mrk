@@ -50,7 +50,6 @@ pub struct StdioPipeOptions {
     pub password: String,
     pub endpoint: String,
     pub peer: Option<String>,
-    pub authorization: Option<String>,
     pub allow_insecure_local: bool,
     pub tls_ca: Option<PathBuf>,
 }
@@ -403,7 +402,6 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 password,
                 endpoint,
                 peer,
-                authorization,
                 allow_insecure_local,
                 tls_ca,
             } = options;
@@ -428,11 +426,8 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 .await
                 .map_err(|error| Error::msg(error.to_string()))?;
             let stream = if let Some(peer_id) = peer {
-                let authorization = authorization.as_deref().ok_or_else(|| {
-                    Error::msg("initiating a paid Relay channel requires --authorization")
-                })?;
                 connection
-                    .open(peer_id, authorization)
+                    .open_auto(peer_id)
                     .await
                     .map_err(|error| Error::msg(error.to_string()))?
             } else {

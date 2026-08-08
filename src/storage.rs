@@ -1,9 +1,12 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
+
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, backends::InMemoryBackend};
 use serde::{Serialize, de::DeserializeOwned};
@@ -11,7 +14,7 @@ use serde::{Serialize, de::DeserializeOwned};
 use crate::{
     Error, Result,
     crypto::EncryptedKeyFile,
-    model::{LedgerState, LocalNodeConfig},
+    model::{LedgerState, LocalNodeConfig, MemberCredential, SignedOperation},
     relay::{ReceiverReceipt, SenderCheckpoint},
 };
 
@@ -21,6 +24,22 @@ pub struct PendingTrafficSettlement {
     pub receiver_receipt: ReceiverReceipt,
     #[serde(default)]
     pub submission_operation_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+pub struct PendingMemberIssue {
+    pub operation_id: String,
+    pub network: String,
+    pub member: String,
+    pub owner_public_key: String,
+    pub operation: SignedOperation,
+    pub keyfile: EncryptedKeyFile,
+    pub credential: MemberCredential,
+    pub created_at: i64,
+}
+
+pub struct MemberIssueLock {
+    _file: File,
 }
 
 #[derive(Clone)]
@@ -122,6 +141,74 @@ impl DataPaths {
             .join("networks")
             .join(network)
             .join(format!("{member}.credential.json")))
+    }
+
+    pub fn pending_member_issue_path(&self, network: &str, member: &str) -> Result<PathBuf> {
+        validate_name(network)?;
+        validate_name(member)?;
+        Ok(self
+            .root
+            .join("networks")
+            .join(network)
+            .join(format!(".{member}.issue.pending.json")))
+    }
+
+    pub fn acquire_member_issue_lock(
+        &self,
+        network: &str,
+        member: &str,
+    ) -> Result<MemberIssueLock> {
+        validate_name(network)?;
+        validate_name(member)?;
+        let directory = self.root.join("networks").join(network);
+        ensure_private_dir(&directory)?;
+        let path = directory.join(format!(".{member}.issue.lock"));
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        #[cfg(unix)]
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(Error::msg(format!(
+                "member '{member}' is already being issued by another local process"
+            )));
+        }
+        file.set_len(0)?;
+        file.write_all(std::process::id().to_string().as_bytes())?;
+        file.sync_all()?;
+        set_private_file(&path)?;
+        Ok(MemberIssueLock { _file: file })
+    }
+
+    pub fn pending_member_issue(
+        &self,
+        network: &str,
+        member: &str,
+    ) -> Result<Option<PendingMemberIssue>> {
+        let path = self.pending_member_issue_path(network, member)?;
+        match fs::read(&path) {
+            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(Error::Io(error)),
+        }
+    }
+
+    pub fn store_pending_member_issue(&self, pending: &PendingMemberIssue) -> Result<PathBuf> {
+        let path = self.pending_member_issue_path(&pending.network, &pending.member)?;
+        atomic_write_json(&path, pending)?;
+        set_private_file(&path)?;
+        Ok(path)
+    }
+
+    pub fn remove_pending_member_issue(&self, network: &str, member: &str) -> Result<()> {
+        let path = self.pending_member_issue_path(network, member)?;
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::Io(error)),
+        }
     }
 
     pub fn load_or_init_ledger(&self) -> Result<LedgerState> {
@@ -247,7 +334,10 @@ impl DataPaths {
                 Some(existing) => {
                     let existing: PendingTrafficSettlement =
                         serde_json::from_slice(existing.value())?;
-                    settlement.sender_checkpoint.sequence >= existing.sender_checkpoint.sequence
+                    (!existing.sender_checkpoint.final_checkpoint
+                        || settlement.sender_checkpoint.final_checkpoint)
+                        && settlement.sender_checkpoint.sequence
+                            >= existing.sender_checkpoint.sequence
                         && settlement.sender_checkpoint.cumulative_sent_bytes
                             >= existing.sender_checkpoint.cumulative_sent_bytes
                 }
@@ -280,6 +370,7 @@ impl DataPaths {
         authorization_id: &str,
         direction: crate::model::RelayDirection,
         maximum_sequence: u64,
+        submitted_final_checkpoint: bool,
     ) -> Result<()> {
         let key = pending_traffic_key(authorization_id, direction)?;
         let db = self.open_chain_db()?;
@@ -292,7 +383,10 @@ impl DataPaths {
                 Some(existing) => {
                     let existing: PendingTrafficSettlement =
                         serde_json::from_slice(existing.value())?;
-                    existing.sender_checkpoint.sequence <= maximum_sequence
+                    existing.sender_checkpoint.sequence < maximum_sequence
+                        || (existing.sender_checkpoint.sequence == maximum_sequence
+                            && (submitted_final_checkpoint
+                                || !existing.sender_checkpoint.final_checkpoint))
                 }
                 None => false,
             };
@@ -493,6 +587,7 @@ mod tests {
                 transcript_hash: format!("hash-{sequence}"),
                 checkpoint_at: sequence as i64,
                 sender_member_id: "sender".to_owned(),
+                final_checkpoint: false,
                 sender_signature: "signature".to_owned(),
             },
             receiver_receipt: ReceiverReceipt {
@@ -523,10 +618,43 @@ mod tests {
                 "authorization",
                 crate::model::RelayDirection::SenderToReceiver,
                 1,
+                false,
             )
             .unwrap();
         let pending = paths.pending_traffic_settlements().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].sender_checkpoint.sequence, 2);
+
+        let mut final_settlement = settlement(2, 20, None);
+        final_settlement.sender_checkpoint.final_checkpoint = true;
+        paths
+            .store_pending_traffic_settlement(&final_settlement)
+            .unwrap();
+        paths
+            .store_pending_traffic_settlement(&settlement(2, 20, None))
+            .unwrap();
+        assert!(
+            paths.pending_traffic_settlements().unwrap()[0]
+                .sender_checkpoint
+                .final_checkpoint
+        );
+        paths
+            .remove_pending_traffic_settlement_if_not_newer(
+                "authorization",
+                crate::model::RelayDirection::SenderToReceiver,
+                2,
+                false,
+            )
+            .unwrap();
+        assert_eq!(paths.pending_traffic_settlements().unwrap().len(), 1);
+        paths
+            .remove_pending_traffic_settlement_if_not_newer(
+                "authorization",
+                crate::model::RelayDirection::SenderToReceiver,
+                2,
+                true,
+            )
+            .unwrap();
+        assert!(paths.pending_traffic_settlements().unwrap().is_empty());
     }
 }

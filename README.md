@@ -100,21 +100,23 @@ The public listener exposes `/health` for process liveness and `/ready` for traf
 mrk network create --name team --account default
 mrk network fund --network team --amount 100MRK --account default
 mrk network show --network team
+mrk network policy show --network team
 mrk member issue --network team --name client-a --account default
 mrk member show --network team --name client-a
 mrk member revoke --network team --serial 1 --account default
 
-mrk payment authorize \
-  --network team \
-  --node-id 7 \
-  --sender client-a \
-  --receiver client-b \
-  --max-amount 10MRK \
-  --valid-minutes 1440 \
-  --account default
+mrk network policy set --network team \
+  --max-session-amount 1MRK \
+  --max-member-reserved 10MRK \
+  --max-node-price-per-gib 100MRK \
+  --max-session-minutes 1440
 ```
 
 Member credentials and encrypted member keys are written below the selected data directory.
+`member issue` does not report success or write the final member files until its operation is
+Finalized. While waiting, the encrypted key is kept in a private `.issue.pending.json` file;
+rerunning the same command resumes submission/finality checks. A concurrent command for the same
+Network and member name is rejected and cannot overwrite the pending key.
 
 ## Member traffic pipe
 
@@ -134,13 +136,16 @@ mrk pipe \
   --network team \
   --member client-a \
   --endpoint relay.example.com \
-  --peer <CLIENT_B_MEMBER_ID> \
-  --authorization <FINALIZED_AUTHORIZATION_ID>
+  --peer <CLIENT_B_MEMBER_ID>
 ```
+
+The initiating member signs a `ReserveSession` operation. The SDK applies the current
+Owner policy, atomically reserves the shared Network Fund, waits for finality, and then
+opens the channel.
 
 After authentication and channel acceptance, the members authenticate an ephemeral X25519 key exchange with their Ed25519 member keys. `mrk pipe` then encrypts every stdin payload end to end with AES-256-GCM before sending it as an opaque Relay `DATA` frame; there is no plaintext fallback. Received payloads are authenticated and decrypted before being written to stdout. Status messages use stderr, so stdout remains safe for piping into another application. Each direction uses a separate session key and preserves order independently. The Relay can still observe member identifiers, traffic lengths, and timing, and billing covers the encrypted payloads and key-exchange overhead that it actually transports.
 
-Other Rust applications can use the same implementation through `mrk::sdk`. `RelayConnection::open` and `IncomingStream::accept` return an `EncryptedStream` implementing Tokio `AsyncRead + AsyncWrite`. Writes are automatically split below the Relay's advertised WebSocket limit; applications see one continuous byte stream and do not add message metadata.
+Other Rust applications can use the same implementation through `mrk::sdk`. `RelayConnection::open_auto` and `IncomingStream::accept` return an `EncryptedStream` implementing Tokio `AsyncRead + AsyncWrite`. Writes are automatically split below the Relay's advertised WebSocket limit; applications see one continuous byte stream and do not add message metadata.
 
 ```rust
 use mrk::{
@@ -158,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &paths, "team", "client-a", &password, endpoint, false, None,
     ).await?;
     let connection = RelayClient::connect(ClientOptions::new(endpoint, identity)).await?;
-    let mut stream = connection.open("<CLIENT_B_MEMBER_ID>", "<AUTHORIZATION_ID>").await?;
+    let mut stream = connection.open_auto("<CLIENT_B_MEMBER_ID>").await?;
 
     stream.write_all(b"hello").await?;
     stream.shutdown().await?;
@@ -168,17 +173,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Paid Relay sessions use a finalized `PaymentAuthorization` that reserves Network Escrow without paying the Node up front. Each direction pauses new DATA after 64 MiB or two minutes, whichever occurs first, while control frames remain live. The sender signs a cumulative checkpoint and the receiver countersigns the matching delivered prefix; only this dual-signed receipt can release the proportional `price_per_gib` amount to the Node. Receipts are exchanged off chain and only the latest cumulative pair is needed for settlement. Unreceipted funds return after the authorization and seven-day claim window expire; traffic settlement never mints MRK.
+Paid Relay sessions use a finalized `PaymentAuthorization` that reserves Network Fund without paying the Node up front. By default every active member may create a bounded reservation; the Owner can update or disable the policy at any time, while finalized reservations retain their policy snapshot. Each direction pauses new DATA after 64 MiB or two minutes, whichever occurs first, while control frames remain live. The sender signs a cumulative checkpoint and the receiver countersigns the matching delivered prefix; only this dual-signed receipt can release the proportional `price_per_gib` amount to the Node. After both directions countersign their final checkpoints, unused reservation returns immediately. Otherwise it remains claimable for seven days after expiry and is reclaimed by the next automatic reservation. Traffic settlement never mints MRK.
 
 Payment checkpoint and receipt exchange is internal to the encrypted stream SDK. There is no standalone Payment SDK in this version; authorization, status, refund, and settlement operations remain available through `mrk payment`.
 
 ```bash
 mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>
+mrk payment history --network team [--member client-a]
 mrk payment refund <AUTHORIZATION_ID> --account default
 ```
 
-`payment authorize` prints both identifiers. Use the authorization ID for `pipe` and `refund`;
-`payment status` also accepts the session ID.
+`payment status` accepts either the authorization ID or session ID.
 
 Production clients require TLS 1.3 `wss://` with a publicly trusted certificate. Private deployments may add a PEM trust anchor with `--tls-ca /path/to/ca.pem`; hostname and certificate-purpose validation remain enabled. Loopback development may use `ws://127.0.0.1/... --allow-insecure-local`; plaintext WebSocket to non-loopback hosts is rejected.
 

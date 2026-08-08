@@ -919,6 +919,8 @@ impl RelayHub {
                     || checkpoint.checkpoint_at < view.authorization.created_at
                     || checkpoint.checkpoint_at > view.authorization.valid_until
                     || checkpoint.checkpoint_at > now.saturating_add(30)
+                    || checkpoint.final_checkpoint
+                        != (frame.flags & RELAY_CHECKPOINT_FINAL_FLAG != 0)
                     || (!direction.checkpoint_due
                         && window_bytes < RELAY_PAYMENT_WINDOW_BYTES
                         && !window_elapsed
@@ -2448,13 +2450,18 @@ fn flush_one_traffic_settlement(
     let already_settled = authorization
         .and_then(|authorization| authorization.directions.get(&direction))
         .is_some_and(|settled| {
-            settled.settled_payload_bytes >= pending.sender_checkpoint.cumulative_sent_bytes
+            if pending.sender_checkpoint.final_checkpoint {
+                settled.finalized
+            } else {
+                settled.settled_payload_bytes >= pending.sender_checkpoint.cumulative_sent_bytes
+            }
         });
     if already_settled {
         return paths.remove_pending_traffic_settlement_if_not_newer(
             &authorization_id,
             direction,
             pending_sequence,
+            pending.sender_checkpoint.final_checkpoint,
         );
     }
     if authorization.is_some_and(|authorization| {
@@ -2464,6 +2471,7 @@ fn flush_one_traffic_settlement(
             &authorization_id,
             direction,
             pending_sequence,
+            pending.sender_checkpoint.final_checkpoint,
         );
     }
     if let Some(operation_id) = &pending.submission_operation_id {
@@ -2477,6 +2485,7 @@ fn flush_one_traffic_settlement(
                     &authorization_id,
                     direction,
                     pending_sequence,
+                    pending.sender_checkpoint.final_checkpoint,
                 );
             }
             Some(mrk::model::OperationStatus::Pending) => return Ok(()),
@@ -3062,6 +3071,20 @@ fn execute_public_rpc(paths: &DataPaths, request: RpcRequest) -> Result<serde_js
         "payment.status" => {
             let identifier = rpc_str(&request.params, "identifier")?;
             serde_json::to_value(service::payment_authorization_status(paths, identifier)?)?
+        }
+        "payment.history" => {
+            let network = rpc_str(&request.params, "network")?;
+            let member = request
+                .params
+                .get("member")
+                .and_then(serde_json::Value::as_str);
+            let limit = request
+                .params
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(20)
+                .min(1_000) as usize;
+            serde_json::to_value(service::payment_history(paths, network, member, limit)?)?
         }
         "treasury.status" => serde_json::to_value(service::treasury_status(paths, now)?)?,
         "treasury.history" => {

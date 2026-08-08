@@ -34,8 +34,14 @@ use tokio::{
 
 use crate::{
     Error,
-    crypto::{EncryptedKeyFile, decrypt_key, sha256_full_id, verify_bytes},
-    model::{MemberCredential, NetworkRecord, PROTOCOL_VERSION, RelayDirection},
+    crypto::{
+        EncryptedKeyFile, address_from_public_key, decrypt_key, hex_lower, random_bytes,
+        sha256_full_id, verify_bytes,
+    },
+    model::{
+        DEFAULT_OPERATION_VALIDITY_SECONDS, MemberCredential, NetworkRecord, OperationStatus,
+        PROTOCOL_VERSION, RelayDirection, SignedOperation, UnsignedOperation,
+    },
     relay::{
         ChallengePayload, FrameType, HelloPayload, IncomingPayload, OpenPayload,
         RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES, RELAY_PAYMENT_WINDOW_SECONDS,
@@ -144,6 +150,7 @@ pub struct MemberIdentity {
     credential: MemberCredential,
     network_owner_public_key: String,
     signer: Arc<dyn MemberSigner>,
+    network: Option<NetworkRecord>,
 }
 
 impl MemberIdentity {
@@ -167,6 +174,7 @@ impl MemberIdentity {
             credential,
             network_owner_public_key,
             signer,
+            network: None,
         })
     }
 
@@ -239,7 +247,9 @@ impl MemberIdentity {
             )
             .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
         let signer = Arc::new(KeystoreSigner::unlock(&keyfile, password)?);
-        Self::new(credential, network_record.owner_public_key.clone(), signer)
+        let mut identity = Self::new(credential, network_record.owner_public_key.clone(), signer)?;
+        identity.network = Some(network_record.clone());
+        Ok(identity)
     }
 
     pub fn credential(&self) -> &MemberCredential {
@@ -252,6 +262,13 @@ impl MemberIdentity {
 
     fn sign(&self, message: &[u8]) -> Result<String, RelayError> {
         self.signer.sign(message)
+    }
+
+    fn signer_address(&self) -> Result<String, RelayError> {
+        let public_key = STANDARD.decode(self.signer.public_key()).map_err(|_| {
+            RelayError::InvalidConfig("member public key is not valid base64".to_owned())
+        })?;
+        Ok(address_from_public_key(&public_key))
     }
 }
 
@@ -406,17 +423,18 @@ struct ConnectionInner {
 }
 
 impl RelayConnection {
-    pub async fn open(
+    /// Atomically reserves Network Fund under the current Owner policy, waits for
+    /// finality, and opens an encrypted Relay stream to `peer_id`.
+    pub async fn open_auto(
         &self,
         peer_id: impl Into<String>,
-        authorization_id: impl Into<String>,
     ) -> Result<EncryptedStream, RelayError> {
         let peer_id = peer_id.into();
-        let authorization_id = authorization_id.into();
+        let _guard = self.inner.open_lock.lock().await;
+        let authorization_id = self.reserve_member_session(&peer_id).await?;
         let view = self
             .resolve_authorization(&authorization_id, true, &peer_id)
             .await?;
-        let _guard = self.inner.open_lock.lock().await;
         let (response, receiver) = oneshot::channel();
         self.inner
             .commands
@@ -465,14 +483,7 @@ impl RelayConnection {
         initiator: bool,
         peer_id: &str,
     ) -> Result<RelayAuthorizationView, RelayError> {
-        let mut endpoint = crate::endpoint::normalize_websocket_url(
-            &self.inner.options.endpoint,
-            crate::endpoint::RELAY_PATH,
-        )
-        .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
-        endpoint.set_path(crate::endpoint::RPC_PATH);
-        endpoint.set_query(None);
-        endpoint.set_fragment(None);
+        let endpoint = self.rpc_endpoint()?;
         let value = rpc_call(
             endpoint.as_str(),
             "payment.get",
@@ -493,6 +504,175 @@ impl RelayConnection {
             initiator,
         )?;
         Ok(view)
+    }
+
+    fn rpc_endpoint(&self) -> Result<url::Url, RelayError> {
+        let mut endpoint = crate::endpoint::normalize_websocket_url(
+            &self.inner.options.endpoint,
+            crate::endpoint::RELAY_PATH,
+        )
+        .map_err(|error| RelayError::InvalidConfig(error.to_string()))?;
+        endpoint.set_path(crate::endpoint::RPC_PATH);
+        endpoint.set_query(None);
+        endpoint.set_fragment(None);
+        Ok(endpoint)
+    }
+
+    async fn rpc(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RelayError> {
+        let endpoint = self.rpc_endpoint()?;
+        rpc_call(
+            endpoint.as_str(),
+            method,
+            params,
+            self.inner.options.allow_insecure_local,
+            self.inner.options.tls_ca.as_deref(),
+        )
+        .await
+        .map_err(|error| RelayError::Authorization(error.to_string()))
+    }
+
+    async fn reserve_member_session(&self, peer_id: &str) -> Result<String, RelayError> {
+        let configured_network = self
+            .inner
+            .options
+            .identity
+            .network
+            .as_ref()
+            .ok_or_else(|| {
+                RelayError::InvalidConfig(
+                    "automatic payment requires a MemberIdentity loaded with its Network record"
+                        .to_owned(),
+                )
+            })?;
+        let network: NetworkRecord = serde_json::from_value(
+            self.rpc(
+                "network.get",
+                serde_json::json!({"alias": configured_network.alias}),
+            )
+            .await?,
+        )
+        .map_err(|error| RelayError::Authorization(error.to_string()))?;
+        if network.network_id != self.inner.options.identity.credential.network_id {
+            return Err(RelayError::Authorization(
+                "Network record does not match the member credential".to_owned(),
+            ));
+        }
+        if !network.spending_policy.enabled {
+            return Err(RelayError::Authorization(
+                "member spending is disabled for this Network".to_owned(),
+            ));
+        }
+        let peer = network
+            .members
+            .values()
+            .find(|member| member.member_id == peer_id)
+            .ok_or_else(|| {
+                RelayError::Authorization("target member is not in this Network".to_owned())
+            })?;
+        let now = Utc::now().timestamp();
+        let valid_until = now
+            .saturating_add(i64::from(network.spending_policy.max_session_minutes) * 60)
+            .min(self.inner.options.identity.credential.expires_at)
+            .min(peer.expires_at);
+        if valid_until <= now {
+            return Err(RelayError::Authorization(
+                "a Relay member credential has expired".to_owned(),
+            ));
+        }
+        let signer_address = self.inner.options.identity.signer_address()?;
+        let balance = self
+            .rpc(
+                "account.balance",
+                serde_json::json!({"address": signer_address}),
+            )
+            .await?;
+        let nonce = balance
+            .get("nonce")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| RelayError::Authorization("invalid account nonce".to_owned()))?
+            .saturating_add(1);
+        let chain = self.rpc("system.ping", serde_json::json!({})).await?;
+        let ledger_id = chain
+            .get("ledger_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| RelayError::Authorization("invalid ledger identity".to_owned()))?;
+        let session_id = hex_lower(
+            &random_bytes::<32>().map_err(|error| RelayError::Crypto(error.to_string()))?,
+        );
+        let unsigned = UnsignedOperation {
+            ledger_id: ledger_id.to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+            module: "TrafficPayment".to_owned(),
+            action: "ReserveSession".to_owned(),
+            signer: signer_address,
+            account_nonce: nonce,
+            valid_until: now + DEFAULT_OPERATION_VALIDITY_SECONDS,
+            payload: serde_json::json!({
+                "network": network.alias,
+                "node_id": self.inner.node_id,
+                "sender_member_id": self.inner.options.identity.credential.member_id,
+                "receiver_member_id": peer_id,
+                "session_id": session_id,
+                "max_amount_base_units": network.spending_policy.max_session_amount.to_string(),
+                "authorization_valid_until": valid_until,
+                "spending_policy_revision": network.spending_policy.revision,
+            }),
+        };
+        let operation = SignedOperation {
+            signature: self.inner.options.identity.sign(
+                &serde_json::to_vec(&unsigned)
+                    .map_err(|error| RelayError::Protocol(error.to_string()))?,
+            )?,
+            unsigned,
+        };
+        let submission = self
+            .rpc(
+                "operation.submit",
+                serde_json::json!({
+                    "public_key": self.inner.options.identity.signer.public_key(),
+                    "operation": operation,
+                }),
+            )
+            .await?;
+        let authorization_id = submission
+            .get("operation_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                RelayError::Authorization("payment reservation ID is missing".to_owned())
+            })?
+            .to_owned();
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            let status: service::PaymentAuthorizationStatusView = serde_json::from_value(
+                self.rpc(
+                    "payment.status",
+                    serde_json::json!({"identifier": authorization_id}),
+                )
+                .await?,
+            )
+            .map_err(|error| RelayError::Authorization(error.to_string()))?;
+            match status.status {
+                OperationStatus::Finalized if status.authorization.is_some() => {
+                    return Ok(authorization_id);
+                }
+                OperationStatus::Rejected | OperationStatus::Expired => {
+                    return Err(RelayError::Authorization(
+                        "automatic payment reservation was not finalized".to_owned(),
+                    ));
+                }
+                OperationStatus::Pending | OperationStatus::Finalized => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(RelayError::Authorization(
+                    "timed out waiting for automatic payment finality".to_owned(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 }
 
@@ -2054,6 +2234,7 @@ async fn send_checkpoint(
         transcript_hash: state.transcript_hash.clone(),
         checkpoint_at: Utc::now().timestamp(),
         sender_member_id: identity.credential.member_id.clone(),
+        final_checkpoint,
         sender_signature: String::new(),
     };
     checkpoint.sender_signature = identity.sign(&sender_checkpoint_signing_bytes(&checkpoint)?)?;

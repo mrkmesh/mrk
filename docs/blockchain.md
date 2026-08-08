@@ -315,6 +315,8 @@ PaymentAuthorization {
   created_at
   valid_until
   claim_until
+  initiator_member_id
+  spending_policy_revision
 }
 
 SenderCheckpoint {
@@ -329,6 +331,7 @@ SenderCheckpoint {
   transcript_hash
   checkpoint_at
   sender_member_id
+  final_checkpoint
   sender_signature
 }
 
@@ -349,7 +352,9 @@ ReceiverReceipt {
 }
 ```
 
-Network Owner 创建 `PaymentAuthorization` 时，从 Network Escrow 原子锁定 `max_amount`，并固定 Node、双方 Member、Session、报价和过期时间；押币不立即转给 Node。每个方向独立维护累计 Sequence、真实 Payload 字节数和 Transcript Hash。窗口从第一个 DATA 开始，在累计 `64 MiB` 或经过 `2 分钟`时结束，以先发生者为准；完全空闲不产生窗口和费用。到达边界后只暂停该方向的新 DATA，控制帧继续通行：发送方签署 `SenderCheckpoint`，接收方校验同一累计前缀后签署 `ReceiverReceipt`。Node 验证完整双签名回执后才打开下一窗口。
+Network Owner 向 Network Fund 充值并维护带 revision 的 `NetworkSpendingPolicy`，可随时更新或停用成员自动消费。Active Member 使用自己的 Member Key 签署 `ReserveSession`；状态机验证发起者、公钥、对端成员、Node 状态与报价，并按照策略的单会话额度、单 Member 并发预留上限和 Fund 可用余额原子确定 `max_amount`。最终 `PaymentAuthorization` 固定 Node、双方 Member、Session、报价、策略 revision 和过期时间；策略更新不追溯修改已经最终确认的授权。
+
+每个方向独立维护累计 Sequence、真实 Payload 字节数和 Transcript Hash。窗口从第一个 DATA 开始，在累计 `64 MiB` 或经过 `2 分钟`时结束，以先发生者为准；完全空闲不产生窗口和费用。到达边界后只暂停该方向的新 DATA，控制帧继续通行：发送方签署 `SenderCheckpoint`，接收方校验同一累计前缀后签署 `ReceiverReceipt`。Node 验证完整双签名回执后才打开下一窗口。
 
 窗口消息在链下交换。Node 把每个方向的最新完整回执覆盖写入本地 redb，默认每 5 分钟尝试提交一次；在此期间多个窗口自然聚合为一个累计前缀，崩溃重启后继续提交。`TrafficSettlement` 按链上已结算累计值计算增量：
 
@@ -366,10 +371,10 @@ amount = total_owed - settled_amount_for_direction
 - Node 不能领取超过 `PaymentAuthorization.max_amount` 的 MRK；每个方向只接受严格递增且不回退的累计前缀；
 - 没有完整回执时 Node 必须拒绝该方向进入下一窗口，最大未结算风险被限制为 `64 MiB` 或 `2 分钟`；
 - Node 不服务时无法取得接收方签名，未使用押币不会释放给 Node；
-- Session 正常关闭时，发送方为不足一个完整窗口的尾部发送 Final Checkpoint；异常断线时 Node 最多损失当前未回执窗口；
+- Session 正常关闭时，两个方向分别为尾部发送带签名的 Final Checkpoint 并取得对端 Receipt；两方向都最终确认后，剩余预留立即退回 Network Fund。异常断线时 Node 最多损失当前未回执窗口；
 - Node 把每个方向最新的完整双签名回执写入本地 redb，并以覆盖方式聚合；后台默认每 5 分钟提交，重启后继续领取。结算操作最终确认前不得删除本地回执；
 - 重连必须从已结算的 Sequence、累计字节和 Transcript Hash 继续；同一授权同时只允许一个 Relay Channel，存在尚未提交的本地回执时拒绝重连，以避免累计前缀分叉；
-- 授权到期后保留 7 天 Relay Claim Window，随后退回未使用余额；
+- 授权到期后保留 7 天 Relay Claim Window，随后由下一次自动预留回收未使用余额；
 - 有效结算回执可把 `last_relay_receipt_at` 更新为布尔服务证据，但流量数量不得增加 Node Seconds、铸币、治理权或 Validator 权重；
 - 自报流量、回执、Heartbeat 和 Probe 均不能从流量结算模块铸币；
 - 结算分成只能转移或销毁已有 MRK，不增加 `lifetime_minted`。

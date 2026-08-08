@@ -340,7 +340,41 @@ fn externally_signed_network_operations_are_committed_by_database_owner() {
         },
     )
     .unwrap();
+    let (_, _, conflicting_issue) = service::prepare_member_issue(
+        &owner,
+        password,
+        service::MemberIssueSigningRequest {
+            ledger_id: &ledger_id,
+            network: &network,
+            member_name: "client-a",
+            valid_days: 7,
+            nonce: 2,
+            now,
+        },
+    )
+    .unwrap();
     service::submit_signed_network_operation(&paths, &owner.public_key, issue, now).unwrap();
+    let conflicting_id =
+        mrk::crypto::sha256_id("op", &serde_json::to_vec(&conflicting_issue).unwrap());
+    let conflict = service::submit_consensus_operation(
+        &paths,
+        mrk::consensus::PendingOperationEnvelope {
+            public_key: owner.public_key.clone(),
+            operation: conflicting_issue,
+        },
+        now,
+    )
+    .unwrap_err();
+    assert!(
+        conflict.to_string().contains("nonce") || conflict.to_string().contains("credential state")
+    );
+    assert!(
+        !paths
+            .read_ledger()
+            .unwrap()
+            .operations
+            .contains_key(&conflicting_id)
+    );
     let revoke = service::sign_public_operation(
         &owner,
         password,

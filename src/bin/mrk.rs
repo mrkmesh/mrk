@@ -1,6 +1,7 @@
 use std::{
     io::{self, Write},
     path::PathBuf,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -88,8 +89,6 @@ enum Command {
         endpoint: String,
         #[arg(long)]
         peer: Option<String>,
-        #[arg(long, requires = "peer")]
-        authorization: Option<String>,
         #[arg(long)]
         allow_insecure_local: bool,
         #[arg(long)]
@@ -182,6 +181,34 @@ enum NetworkCommand {
         #[arg(long)]
         network: String,
     },
+    Policy {
+        #[command(subcommand)]
+        command: NetworkPolicyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum NetworkPolicyCommand {
+    Show {
+        #[arg(long)]
+        network: String,
+    },
+    Set {
+        #[arg(long)]
+        network: String,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long)]
+        max_session_amount: Option<String>,
+        #[arg(long)]
+        max_member_reserved: Option<String>,
+        #[arg(long)]
+        max_node_price_per_gib: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..=43200))]
+        max_session_minutes: Option<u32>,
+        #[arg(long, default_value = "default")]
+        account: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -255,25 +282,17 @@ enum MemberCommand {
 
 #[derive(Subcommand)]
 enum PaymentCommand {
-    Authorize {
-        #[arg(long)]
-        network: String,
-        #[arg(long)]
-        node_id: u64,
-        #[arg(long)]
-        sender: String,
-        #[arg(long)]
-        receiver: String,
-        #[arg(long)]
-        max_amount: String,
-        #[arg(long, default_value_t = 1440)]
-        valid_minutes: i64,
-        #[arg(long, default_value = "default")]
-        account: String,
-    },
     Status {
         #[arg(value_name = "AUTHORIZATION_ID_OR_SESSION_ID")]
         identifier: String,
+    },
+    History {
+        #[arg(long)]
+        network: String,
+        #[arg(long)]
+        member: Option<String>,
+        #[arg(long, default_value_t = 20, value_parser = clap::value_parser!(u64).range(1..=1000))]
+        limit: u64,
     },
     Refund {
         authorization_id: String,
@@ -487,6 +506,96 @@ fn run() -> Result<()> {
                 let network: mrk::model::NetworkRecord = serde_json::from_value(value.clone())?;
                 print_value(cli.output, &value, || network_text(&network))?;
             }
+            NetworkCommand::Policy { command } => match command {
+                NetworkPolicyCommand::Show { network } => {
+                    let record: mrk::model::NetworkRecord = serde_json::from_value(
+                        rpc.call("network.get", serde_json::json!({ "alias": network }))?,
+                    )?;
+                    print_value(cli.output, &record.spending_policy, || {
+                        spending_policy_text(&record.spending_policy)
+                    })?;
+                }
+                NetworkPolicyCommand::Set {
+                    network,
+                    enabled,
+                    max_session_amount,
+                    max_member_reserved,
+                    max_node_price_per_gib,
+                    max_session_minutes,
+                    account,
+                } => {
+                    if enabled.is_none()
+                        && max_session_amount.is_none()
+                        && max_member_reserved.is_none()
+                        && max_node_price_per_gib.is_none()
+                        && max_session_minutes.is_none()
+                    {
+                        return Err(Error::msg("no spending policy changes were specified"));
+                    }
+                    let record: mrk::model::NetworkRecord = serde_json::from_value(
+                        rpc.call("network.get", serde_json::json!({ "alias": network }))?,
+                    )?;
+                    let current = record.spending_policy;
+                    let policy = mrk::model::NetworkSpendingPolicy {
+                        revision: current.revision.saturating_add(1),
+                        enabled: enabled.unwrap_or(current.enabled),
+                        max_session_amount: max_session_amount
+                            .as_deref()
+                            .map(parse_mrk)
+                            .transpose()?
+                            .unwrap_or(current.max_session_amount),
+                        max_member_reserved: max_member_reserved
+                            .as_deref()
+                            .map(parse_mrk)
+                            .transpose()?
+                            .unwrap_or(current.max_member_reserved),
+                        max_node_price_per_gib: max_node_price_per_gib
+                            .as_deref()
+                            .map(parse_mrk)
+                            .transpose()?
+                            .unwrap_or(current.max_node_price_per_gib),
+                        max_session_minutes: max_session_minutes
+                            .unwrap_or(current.max_session_minutes),
+                    };
+                    let keyfile = service::account_keyfile(&paths, &account)?;
+                    if keyfile.address != record.owner_address {
+                        return Err(Error::msg(
+                            "only the Network Owner account can update its spending policy",
+                        ));
+                    }
+                    let (ledger_id, nonce) = rpc_signing_context(&rpc, &keyfile.address)?;
+                    let password = read_password("Owner account password: ")?;
+                    let operation = service::sign_public_operation(
+                        &keyfile,
+                        &password,
+                        service::PublicOperationSigningRequest {
+                            ledger_id: &ledger_id,
+                            module: "NetworkEscrow",
+                            action: "SetSpendingPolicy",
+                            nonce,
+                            valid_until: Utc::now().timestamp()
+                                + DEFAULT_OPERATION_VALIDITY_SECONDS,
+                            payload: serde_json::json!({
+                                "network": network,
+                                "revision": policy.revision,
+                                "enabled": policy.enabled,
+                                "max_session_amount_base_units": policy.max_session_amount.to_string(),
+                                "max_member_reserved_base_units": policy.max_member_reserved.to_string(),
+                                "max_node_price_per_gib_base_units": policy.max_node_price_per_gib.to_string(),
+                                "max_session_minutes": policy.max_session_minutes,
+                            }),
+                        },
+                    )?;
+                    let result = rpc.call(
+                        "operation.submit",
+                        serde_json::json!({
+                            "public_key": keyfile.public_key,
+                            "operation": operation,
+                        }),
+                    )?;
+                    print_rpc_value(cli.output, &result)?;
+                }
+            },
         },
         Command::Registry { command } => match command {
             RegistryCommand::List {
@@ -528,6 +637,30 @@ fn run() -> Result<()> {
                 account,
                 valid_days,
             } => {
+                let _issue_lock = paths.acquire_member_issue_lock(&network, &name)?;
+                if let Some(pending) = paths.pending_member_issue(&network, &name)? {
+                    return match finalize_pending_member_issue(&paths, &rpc, &pending) {
+                        Ok(path) => print_finalized_member_issue(cli.output, &pending, &path, true),
+                        Err(error) => {
+                            let pending_path = paths.pending_member_issue_path(&network, &name)?;
+                            if pending_path.exists() {
+                                Err(Error::msg(format!(
+                                    "{error}; pending member key remains at {}",
+                                    pending_path.display()
+                                )))
+                            } else {
+                                Err(error)
+                            }
+                        }
+                    };
+                }
+                let key_path = paths.member_key_path(&network, &name)?;
+                let credential_path = paths.member_credential_path(&network, &name)?;
+                if key_path.exists() || credential_path.exists() {
+                    return Err(Error::msg(format!(
+                        "local member '{name}' already exists; revoke or choose another name"
+                    )));
+                }
                 let owner_file = service::account_keyfile(&paths, &account)?;
                 let (ledger_id, nonce) = rpc_signing_context(&rpc, &owner_file.address)?;
                 let network_record: mrk::model::NetworkRecord = serde_json::from_value(
@@ -547,36 +680,30 @@ fn run() -> Result<()> {
                         now,
                     },
                 )?;
-                let accepted = rpc.call(
-                    "operation.submit",
-                    serde_json::json!({
-                        "public_key": owner_file.public_key,
-                        "operation": operation,
-                    }),
-                )?;
-                let path = service::store_member_files(
-                    &paths,
-                    &network,
-                    &name,
-                    &member_file,
-                    &credential,
-                )?;
-                print_value(
-                    cli.output,
-                    &serde_json::json!({
-                        "credential": credential,
-                        "submission": accepted,
-                        "path": path.display().to_string(),
-                    }),
-                    || {
-                        format!(
-                            "Member: {name}\nMember ID: {}\nSerial: {}\nCredential: {}",
-                            credential.member_id,
-                            credential.serial,
-                            path.display()
-                        )
-                    },
-                )?;
+                let operation_id = mrk::crypto::sha256_id("op", &serde_json::to_vec(&operation)?);
+                let pending = mrk::storage::PendingMemberIssue {
+                    operation_id,
+                    network,
+                    member: name,
+                    owner_public_key: owner_file.public_key,
+                    operation,
+                    keyfile: member_file,
+                    credential,
+                    created_at: now,
+                };
+                let pending_path = paths.store_pending_member_issue(&pending)?;
+                match finalize_pending_member_issue(&paths, &rpc, &pending) {
+                    Ok(path) => print_finalized_member_issue(cli.output, &pending, &path, false)?,
+                    Err(error) => {
+                        if pending_path.exists() {
+                            return Err(Error::msg(format!(
+                                "{error}; pending member key preserved at {} — rerun the same member issue command to resume",
+                                pending_path.display()
+                            )));
+                        }
+                        return Err(error);
+                    }
+                }
             }
             MemberCommand::Revoke {
                 network,
@@ -615,59 +742,6 @@ fn run() -> Result<()> {
             }
         },
         Command::Payment { command } => match command {
-            PaymentCommand::Authorize {
-                network,
-                node_id,
-                sender,
-                receiver,
-                max_amount,
-                valid_minutes,
-                account,
-            } => {
-                let owner_file = service::account_keyfile(&paths, &account)?;
-                let (ledger_id, nonce) = rpc_signing_context(&rpc, &owner_file.address)?;
-                let network_record: mrk::model::NetworkRecord = serde_json::from_value(
-                    rpc.call("network.get", serde_json::json!({ "alias": network }))?,
-                )?;
-                let password = read_password("Owner account password: ")?;
-                let (session_id, operation) = service::prepare_payment_authorization(
-                    &owner_file,
-                    &password,
-                    service::PaymentAuthorizationSigningRequest {
-                        ledger_id: &ledger_id,
-                        network: &network_record,
-                        node_id,
-                        sender_member_name: &sender,
-                        receiver_member_name: &receiver,
-                        max_amount_text: &max_amount,
-                        valid_minutes,
-                        nonce,
-                        now: Utc::now().timestamp(),
-                    },
-                )?;
-                let result = rpc.call(
-                    "operation.submit",
-                    serde_json::json!({
-                        "public_key": owner_file.public_key,
-                        "operation": operation,
-                    }),
-                )?;
-                let authorization_id = json_str(&result, "operation_id")?.to_owned();
-                let status = json_str(&result, "status")?.to_owned();
-                print_value(
-                    cli.output,
-                    &serde_json::json!({
-                        "authorization_id": authorization_id,
-                        "session_id": session_id,
-                        "submission": result,
-                    }),
-                    || {
-                        format!(
-                            "Payment authorization submitted\nAuthorization: {authorization_id}\nSession: {session_id}\nStatus: {status}"
-                        )
-                    },
-                )?;
-            }
             PaymentCommand::Status { identifier } => {
                 let value = rpc.call(
                     "payment.status",
@@ -675,11 +749,61 @@ fn run() -> Result<()> {
                 )?;
                 print_rpc_value(cli.output, &value)?;
             }
+            PaymentCommand::History {
+                network,
+                member,
+                limit,
+            } => {
+                let value = rpc.call(
+                    "payment.history",
+                    serde_json::json!({
+                        "network": network,
+                        "member": member,
+                        "limit": limit,
+                    }),
+                )?;
+                let history: service::PaymentHistoryView = serde_json::from_value(value.clone())?;
+                print_value(cli.output, &value, || payment_history_text(&history))?;
+            }
             PaymentCommand::Refund {
                 authorization_id,
                 account,
             } => {
                 let owner_file = service::account_keyfile(&paths, &account)?;
+                let status: service::PaymentAuthorizationStatusView =
+                    serde_json::from_value(rpc.call(
+                        "payment.status",
+                        serde_json::json!({ "identifier": authorization_id }),
+                    )?)?;
+                if !matches!(status.status, mrk::model::OperationStatus::Finalized) {
+                    return Err(Error::msg("payment authorization is not finalized"));
+                }
+                let authorization = status
+                    .authorization
+                    .ok_or_else(|| Error::msg("payment authorization state is unavailable"))?;
+                if authorization.payer_address != owner_file.address {
+                    return Err(Error::msg(
+                        "only the payment owner account can request a refund",
+                    ));
+                }
+                if authorization.refunded_at.is_some() {
+                    return Err(Error::msg("payment authorization was already refunded"));
+                }
+                if authorization.reserved_remaining == 0 {
+                    return Err(Error::msg(
+                        "payment authorization has no remaining MRK to refund",
+                    ));
+                }
+                let now = Utc::now().timestamp();
+                if now <= authorization.claim_until {
+                    let claim_until =
+                        chrono::DateTime::<Utc>::from_timestamp(authorization.claim_until, 0)
+                            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                            .unwrap_or_else(|| authorization.claim_until.to_string());
+                    return Err(Error::msg(format!(
+                        "payment authorization claim window is still open until {claim_until}"
+                    )));
+                }
                 let (ledger_id, nonce) = rpc_signing_context(&rpc, &owner_file.address)?;
                 let password = read_password("Owner account password: ")?;
                 let operation = service::sign_public_operation(
@@ -690,7 +814,7 @@ fn run() -> Result<()> {
                         module: "TrafficPayment",
                         action: "Refund",
                         nonce,
-                        valid_until: Utc::now().timestamp() + DEFAULT_OPERATION_VALIDITY_SECONDS,
+                        valid_until: now + DEFAULT_OPERATION_VALIDITY_SECONDS,
                         payload: serde_json::json!({
                             "authorization_id": authorization_id,
                         }),
@@ -711,7 +835,6 @@ fn run() -> Result<()> {
             member,
             endpoint,
             peer,
-            authorization,
             allow_insecure_local,
             tls_ca,
         } => {
@@ -723,7 +846,6 @@ fn run() -> Result<()> {
                 password,
                 endpoint,
                 peer,
-                authorization,
                 allow_insecure_local,
                 tls_ca,
             })?;
@@ -784,6 +906,145 @@ impl RpcOptions {
     }
 }
 
+fn finalize_pending_member_issue(
+    paths: &DataPaths,
+    rpc: &RpcOptions,
+    pending: &mrk::storage::PendingMemberIssue,
+) -> Result<PathBuf> {
+    let expected_operation_id =
+        mrk::crypto::sha256_id("op", &serde_json::to_vec(&pending.operation)?);
+    if pending.operation_id != expected_operation_id
+        || pending.operation.unsigned.module != "NetworkRegistry"
+        || pending.operation.unsigned.action != "IssueMember"
+        || pending
+            .operation
+            .unsigned
+            .payload
+            .get("network")
+            .and_then(serde_json::Value::as_str)
+            != Some(pending.network.as_str())
+        || pending
+            .operation
+            .unsigned
+            .payload
+            .get("member_name")
+            .and_then(serde_json::Value::as_str)
+            != Some(pending.member.as_str())
+    {
+        return Err(Error::msg("pending member issue record is inconsistent"));
+    }
+    match rpc.call(
+        "operation.submit",
+        serde_json::json!({
+            "public_key": pending.owner_public_key,
+            "operation": pending.operation,
+        }),
+    ) {
+        Ok(submission) => {
+            let returned_id = json_str(&submission, "operation_id")?;
+            if returned_id != pending.operation_id {
+                return Err(Error::msg(
+                    "RPC returned another operation ID for the pending member issue",
+                ));
+            }
+        }
+        Err(error) if error.to_string().starts_with("RPC ") => {
+            paths.remove_pending_member_issue(&pending.network, &pending.member)?;
+            return Err(error);
+        }
+        Err(_) => {}
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if let Ok(value) = rpc.call(
+            "operation.get",
+            serde_json::json!({ "operation_id": pending.operation_id }),
+        ) {
+            let operation: mrk::model::OperationRecord = serde_json::from_value(value)?;
+            match operation.status {
+                mrk::model::OperationStatus::Finalized => {
+                    let network: mrk::model::NetworkRecord = serde_json::from_value(rpc.call(
+                        "network.get",
+                        serde_json::json!({ "alias": pending.network }),
+                    )?)?;
+                    let member = network.members.get(&pending.member).ok_or_else(|| {
+                        Error::msg(
+                            "member issue finalized but the member is missing from Network state",
+                        )
+                    })?;
+                    let credential = &pending.credential;
+                    if credential.network_id != network.network_id
+                        || member.member_id != credential.member_id
+                        || member.public_key != credential.member_public_key
+                        || member.serial != credential.serial
+                        || member.issued_at != credential.issued_at
+                        || member.expires_at != credential.expires_at
+                        || member.credential_signature != credential.owner_signature
+                    {
+                        return Err(Error::msg(
+                            "finalized Network member does not match the pending local key",
+                        ));
+                    }
+                    let path = service::store_member_files(
+                        paths,
+                        &pending.network,
+                        &pending.member,
+                        &pending.keyfile,
+                        credential,
+                    )?;
+                    paths.remove_pending_member_issue(&pending.network, &pending.member)?;
+                    return Ok(path);
+                }
+                mrk::model::OperationStatus::Rejected | mrk::model::OperationStatus::Expired => {
+                    paths.remove_pending_member_issue(&pending.network, &pending.member)?;
+                    return Err(Error::msg(format!(
+                        "member issue operation {} ended as {}",
+                        pending.operation_id,
+                        operation_status_text(&operation.status),
+                    )));
+                }
+                mrk::model::OperationStatus::Pending => {}
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::msg(format!(
+                "timed out waiting for member issue operation {} to finalize",
+                pending.operation_id
+            )));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn print_finalized_member_issue(
+    output: Output,
+    pending: &mrk::storage::PendingMemberIssue,
+    path: &std::path::Path,
+    resumed: bool,
+) -> Result<()> {
+    print_value(
+        output,
+        &serde_json::json!({
+            "credential": pending.credential,
+            "operation_id": pending.operation_id,
+            "status": "FINALIZED",
+            "resumed": resumed,
+            "path": path.display().to_string(),
+        }),
+        || {
+            format!(
+                "Member finalized\nMember: {}\nMember ID: {}\nSerial: {}\nOperation: {}\nCredential: {}",
+                pending.member,
+                pending.credential.member_id,
+                pending.credential.serial,
+                pending.operation_id,
+                path.display(),
+            )
+        },
+    )
+}
+
 fn print_rpc_value(output: Output, value: &serde_json::Value) -> Result<()> {
     print_value(output, value, || {
         serde_json::to_string_pretty(value).expect("JSON value serialization cannot fail")
@@ -831,11 +1092,33 @@ fn resolve_address(paths: &DataPaths, target: &AccountOrAddress) -> Result<Strin
 
 fn network_text(network: &mrk::model::NetworkRecord) -> String {
     format!(
-        "Network:      {}\nCommitment:   {}\nOwner:        {}\nFund balance: {}",
+        "Network:      {}\nCommitment:   {}\nOwner:        {}\nFund balance: {}\nMember spend: {} (policy revision {})",
         network.alias,
         network.commitment,
         network.owner_address,
-        format_mrk(network.escrow_balance)
+        format_mrk(network.escrow_balance),
+        if network.spending_policy.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        network.spending_policy.revision,
+    )
+}
+
+fn spending_policy_text(policy: &mrk::model::NetworkSpendingPolicy) -> String {
+    format!(
+        "Revision:             {}\nMember spending:      {}\nMax session amount:   {}\nMax member reserved:  {}\nMax Node price/GiB:   {}\nMax session duration: {} minutes",
+        policy.revision,
+        if policy.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
+        format_mrk(policy.max_session_amount),
+        format_mrk(policy.max_member_reserved),
+        format_mrk(policy.max_node_price_per_gib),
+        policy.max_session_minutes,
     )
 }
 
@@ -877,6 +1160,37 @@ fn operation_status_text(status: &mrk::model::OperationStatus) -> &'static str {
         mrk::model::OperationStatus::Rejected => "REJECTED",
         mrk::model::OperationStatus::Expired => "EXPIRED",
     }
+}
+
+fn payment_history_text(history: &service::PaymentHistoryView) -> String {
+    let mut output = format!(
+        "Network: {}\nFund balance: {}\nSettled in view: {}\nReserved in view: {}\nSessions: {}",
+        history.network,
+        format_mrk(history.fund_balance),
+        format_mrk(history.total_settled),
+        format_mrk(history.total_reserved),
+        history.authorizations.len(),
+    );
+    for authorization in &history.authorizations {
+        let created_at = chrono::DateTime::<Utc>::from_timestamp(authorization.created_at, 0)
+            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+            .unwrap_or_else(|| authorization.created_at.to_string());
+        output.push_str(&format!(
+            "\n\n{}\n  Session: {}\n  Initiator: {}\n  Members: {} -> {}\n  Node: {}\n  Reserved: {} / {}\n  Settled: {}\n  Created: {}\n  Policy revision: {}",
+            authorization.authorization_id,
+            authorization.session_id,
+            authorization.initiator_member_id,
+            authorization.sender_member_id,
+            authorization.receiver_member_id,
+            authorization.node_id,
+            format_mrk(authorization.reserved_remaining),
+            format_mrk(authorization.max_amount),
+            format_mrk(authorization.settled_amount),
+            created_at,
+            authorization.spending_policy_revision,
+        ));
+    }
+    output
 }
 
 fn transfer_preview_text(preview: &service::TransferPreview) -> String {
