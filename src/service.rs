@@ -17,6 +17,12 @@ use url::{Host, Url};
 use crate::{
     Error, Result,
     amount::{MAX_SUPPLY, format_mrk, parse_mrk},
+    chain::{
+        block_is_due, consensus_timer_started_at, height as chain_height,
+        next_block_at as next_block_timestamp, next_height as next_block_height,
+        state_root as ledger_state_root, tip_hash as chain_tip_hash,
+        tip_timestamp as chain_tip_timestamp,
+    },
     crypto::{
         EncryptedKeyFile, address_from_public_key, decrypt_key, generate_keyfile, hex_lower,
         random_bytes, sha256_full_id, sha256_id, sign_bytes, validate_address,
@@ -36,12 +42,21 @@ use crate::{
         SignedOperation, TRANSFER_FEE, TrafficDirectionSettlement, TreasurySpendRecord,
         UnsignedOperation,
     },
+    operation::{
+        add_history, id as operation_id, sign as sign_operation,
+        sort_pending as sort_pending_operation_ids, verify as verify_operation,
+    },
     relay::{
         ChallengePayload, HelloPayload, ProbePayload, RELAY_PAYMENT_CLAIM_SECONDS, ReceiverReceipt,
         SenderCheckpoint, credential_signing_bytes, hello_signing_bytes,
         receiver_receipt_signing_bytes, sender_checkpoint_hash, sender_checkpoint_signing_bytes,
     },
     storage::{DataPaths, UnsettledRelaySession, atomic_write_json, read_json, validate_name},
+};
+
+pub use crate::store::{
+    HistoryPruneReport, LITE_BLOCK_RETENTION_SECONDS, LITE_RETAIN_ACCOUNT_OPERATIONS,
+    lite_retain_blocks,
 };
 
 pub const GOVERNANCE_NODE_THRESHOLD: usize = 20;
@@ -374,20 +389,8 @@ pub struct BlockVerificationReport {
     pub detail: String,
 }
 
-pub const LITE_RETAIN_BLOCKS: usize = 65_536;
-pub const LITE_RETAIN_OPERATIONS: usize = 262_144;
-pub const LITE_RETAIN_ACCOUNT_OPERATIONS: usize = 1_024;
-pub const BOOTSTRAP_CHECKPOINT_RETENTION: usize = 256;
-
-#[derive(Clone, Debug, Default, Serialize)]
-pub struct HistoryPruneReport {
-    pub pruned_blocks: usize,
-    pub pruned_operations: usize,
-    pub pruned_account_history_entries: usize,
-    pub pruned_through_height: u64,
-    pub retained_blocks: usize,
-    pub retained_operations: usize,
-}
+pub const BOOTSTRAP_CHECKPOINT_RETENTION: usize = crate::checkpoint::RETENTION;
+pub const BOOTSTRAP_CHECKPOINT_INTERVAL_SECONDS: i64 = crate::checkpoint::INTERVAL_SECONDS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsensusCatchUpChunk {
@@ -397,85 +400,17 @@ pub struct ConsensusCatchUpChunk {
     pub finalized_checkpoint: Option<Box<LedgerState>>,
 }
 
-fn chain_height(ledger: &LedgerState) -> u64 {
-    ledger.pruned_through_height + ledger.blocks.len() as u64
-}
-
-fn next_block_height(ledger: &LedgerState) -> u64 {
-    chain_height(ledger) + 1
-}
-
-fn chain_tip_hash(ledger: &LedgerState) -> Option<&str> {
-    ledger
-        .blocks
-        .last()
-        .map(|block| block.block_hash.as_str())
-        .or(ledger.pruned_tip_hash.as_deref())
-}
-
-fn chain_tip_timestamp(ledger: &LedgerState) -> Option<i64> {
-    ledger
-        .blocks
-        .last()
-        .map(|block| block.timestamp)
-        .or(ledger.pruned_tip_timestamp)
-}
-
 pub fn consensus_catch_up_chunk(
     paths: &DataPaths,
     from_height: u64,
     max_blocks: usize,
 ) -> Result<ConsensusCatchUpChunk> {
-    let ledger = paths.read_ledger()?;
-    let tip_height = chain_height(&ledger);
-    if from_height > tip_height {
-        return Err(Error::msg(format!(
-            "requested catch-up height {from_height} is ahead of local tip {tip_height}"
-        )));
-    }
-    if from_height < ledger.pruned_through_height {
-        return Err(Error::msg(format!(
-            "requested history was pruned through height {}",
-            ledger.pruned_through_height
-        )));
-    }
-    let blocks = ledger
-        .blocks
-        .iter()
-        .filter(|block| block.height > from_height)
-        .take(max_blocks.clamp(1, crate::consensus::MAX_CATCH_UP_BLOCKS))
-        .cloned()
-        .collect::<Vec<_>>();
-    let operation_ids = blocks
-        .iter()
-        .flat_map(|block| block.operation_ids.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    let operations = operation_ids
-        .iter()
-        .map(|operation_id| {
-            ledger.operations.get(operation_id).cloned().ok_or_else(|| {
-                Error::msg(format!(
-                    "catch-up block references pruned operation {operation_id}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let reached_tip = blocks.last().map_or(from_height == tip_height, |block| {
-        block.height == tip_height
-    });
-    let finalized_checkpoint = if reached_tip {
-        ledger
-            .finalized_checkpoint
-            .clone()
-            .filter(|checkpoint| checkpoint.pruned_through_height == tip_height)
-    } else {
-        None
-    };
+    let history = paths.consensus_catch_up_history(from_height, max_blocks)?;
     Ok(ConsensusCatchUpChunk {
-        tip_height,
-        blocks,
-        operations,
-        finalized_checkpoint,
+        tip_height: history.tip_height,
+        blocks: history.blocks,
+        operations: history.operations,
+        finalized_checkpoint: history.finalized_checkpoint,
     })
 }
 
@@ -613,9 +548,9 @@ pub fn apply_consensus_catch_up(
 pub fn prune_lite_history(paths: &DataPaths, name: &str) -> Result<HistoryPruneReport> {
     let config = paths.read_node_config(name)?;
     let ledger = paths.read_ledger()?;
+    let retained_block_limit = lite_retain_blocks(ledger.settings.block_interval_seconds);
     if config.storage_mode != NodeStorageMode::Lite
-        || (ledger.blocks.len() <= LITE_RETAIN_BLOCKS
-            && ledger.operations.len() <= LITE_RETAIN_OPERATIONS
+        || (ledger.blocks.len() <= retained_block_limit
             && ledger
                 .accounts
                 .values()
@@ -629,87 +564,13 @@ pub fn prune_lite_history(paths: &DataPaths, name: &str) -> Result<HistoryPruneR
         });
     }
     let report = paths.with_ledger_mut(|ledger| {
-        Ok(prune_history_with_limits(
+        Ok(crate::store::prune_history(
             ledger,
-            LITE_RETAIN_BLOCKS,
-            LITE_RETAIN_OPERATIONS,
+            retained_block_limit,
             LITE_RETAIN_ACCOUNT_OPERATIONS,
         ))
     })?;
-    if report.pruned_blocks > 0
-        || report.pruned_operations > 0
-        || report.pruned_account_history_entries > 0
-    {
-        paths.compact_chain_db()?;
-    }
     Ok(report)
-}
-
-fn prune_history_with_limits(
-    ledger: &mut LedgerState,
-    retained_block_limit: usize,
-    retained_operation_limit: usize,
-    retained_account_operation_limit: usize,
-) -> HistoryPruneReport {
-    let mut report = HistoryPruneReport::default();
-    let remove_blocks = ledger.blocks.len().saturating_sub(retained_block_limit);
-    if remove_blocks > 0 {
-        let checkpoint = ledger.blocks[remove_blocks - 1].clone();
-        ledger.blocks.drain(..remove_blocks);
-        ledger.pruned_through_height = checkpoint.height;
-        ledger.pruned_tip_hash = Some(checkpoint.block_hash);
-        ledger.pruned_tip_timestamp = Some(checkpoint.timestamp);
-        report.pruned_blocks = remove_blocks;
-    }
-
-    // Retain complete operation histories for the newest suffix of blocks. A single
-    // large block is retained whole even if it exceeds the configured target.
-    let mut retained_operation_ids = ledger
-        .pending_operation_ids
-        .iter()
-        .cloned()
-        .collect::<BTreeSet<_>>();
-    let mut retained_finalized = 0_usize;
-    let mut operation_history_from_height = next_block_height(ledger);
-    for block in ledger.blocks.iter().rev() {
-        if retained_finalized > 0
-            && retained_finalized.saturating_add(block.operation_ids.len())
-                > retained_operation_limit
-        {
-            break;
-        }
-        retained_finalized = retained_finalized.saturating_add(block.operation_ids.len());
-        retained_operation_ids.extend(block.operation_ids.iter().cloned());
-        operation_history_from_height = block.height;
-    }
-    ledger.operation_history_from_height = operation_history_from_height;
-    let before_operations = ledger.operations.len();
-    ledger.operations.retain(|operation_id, operation| {
-        matches!(operation.status, OperationStatus::Pending)
-            || retained_operation_ids.contains(operation_id)
-    });
-    report.pruned_operations = before_operations.saturating_sub(ledger.operations.len());
-    ledger.pruned_operation_count = ledger
-        .pruned_operation_count
-        .saturating_add(report.pruned_operations as u64);
-
-    for account in ledger.accounts.values_mut() {
-        let before = account.operation_ids.len();
-        account
-            .operation_ids
-            .retain(|operation_id| ledger.operations.contains_key(operation_id));
-        if account.operation_ids.len() > retained_account_operation_limit {
-            let remove = account.operation_ids.len() - retained_account_operation_limit;
-            account.operation_ids.drain(..remove);
-        }
-        report.pruned_account_history_entries = report
-            .pruned_account_history_entries
-            .saturating_add(before.saturating_sub(account.operation_ids.len()));
-    }
-    report.pruned_through_height = ledger.pruned_through_height;
-    report.retained_blocks = ledger.blocks.len();
-    report.retained_operations = ledger.operations.len();
-    report
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -803,10 +664,13 @@ pub struct ConsensusStatusView {
     pub height: u64,
     pub round: u32,
     pub round_started_at: Option<i64>,
+    pub next_block_at: Option<i64>,
     pub proposer_node_id: Option<u64>,
     pub proposal_block_hash: Option<String>,
     pub prevote_count: usize,
     pub precommit_count: usize,
+    pub prevote_validator_ids: Vec<u64>,
+    pub precommit_validator_ids: Vec<u64>,
     pub quorum: usize,
     pub active_validator_ids: Vec<u64>,
     pub validator_set_hash: String,
@@ -2353,7 +2217,10 @@ fn stage_consensus_candidate(
         .unsigned
         .valid_until
         .saturating_sub(DEFAULT_OPERATION_VALIDITY_SECONDS);
-    paths.with_ledger_mut(|ledger| {
+    if paths.operation_exists(&operation_id_value)? {
+        return Ok(operation_id_value);
+    }
+    paths.with_active_ledger_mut(|ledger| {
         if operation.unsigned.ledger_id != ledger.ledger_id {
             return Err(Error::msg("consensus candidate targets another ledger"));
         }
@@ -4266,7 +4133,7 @@ pub fn init_node_with_storage_mode(
 }
 
 fn latest_bootstrap_snapshot(paths: &DataPaths) -> Result<BootstrapSnapshot> {
-    let ledger = paths.read_ledger()?;
+    let ledger = paths.read_active_ledger()?;
     let checkpoint = ledger
         .finalized_checkpoint
         .as_ref()
@@ -4314,7 +4181,7 @@ pub fn bootstrap_snapshot_at(paths: &DataPaths, height: u64) -> Result<Bootstrap
     }
     let mut checkpoint = paths.bootstrap_checkpoint(height)?.ok_or_else(|| {
         Error::msg(format!(
-            "bootstrap checkpoint at height {height} is not retained; choose a checkpoint published within the last {BOOTSTRAP_CHECKPOINT_RETENTION} finalized blocks"
+            "bootstrap checkpoint at height {height} is not retained; choose one of the latest {BOOTSTRAP_CHECKPOINT_RETENTION} scheduled checkpoints"
         ))
     })?;
     checkpoint.finalized_checkpoint = None;
@@ -4795,7 +4662,7 @@ pub fn node_tick(paths: &DataPaths, name: &str, now: i64) -> Result<NodeRecord> 
     let node_id = config
         .node_id
         .ok_or_else(|| Error::msg("node is not registered"))?;
-    paths.with_ledger_mut(|ledger| {
+    paths.with_active_ledger_mut(|ledger| {
         let node = ledger
             .nodes
             .get_mut(&node_id)
@@ -6075,20 +5942,18 @@ fn consensus_value_id(block: &BlockRecord) -> String {
 }
 
 pub fn consensus_status(paths: &DataPaths, now: i64) -> Result<ConsensusStatusView> {
-    let ledger = paths.read_ledger()?;
+    let ledger = paths.read_active_ledger()?;
     let active = ledger.consensus.active_validators.clone();
     let height = next_block_height(&ledger);
     let set_hash = validator_set_hash(&ledger, &active)?;
     let eligible_count = governance_eligible_node_ids(&ledger, now).len();
     let multi_validator =
         eligible_count >= GOVERNANCE_NODE_THRESHOLD && active.len() >= MIN_ACTIVE_VALIDATORS;
+    let next_block_at = multi_validator
+        .then(|| next_block_timestamp(&ledger))
+        .flatten();
     let round_started_at = multi_validator
-        .then(|| {
-            ledger
-                .consensus
-                .round_started_at
-                .or_else(|| chain_tip_timestamp(&ledger))
-        })
+        .then(|| consensus_timer_started_at(&ledger, ledger.consensus.round_started_at))
         .flatten();
     Ok(ConsensusStatusView {
         mode: if multi_validator {
@@ -6099,6 +5964,7 @@ pub fn consensus_status(paths: &DataPaths, now: i64) -> Result<ConsensusStatusVi
         height,
         round: ledger.consensus.round,
         round_started_at,
+        next_block_at,
         proposer_node_id: multi_validator
             .then(|| consensus_proposer(&active, height, ledger.consensus.round))
             .flatten(),
@@ -6120,6 +5986,16 @@ pub fn consensus_status(paths: &DataPaths, now: i64) -> Result<ConsensusStatusVi
             ledger.consensus.precommits.len()
         } else {
             0
+        },
+        prevote_validator_ids: if multi_validator {
+            ledger.consensus.prevotes.keys().copied().collect()
+        } else {
+            Vec::new()
+        },
+        precommit_validator_ids: if multi_validator {
+            ledger.consensus.precommits.keys().copied().collect()
+        } else {
+            Vec::new()
         },
         quorum: if multi_validator {
             consensus_quorum(active.len())
@@ -6245,7 +6121,7 @@ pub fn submit_consensus_proposal(
     block: BlockRecord,
     now: i64,
 ) -> Result<ConsensusSubmissionView> {
-    paths.with_ledger_mut(|ledger| {
+    paths.with_active_ledger_mut(|ledger| {
         ensure_multi_validator_mode(ledger, now)?;
         if let Some(existing) = &ledger.consensus.proposal {
             if existing.block.block_hash == block.block_hash {
@@ -6283,7 +6159,7 @@ pub fn submit_consensus_vote(
     vote: ConsensusVote,
     now: i64,
 ) -> Result<ConsensusSubmissionView> {
-    let submission = paths.with_ledger_mut(|ledger| {
+    let submission = paths.with_active_ledger_mut(|ledger| {
         ensure_multi_validator_mode(ledger, now)?;
         if (now - vote.timestamp).abs() > 60 {
             return Err(Error::msg("consensus vote timestamp is stale"));
@@ -6403,9 +6279,10 @@ pub fn propose_consensus_block(
         .ok_or_else(|| Error::msg("node is not registered"))?;
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
     let owner_key = decrypt_key(&owner_file, password)?;
-    paths.with_ledger_mut(|ledger| {
+    paths.with_active_ledger_mut(|ledger| {
         ensure_multi_validator_mode(ledger, now)?;
         ensure_active_validator_identity(ledger, node_id, &owner_file)?;
+        ensure_consensus_block_is_due(ledger, now)?;
         let height = next_block_height(ledger);
         let round = ledger.consensus.round;
         let expected = consensus_proposer(&ledger.consensus.active_validators, height, round)
@@ -6418,7 +6295,6 @@ pub fn propose_consensus_block(
         if ledger.consensus.proposal.is_some() {
             return Err(Error::msg("a proposal already exists for the current round"));
         }
-        migrate_legacy_pending_operations(ledger);
         if ledger.pending_operation_ids.len() > MAX_BLOCK_OPERATIONS {
             return Err(Error::msg(format!(
                 "pending operation count exceeds the {MAX_BLOCK_OPERATIONS} operation block limit"
@@ -6518,7 +6394,7 @@ pub fn cast_consensus_vote(
         .ok_or_else(|| Error::msg("node is not registered"))?;
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
     let owner_key = decrypt_key(&owner_file, password)?;
-    paths.with_ledger_mut(|ledger| {
+    paths.with_active_ledger_mut(|ledger| {
         ensure_multi_validator_mode(ledger, now)?;
         ensure_active_validator_identity(ledger, node_id, &owner_file)?;
         let height = next_block_height(ledger);
@@ -6638,13 +6514,10 @@ pub fn cast_consensus_vote(
 }
 
 pub fn advance_consensus_round(paths: &DataPaths, now: i64) -> Result<u32> {
-    paths.with_ledger_mut(|ledger| {
+    paths.with_active_ledger_mut(|ledger| {
         ensure_multi_validator_mode(ledger, now)?;
-        let started = ledger
-            .consensus
-            .round_started_at
-            .or_else(|| chain_tip_timestamp(ledger))
-            .unwrap_or(now);
+        let started =
+            consensus_timer_started_at(ledger, ledger.consensus.round_started_at).unwrap_or(now);
         let multiplier = 1_i64
             .checked_shl(ledger.consensus.round.min(5))
             .unwrap_or(32);
@@ -6680,9 +6553,9 @@ pub fn advance_consensus_round(paths: &DataPaths, now: i64) -> Result<u32> {
 }
 
 pub fn restart_consensus_timer(paths: &DataPaths, now: i64) -> Result<()> {
-    paths.with_ledger_mut(|ledger| {
+    paths.with_active_ledger_mut(|ledger| {
         if ledger.consensus.proposal.is_none() {
-            ledger.consensus.round_started_at = Some(now);
+            ledger.consensus.round_started_at = consensus_timer_started_at(ledger, Some(now));
         }
         Ok(())
     })
@@ -6707,6 +6580,17 @@ fn ensure_multi_validator_mode(ledger: &LedgerState, now: i64) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn ensure_consensus_block_is_due(ledger: &LedgerState, now: i64) -> Result<()> {
+    if block_is_due(ledger, now) {
+        return Ok(());
+    }
+    let next = next_block_timestamp(ledger).expect("a block that is not due has a chain tip");
+    Err(Error::msg(format!(
+        "next block is not due until timestamp {next} under block-interval-seconds={}",
+        ledger.settings.block_interval_seconds
+    )))
 }
 
 fn reset_multi_validator_consensus_if_node1_mode(ledger: &mut LedgerState, now: i64) {
@@ -6789,6 +6673,12 @@ fn verify_multi_validator_proposal(
     if block.timestamp > now + 30 || block.timestamp < now - 60 {
         return Err(Error::msg(
             "proposal timestamp is outside the allowed window",
+        ));
+    }
+    ensure_consensus_block_is_due(ledger, now)?;
+    if next_block_timestamp(ledger).is_some_and(|earliest| block.timestamp < earliest) {
+        return Err(Error::msg(
+            "proposal timestamp is earlier than the configured block interval",
         ));
     }
     let expected_previous = chain_tip_hash(ledger).unwrap_or(GENESIS_PREVIOUS_BLOCK_HASH);
@@ -7201,21 +7091,7 @@ pub fn block_status(paths: &DataPaths, now: i64) -> Result<BlockStatusView> {
 }
 
 pub fn block_by_height(paths: &DataPaths, height: u64) -> Result<BlockRecord> {
-    if height == 0 {
-        return Err(Error::msg("block height starts at 1"));
-    }
-    let ledger = paths.read_ledger()?;
-    if height <= ledger.pruned_through_height {
-        return Err(Error::msg(format!(
-            "block {height} was pruned; retained history starts at {}",
-            ledger.pruned_through_height + 1
-        )));
-    }
-    ledger
-        .blocks
-        .get((height - ledger.pruned_through_height - 1) as usize)
-        .cloned()
-        .ok_or_else(|| Error::msg(format!("block {height} does not exist")))
+    paths.stored_block(height)
 }
 
 pub fn produce_node1_block(
@@ -7231,7 +7107,7 @@ pub fn produce_node1_block(
         .ok_or_else(|| Error::msg("node is not registered"))?;
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
     let owner_key = decrypt_key(&owner_file, password)?;
-    let block = paths.with_ledger_mut(|ledger| {
+    let block = paths.with_active_ledger_mut(|ledger| {
         let genesis = ensure_genesis_authority(ledger)?;
         if node_id != genesis.node_id
             || config.owner_address != genesis.owner_address
@@ -7252,7 +7128,6 @@ pub fn produce_node1_block(
             )));
         }
         reset_multi_validator_consensus_if_node1_mode(ledger, now);
-        migrate_legacy_pending_operations(ledger);
         if ledger.pending_operation_ids.is_empty() && !allow_empty {
             return Err(Error::msg("there are no pending operations to include"));
         }
@@ -7328,7 +7203,7 @@ pub fn produce_node1_block_if_due(
     if config.node_id != Some(1) {
         return Ok(None);
     }
-    let ledger = paths.read_ledger()?;
+    let ledger = paths.read_active_ledger()?;
     let genesis_exists = ledger.genesis_authority.is_some() || ledger.nodes.contains_key(&1);
     let multi_validator_ready = governance_eligible_node_ids(&ledger, now).len()
         >= GOVERNANCE_NODE_THRESHOLD
@@ -7336,10 +7211,7 @@ pub fn produce_node1_block_if_due(
     if !genesis_exists || multi_validator_ready {
         return Ok(None);
     }
-    let due = chain_tip_timestamp(&ledger).is_none_or(|timestamp| {
-        now.saturating_sub(timestamp) >= ledger.settings.block_interval_seconds
-    });
-    if !due {
+    if !block_is_due(&ledger, now) {
         return Ok(None);
     }
     produce_node1_block(paths, name, password, true, now).map(Some)
@@ -7639,50 +7511,6 @@ fn verify_blockchain_inner(ledger: &LedgerState) -> Result<(usize, usize)> {
     Ok((checked_operations, legacy_unverified))
 }
 
-fn migrate_legacy_pending_operations(ledger: &mut LedgerState) {
-    if chain_height(ledger) > 0 || !ledger.pending_operation_ids.is_empty() {
-        return;
-    }
-    let mut legacy = ledger
-        .operations
-        .values()
-        .filter(|operation| operation.block_height.is_none())
-        .map(|operation| {
-            (
-                operation.created_at,
-                operation.nonce,
-                operation.operation_id.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-    legacy.sort();
-    ledger.pending_operation_ids = legacy.into_iter().map(|(_, _, id)| id).collect();
-}
-
-fn ledger_state_root(ledger: &LedgerState) -> Result<String> {
-    let mut committed = ledger.clone();
-    committed.blocks.clear();
-    committed.pruned_through_height = 0;
-    committed.pruned_tip_hash = None;
-    committed.pruned_tip_timestamp = None;
-    committed.pruned_operation_count = 0;
-    committed.operation_history_from_height = 1;
-    committed.operations.clear();
-    for account in committed.accounts.values_mut() {
-        account.operation_ids.clear();
-    }
-    for node in committed.nodes.values_mut() {
-        node.last_heartbeat = None;
-    }
-    committed.pending_operation_ids.clear();
-    let consensus = std::mem::take(&mut committed.consensus);
-    committed.consensus.active_validators = consensus.active_validators;
-    committed.consensus.last_selection_epoch = consensus.last_selection_epoch;
-    committed.consensus.double_sign_evidence = consensus.double_sign_evidence;
-    committed.finalized_checkpoint = None;
-    Ok(sha256_full_id("state", &serde_json::to_vec(&committed)?))
-}
-
 fn update_finalized_checkpoint(ledger: &mut LedgerState) {
     let mut checkpoint = ledger.clone();
     checkpoint.finalized_checkpoint = None;
@@ -7709,6 +7537,13 @@ fn update_finalized_checkpoint(ledger: &mut LedgerState) {
 
 fn persist_latest_bootstrap_checkpoint(paths: &DataPaths) -> Result<()> {
     let snapshot = latest_bootstrap_snapshot(paths)?;
+    let previous = paths.latest_bootstrap_checkpoint()?;
+    if !crate::checkpoint::should_persist(
+        previous.as_ref().map(|(_, checkpoint)| checkpoint),
+        &snapshot.checkpoint,
+    ) {
+        return Ok(());
+    }
     paths.store_bootstrap_checkpoint(
         snapshot.height,
         &snapshot.checkpoint,
@@ -9583,42 +9418,6 @@ fn ensure_account(ledger: &mut LedgerState, keyfile: &EncryptedKeyFile) -> Resul
     Ok(())
 }
 
-fn sign_operation(
-    ledger: &LedgerState,
-    signer: (&EncryptedKeyFile, &Ed25519KeyPair),
-    module: &str,
-    action: &str,
-    nonce: u64,
-    valid_until: i64,
-    payload: Value,
-) -> Result<SignedOperation> {
-    let (keyfile, key_pair) = signer;
-    let unsigned = UnsignedOperation {
-        ledger_id: ledger.ledger_id.clone(),
-        protocol_version: PROTOCOL_VERSION,
-        module: module.to_owned(),
-        action: action.to_owned(),
-        signer: keyfile.address.clone(),
-        account_nonce: nonce,
-        valid_until,
-        payload,
-    };
-    let bytes = serde_json::to_vec(&unsigned)?;
-    Ok(SignedOperation {
-        signature: sign_bytes(key_pair, &bytes),
-        unsigned,
-    })
-}
-
-fn verify_operation(operation: &SignedOperation, public_key: &str) -> Result<()> {
-    let bytes = serde_json::to_vec(&operation.unsigned)?;
-    verify_bytes(public_key, &bytes, &operation.signature)
-}
-
-fn operation_id(operation: &SignedOperation) -> Result<String> {
-    Ok(sha256_id("op", &serde_json::to_vec(operation)?))
-}
-
 fn finalize_operation(
     ledger: &mut LedgerState,
     operation: &SignedOperation,
@@ -9666,40 +9465,6 @@ fn finalize_operation(
     ledger.pending_operation_ids.push(operation_id.to_owned());
     sort_pending_operation_ids(ledger);
     Ok(())
-}
-
-fn sort_pending_operation_ids(ledger: &mut LedgerState) {
-    ledger.pending_operation_ids.sort_by(|left, right| {
-        let left_record = &ledger.operations[left];
-        let right_record = &ledger.operations[right];
-        (
-            left_record
-                .signed_operation
-                .as_ref()
-                .map(|operation| operation.unsigned.valid_until)
-                .unwrap_or(i64::MAX),
-            left_record.signer.as_str(),
-            left_record.nonce,
-            left.as_str(),
-        )
-            .cmp(&(
-                right_record
-                    .signed_operation
-                    .as_ref()
-                    .map(|operation| operation.unsigned.valid_until)
-                    .unwrap_or(i64::MAX),
-                right_record.signer.as_str(),
-                right_record.nonce,
-                right.as_str(),
-            ))
-    });
-}
-
-fn add_history(ledger: &mut LedgerState, address: &str, operation_id: &str) {
-    let account = ledger.accounts.entry(address.to_owned()).or_default();
-    if !account.operation_ids.iter().any(|id| id == operation_id) {
-        account.operation_ids.push(operation_id.to_owned());
-    }
 }
 
 fn resolve_network(ledger: &LedgerState, alias_or_commitment: &str) -> Result<String> {
@@ -11013,15 +10778,21 @@ mod tests {
         }
 
         let report = paths
-            .with_ledger_mut(|ledger| Ok(prune_history_with_limits(ledger, 2, 1, 1)))
+            .with_ledger_mut(|ledger| Ok(crate::store::prune_history(ledger, 2, 1)))
             .unwrap();
         assert_eq!(report.pruned_blocks, 2);
         assert_eq!(report.retained_blocks, 2);
         assert_eq!(report.pruned_through_height, 2);
         assert_eq!(
             paths.read_ledger().unwrap().operation_history_from_height,
-            4
+            3
         );
+        let retained = paths.read_ledger().unwrap();
+        for block in &retained.blocks {
+            for operation_id in &block.operation_ids {
+                assert!(retained.operations.contains_key(operation_id));
+            }
+        }
         assert!(
             block_by_height(&paths, 1)
                 .unwrap_err()

@@ -352,11 +352,13 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
         lagging_paths.read_ledger().unwrap().pending_operation_ids
     );
 
-    let next = service::propose_consensus_block(&paths, "node2", password, now + 36).unwrap();
+    assert!(service::propose_consensus_block(&paths, "node2", password, now + 36).is_err());
+    let next = service::propose_consensus_block(&paths, "node2", password, now + 44).unwrap();
     assert_eq!(next.height, 2);
     assert_eq!(next.operation_ids.len(), 1);
+    assert!(service::submit_consensus_proposal(&lagging_paths, next.clone(), now + 36).is_err());
     assert!(
-        service::submit_consensus_proposal(&lagging_paths, next.clone(), now + 36)
+        service::submit_consensus_proposal(&lagging_paths, next.clone(), now + 44)
             .unwrap()
             .accepted
     );
@@ -366,7 +368,7 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
             Ok(())
         })
         .unwrap();
-    let fallback = service::consensus_status(&paths, now + 36).unwrap();
+    let fallback = service::consensus_status(&paths, now + 44).unwrap();
     assert_eq!(fallback.mode, "NODE1_SINGLE_PRODUCER");
     assert!(fallback.proposal_block_hash.is_none());
 

@@ -16,6 +16,7 @@ use crate::{
     crypto::EncryptedKeyFile,
     model::{LedgerState, LocalNodeConfig, MemberCredential, SignedOperation},
     relay::{ReceiverReceipt, SenderCheckpoint},
+    store,
 };
 
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -248,7 +249,8 @@ impl DataPaths {
     pub fn load_or_init_ledger(&self) -> Result<LedgerState> {
         let db = self.open_chain_db()?;
         let write = db.begin_write().map_err(redb_error)?;
-        let state = {
+        store::initialize_tables(&write)?;
+        let mut state = {
             let mut table = write.open_table(LEDGER_TABLE).map_err(redb_error)?;
             let existing = table
                 .get(LEDGER_STATE_KEY)
@@ -258,7 +260,7 @@ impl DataPaths {
                 Some(bytes) => serde_json::from_slice(&bytes)?,
                 None => {
                     let state = LedgerState::default();
-                    let bytes = serde_json::to_vec(&state)?;
+                    let bytes = serde_json::to_vec(&store::persisted_state(&state))?;
                     table
                         .insert(LEDGER_STATE_KEY, bytes.as_slice())
                         .map_err(redb_error)?;
@@ -278,9 +280,7 @@ impl DataPaths {
         write
             .open_table(RELAY_AUTO_ABANDON_USAGE_TABLE)
             .map_err(redb_error)?;
-        write
-            .open_table(BOOTSTRAP_CHECKPOINT_TABLE)
-            .map_err(redb_error)?;
+        store::hydrate_ledger(&write, &mut state)?;
         write.commit().map_err(redb_error)?;
         Ok(state)
     }
@@ -291,23 +291,91 @@ impl DataPaths {
     ) -> Result<T> {
         let db = self.open_chain_db()?;
         let write = db.begin_write().map_err(redb_error)?;
-        let mut ledger = {
-            let table = write.open_table(LEDGER_TABLE).map_err(redb_error)?;
-            match table.get(LEDGER_STATE_KEY).map_err(redb_error)? {
-                Some(bytes) => serde_json::from_slice(bytes.value())?,
-                None => LedgerState::default(),
-            }
-        };
+        store::initialize_tables(&write)?;
+        let mut ledger = load_persisted_ledger(&write)?;
+        store::hydrate_ledger(&write, &mut ledger)?;
+        let before = ledger.clone();
         let result = operation(&mut ledger)?;
+        store::persist_histories(&write, &before, &ledger)?;
+        store_persisted_ledger(&write, &ledger)?;
+        write.commit().map_err(redb_error)?;
+        Ok(result)
+    }
+
+    /// Mutates consensus state without materializing finalized history. The
+    /// returned runtime ledger represents the persisted chain prefix through
+    /// `pruned_*` and contains only pending operations plus blocks appended by
+    /// this transaction.
+    pub(crate) fn with_active_ledger_mut<T>(
+        &self,
+        operation: impl FnOnce(&mut LedgerState) -> Result<T>,
+    ) -> Result<T> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        store::initialize_tables(&write)?;
+        let mut ledger = load_persisted_ledger(&write)?;
+        let retained_prefix = (
+            ledger.pruned_through_height,
+            ledger.pruned_tip_hash.clone(),
+            ledger.pruned_tip_timestamp,
+        );
+        store::hydrate_active_ledger(&write, &mut ledger)?;
+        let before = ledger.clone();
+        let result = operation(&mut ledger)?;
+        store::persist_histories(&write, &before, &ledger)?;
         {
-            let mut table = write.open_table(LEDGER_TABLE).map_err(redb_error)?;
-            let bytes = serde_json::to_vec(&ledger)?;
-            table
-                .insert(LEDGER_STATE_KEY, bytes.as_slice())
-                .map_err(redb_error)?;
+            let mut state = store::persisted_state(&ledger);
+            state.pruned_through_height = retained_prefix.0;
+            state.pruned_tip_hash = retained_prefix.1;
+            state.pruned_tip_timestamp = retained_prefix.2;
+            store_persisted_state(&write, &state)?;
         }
         write.commit().map_err(redb_error)?;
         Ok(result)
+    }
+
+    pub(crate) fn read_active_ledger(&self) -> Result<LedgerState> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        store::initialize_tables(&write)?;
+        let mut ledger = load_persisted_ledger(&write)?;
+        store::hydrate_active_ledger(&write, &mut ledger)?;
+        write.commit().map_err(redb_error)?;
+        Ok(ledger)
+    }
+
+    pub(crate) fn operation_exists(&self, operation_id: &str) -> Result<bool> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        store::initialize_tables(&write)?;
+        let exists = store::operation_exists(&write, operation_id)?;
+        write.commit().map_err(redb_error)?;
+        Ok(exists)
+    }
+
+    pub(crate) fn consensus_catch_up_history(
+        &self,
+        from_height: u64,
+        max_blocks: usize,
+    ) -> Result<store::CatchUpHistory> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        store::initialize_tables(&write)?;
+        let ledger = load_persisted_ledger(&write)?;
+        let history =
+            store::collect_catch_up_from_tables(&write, &ledger, from_height, max_blocks)?;
+        write.commit().map_err(redb_error)?;
+        Ok(history)
+    }
+
+    pub(crate) fn stored_block(&self, height: u64) -> Result<crate::model::BlockRecord> {
+        let db = self.open_chain_db()?;
+        let write = db.begin_write().map_err(redb_error)?;
+        store::initialize_tables(&write)?;
+        let pruned_through_height = load_persisted_ledger(&write)?.pruned_through_height;
+        let block = store::block_by_height_from_table(&write, pruned_through_height, height)?;
+        write.commit().map_err(redb_error)?;
+        Ok(block)
     }
 
     pub fn read_ledger(&self) -> Result<LedgerState> {
@@ -320,26 +388,9 @@ impl DataPaths {
         checkpoint: &LedgerState,
         retained_limit: usize,
     ) -> Result<()> {
-        let bytes = serde_json::to_vec(checkpoint)?;
         let db = self.open_chain_db()?;
         let write = db.begin_write().map_err(redb_error)?;
-        {
-            let mut table = write
-                .open_table(BOOTSTRAP_CHECKPOINT_TABLE)
-                .map_err(redb_error)?;
-            table.insert(height, bytes.as_slice()).map_err(redb_error)?;
-            let heights = table
-                .iter()
-                .map_err(redb_error)?
-                .map(|entry| entry.map(|(height, _)| height.value()).map_err(redb_error))
-                .collect::<Result<Vec<_>>>()?;
-            for stale_height in heights
-                .iter()
-                .take(heights.len().saturating_sub(retained_limit.max(1)))
-            {
-                table.remove(*stale_height).map_err(redb_error)?;
-            }
-        }
+        store::checkpoint::store(&write, height, checkpoint, retained_limit)?;
         write.commit().map_err(redb_error)?;
         Ok(())
     }
@@ -347,15 +398,13 @@ impl DataPaths {
     pub fn bootstrap_checkpoint(&self, height: u64) -> Result<Option<LedgerState>> {
         let db = self.open_chain_db()?;
         let read = db.begin_read().map_err(redb_error)?;
-        let table = read
-            .open_table(BOOTSTRAP_CHECKPOINT_TABLE)
-            .map_err(redb_error)?;
-        let checkpoint = table
-            .get(height)
-            .map_err(redb_error)?
-            .map(|bytes| serde_json::from_slice(bytes.value()))
-            .transpose()?;
-        Ok(checkpoint)
+        store::checkpoint::get(&read, height)
+    }
+
+    pub fn latest_bootstrap_checkpoint(&self) -> Result<Option<(u64, LedgerState)>> {
+        let db = self.open_chain_db()?;
+        let read = db.begin_read().map_err(redb_error)?;
+        store::checkpoint::latest(&read)
     }
 
     pub fn store_pending_traffic_settlement(
@@ -687,8 +736,27 @@ const ACTIVE_RELAY_SESSION_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("active_relay_sessions/v1");
 const RELAY_AUTO_ABANDON_USAGE_TABLE: TableDefinition<&str, &[u8]> =
     TableDefinition::new("relay_auto_abandon_usage/v1");
-const BOOTSTRAP_CHECKPOINT_TABLE: TableDefinition<u64, &[u8]> =
-    TableDefinition::new("bootstrap_checkpoints/v1");
+
+fn load_persisted_ledger(write: &redb::WriteTransaction) -> Result<LedgerState> {
+    let table = write.open_table(LEDGER_TABLE).map_err(redb_error)?;
+    match table.get(LEDGER_STATE_KEY).map_err(redb_error)? {
+        Some(bytes) => Ok(serde_json::from_slice(bytes.value())?),
+        None => Ok(LedgerState::default()),
+    }
+}
+
+fn store_persisted_ledger(write: &redb::WriteTransaction, ledger: &LedgerState) -> Result<()> {
+    store_persisted_state(write, &store::persisted_state(ledger))
+}
+
+fn store_persisted_state(write: &redb::WriteTransaction, state: &LedgerState) -> Result<()> {
+    let bytes = serde_json::to_vec(state)?;
+    let mut table = write.open_table(LEDGER_TABLE).map_err(redb_error)?;
+    table
+        .insert(LEDGER_STATE_KEY, bytes.as_slice())
+        .map_err(redb_error)?;
+    Ok(())
+}
 
 fn pending_traffic_key(
     authorization_id: &str,

@@ -3521,7 +3521,11 @@ fn drive_validator_consensus_once(
         return Ok(events);
     }
 
-    if status.proposal_block_hash.is_none() && status.proposer_node_id == Some(node_id) {
+    let block_is_due = status.next_block_at.is_none_or(|ready_at| now >= ready_at);
+    if block_is_due
+        && status.proposal_block_hash.is_none()
+        && status.proposer_node_id == Some(node_id)
+    {
         let block = service::propose_consensus_block(paths, name, password, now)?;
         events.push(format!(
             "Proposed block {} {} at round {}",
@@ -3531,10 +3535,8 @@ fn drive_validator_consensus_once(
     }
 
     if let Some(block_hash) = status.proposal_block_hash.clone() {
-        let ledger = paths.read_ledger()?;
-        let has_prevote = ledger.consensus.prevotes.contains_key(&node_id);
-        let has_precommit = ledger.consensus.precommits.contains_key(&node_id);
-        drop(ledger);
+        let has_prevote = status.prevote_validator_ids.contains(&node_id);
+        let has_precommit = status.precommit_validator_ids.contains(&node_id);
         if !has_prevote {
             service::cast_consensus_vote(
                 paths,

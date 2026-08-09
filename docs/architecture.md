@@ -473,11 +473,16 @@ Node 配置并由 `mrk node status` 显示，不允许运行时静默切换。`L
 链状态写入 `~/.mrk/chain.redb`，只有常驻 `mrk node run` 进程打开 redb；
 其余 `mrk node` 命令统一通过数据根目录唯一的 `~/.mrk/mrk.sock` 调用本地
 管理 RPC；一台机器的默认数据目录只运行一个 `mrk node`，不再为 Node 分 Socket 目录。Socket 权限为 `0600` 且服务端校验同一 UID。`LITE` 的有界历史
-裁剪由 `mrk node run` 每 60 秒执行：保留最近 65,536 个 Block、以完整 Block
-为边界保留目标不超过 262,144 项的近期 Operation 正文，并将每个账户的
+裁剪由 `mrk node run` 每 60 秒执行：按当前 `block-interval-seconds` 向上取整
+保留最近七天的 Block（3 秒时为 201,600 个），保留这些 Block 引用的全部
+Operation 正文，并将每个账户的
 历史索引限制为最近 1,024 项。待终局 Operation 和完整当前状态永不裁剪；
-已删除前缀保存最后高度、Block Hash 与时间戳检查点，删除后执行 redb
-compaction。区块高度、父哈希、共识和治理从检查点连续运行。`FULL` 不裁剪。
+Block、Operation 正文与终局状态、账户历史链接分别追加到独立 redb 表。
+出块与共识热事务只读取当前状态、链 Tip 和待终局 Operation，不物化完整历史；
+查询、校验、备份和裁剪再按需读取历史表。
+已删除前缀保存最后高度、Block Hash 与时间戳检查点，释放页面供后续写入
+复用，不在每轮裁剪后执行全库 compaction。区块高度、父哈希、共识和治理
+从检查点连续运行。`FULL` 不裁剪。
 
 Node 初始化时分别生成 Owner 冷钥、Relay 热钥和 Reward Key。节点奖励领取到 Reward Key；使用账户 CLI 的 `--account node:default` 可以查询和转移该余额，不需要动用 Node Owner 冷钥。
 

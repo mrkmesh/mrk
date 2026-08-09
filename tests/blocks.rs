@@ -64,9 +64,23 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
     assert!(ledger.nodes.contains_key(&2));
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].node_id, 1);
 
-    let request = service::availability_probe_request(&paths, "node1", password, 2, now).unwrap();
-    let response =
-        service::node_probe_response(&paths, "node2", password, &request.challenge).unwrap();
+    let slot_seconds = paths
+        .read_ledger()
+        .unwrap()
+        .settings
+        .availability_slot_seconds;
+    let mut probe_now = Utc::now().timestamp();
+    let (request, response) = loop {
+        let request =
+            service::availability_probe_request(&paths, "node1", password, 2, probe_now).unwrap();
+        let response =
+            service::node_probe_response(&paths, "node2", password, &request.challenge).unwrap();
+        if response.timestamp.div_euclid(slot_seconds) == request.slot {
+            break (request, response);
+        }
+        probe_now = response.timestamp;
+    };
+    let probe_now = response.timestamp;
     let attestation = service::submit_node_probe_attestation(
         &paths,
         "node1",
@@ -77,7 +91,7 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
             role: request.role,
             ticket_signature: request.ticket_signature,
             response,
-            now,
+            now: probe_now,
         },
     )
     .unwrap();
@@ -87,17 +101,18 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
         NodeStatus::WarmingUp
     );
 
-    service::drain_node(&paths, "node1", password, now + 5).unwrap();
+    let timeline = probe_now;
+    service::drain_node(&paths, "node1", password, timeline + 5).unwrap();
     assert_eq!(
         service::node_record(&paths, "node1").unwrap().status,
         NodeStatus::Draining
     );
-    service::produce_node1_block(&paths, "node1", password, false, now + 6).unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, timeline + 6).unwrap();
     let ledger = paths.read_ledger().unwrap();
     assert_eq!(ledger.nodes[&1].status, NodeStatus::Exited);
     assert_eq!(ledger.nodes[&1].claimable_reward, 10);
     assert_eq!(ledger.nodes[&1].service_bond, 100);
-    assert_eq!(ledger.nodes[&1].service_bond_unlock_at, Some(now + 26));
+    assert_eq!(ledger.nodes[&1].service_bond_unlock_at, Some(timeline + 26));
     assert!(ledger.nodes[&1].reward_vesting_schedules.is_empty());
     assert_eq!(ledger.treasury, treasury_before_exit + 60);
     assert_eq!(ledger.pool_remaining, pool_before_exit);
@@ -106,41 +121,47 @@ fn ip_slot_conflicts_updates_and_exit_are_finalized_deterministically() {
         ledger.finalized_checkpoint.as_ref().unwrap().nodes[&1].status,
         NodeStatus::Exited
     );
-    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, Some(now + 6));
+    assert_eq!(
+        ledger.ip_slots["v4:1.1.1.1"].released_at,
+        Some(timeline + 6)
+    );
 
-    service::update_reward_ip(&paths, "node2", password, "1.1.1.1", now + 10).unwrap();
+    service::update_reward_ip(&paths, "node2", password, "1.1.1.1", timeline + 10).unwrap();
     assert_eq!(
         service::node_record(&paths, "node2").unwrap().endpoint,
         "wss://1.1.1.1/v1/relay"
     );
-    service::produce_node1_block(&paths, "node1", password, false, now + 11).unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, timeline + 11).unwrap();
     let ledger = paths.read_ledger().unwrap();
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].node_id, 1);
-    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, Some(now + 6));
+    assert_eq!(
+        ledger.ip_slots["v4:1.1.1.1"].released_at,
+        Some(timeline + 6)
+    );
 
     service::update_reward_ip(
         &paths,
         "node2",
         password,
         "wss://1.1.1.1/v1/relay",
-        now + 15,
+        timeline + 15,
     )
     .unwrap();
-    service::produce_node1_block(&paths, "node1", password, false, now + 16).unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, timeline + 16).unwrap();
     let ledger = paths.read_ledger().unwrap();
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].node_id, 2);
-    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].bound_at, now + 16);
+    assert_eq!(ledger.ip_slots["v4:1.1.1.1"].bound_at, timeline + 16);
     assert_eq!(ledger.ip_slots["v4:1.1.1.1"].released_at, None);
     assert_eq!(ledger.nodes[&2].status, NodeStatus::WarmingUp);
-    assert!(service::withdraw_service_bond(&paths, "node1", password, now + 25).is_err());
+    assert!(service::withdraw_service_bond(&paths, "node1", password, timeline + 25).is_err());
     let reward_address = ledger.nodes[&1].reward_address.clone();
     let reward_balance_before = ledger.accounts[&reward_address].balance;
     drop(ledger);
 
     let (_, withdrawn) =
-        service::withdraw_service_bond(&paths, "node1", password, now + 27).unwrap();
+        service::withdraw_service_bond(&paths, "node1", password, timeline + 27).unwrap();
     assert_eq!(withdrawn, 100);
-    service::produce_node1_block(&paths, "node1", password, false, now + 28).unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, timeline + 28).unwrap();
     let ledger = paths.read_ledger().unwrap();
     assert_eq!(ledger.nodes[&1].service_bond, 0);
     assert_eq!(ledger.nodes[&1].service_bond_unlock_at, None);
@@ -231,6 +252,11 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
     service::init_node(&target, "joining", password).unwrap();
     let first_snapshot = service::bootstrap_snapshot(&source).unwrap();
     service::produce_node1_block(&source, "node1", password, true, now + 2).unwrap();
+    assert_eq!(
+        source.latest_bootstrap_checkpoint().unwrap().unwrap().0,
+        1,
+        "automatic checkpoints inside the one-hour interval must be skipped"
+    );
     let latest_snapshot = service::bootstrap_snapshot(&source).unwrap();
     assert_eq!(latest_snapshot.height, 2);
     drop(source);
@@ -355,6 +381,24 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
 }
 
 #[test]
+fn automatic_bootstrap_checkpoints_are_hourly() {
+    let root = temp_root("hourly-checkpoint");
+    let paths = DataPaths::new(Some(root.clone())).unwrap();
+    let password = "hourly-checkpoint-password";
+    let now = Utc::now().timestamp();
+    register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
+
+    service::produce_node1_block(&paths, "node1", password, false, now + 1).unwrap();
+    service::produce_node1_block(&paths, "node1", password, true, now + 2).unwrap();
+    assert_eq!(paths.latest_bootstrap_checkpoint().unwrap().unwrap().0, 1);
+
+    service::produce_node1_block(&paths, "node1", password, true, now + 3_601).unwrap();
+    assert_eq!(paths.latest_bootstrap_checkpoint().unwrap().unwrap().0, 3);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn node1_builds_signed_linked_blocks_and_detects_operation_tampering() {
     let root = temp_root("node1-blocks");
     let paths = DataPaths::new(Some(root.clone())).unwrap();
@@ -414,21 +458,11 @@ fn node1_builds_signed_linked_blocks_and_detects_operation_tampering() {
     assert_eq!(report.checked_operations, 3);
     assert_eq!(report.legacy_unverified_operations, 0);
 
-    paths
-        .with_ledger_mut(|ledger| {
-            ledger.blocks.get_mut(1).unwrap().previous_block_hash = "tampered".to_owned();
-            Ok(())
-        })
-        .unwrap();
-    let broken_link = service::verify_blockchain(&paths).unwrap();
-    assert!(!broken_link.ok);
-    assert!(broken_link.detail.contains("does not link"));
-    paths
-        .with_ledger_mut(|ledger| {
-            ledger.blocks.get_mut(1).unwrap().previous_block_hash = first.block_hash.clone();
-            Ok(())
-        })
-        .unwrap();
+    let block_tamper = paths.with_ledger_mut(|ledger| {
+        ledger.blocks.get_mut(1).unwrap().previous_block_hash = "tampered".to_owned();
+        Ok(())
+    });
+    assert!(block_tamper.is_err());
 
     assert!(
         service::produce_node1_block_if_due(&paths, "node1", password, now + 3)
@@ -441,19 +475,17 @@ fn node1_builds_signed_linked_blocks_and_detects_operation_tampering() {
     assert_eq!(automatic.height, 3);
     assert!(automatic.operation_ids.is_empty());
 
-    paths
-        .with_ledger_mut(|ledger| {
-            ledger
-                .operations
-                .get_mut(&governance.operation_id)
-                .unwrap()
-                .payload = serde_json::json!({"tampered": true});
-            Ok(())
-        })
-        .unwrap();
-    let corrupted = service::verify_blockchain(&paths).unwrap();
-    assert!(!corrupted.ok);
-    assert!(corrupted.detail.contains("signed commitment"));
+    let tamper = paths.with_ledger_mut(|ledger| {
+        ledger
+            .operations
+            .get_mut(&governance.operation_id)
+            .unwrap()
+            .payload = serde_json::json!({"tampered": true});
+        Ok(())
+    });
+    assert!(tamper.is_err());
+    let intact = service::verify_blockchain(&paths).unwrap();
+    assert!(intact.ok, "{}", intact.detail);
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -592,31 +624,42 @@ fn node1_replays_candidates_and_excludes_duplicate_network_aliases() {
 }
 
 #[test]
-fn first_block_migrates_operations_from_the_pre_block_ledger() {
-    let root = temp_root("legacy-block-migration");
+fn operation_bodies_are_immutable_after_submission() {
+    let root = temp_root("immutable-operation-body");
     let paths = DataPaths::new(Some(root.clone())).unwrap();
     let password = "legacy-block-password";
     let now = Utc::now().timestamp();
     register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
-    paths
-        .with_ledger_mut(|ledger| {
-            ledger.pending_operation_ids.clear();
-            for operation in ledger.operations.values_mut() {
-                operation.status = OperationStatus::Finalized;
-                operation.block_height = None;
-                operation.signed_operation = None;
-            }
-            Ok(())
-        })
-        .unwrap();
+    let mutation = paths.with_ledger_mut(|ledger| {
+        for operation in ledger.operations.values_mut() {
+            operation.signed_operation = None;
+        }
+        Ok(())
+    });
+    assert!(mutation.is_err());
+    assert_eq!(paths.read_ledger().unwrap().pending_operation_ids.len(), 1);
 
-    let status = service::block_status(&paths, now + 1).unwrap();
-    assert_eq!(status.pending_operation_count, 1);
-    let block = service::produce_node1_block(&paths, "node1", password, false, now + 1).unwrap();
-    assert_eq!(block.operation_ids.len(), 1);
-    let report = service::verify_blockchain(&paths).unwrap();
-    assert!(report.ok, "{}", report.detail);
-    assert_eq!(report.legacy_unverified_operations, 1);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn finalized_blocks_are_append_only() {
+    let root = temp_root("append-only-block");
+    let paths = DataPaths::new(Some(root.clone())).unwrap();
+    let password = "append-only-block-password";
+    let now = Utc::now().timestamp();
+    register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
+    service::produce_node1_block(&paths, "node1", password, false, now + 1).unwrap();
+
+    let mutation = paths.with_ledger_mut(|ledger| {
+        ledger.blocks[0].state_root = format!("state_{}", "0".repeat(64));
+        Ok(())
+    });
+    assert!(mutation.is_err());
+    assert_ne!(
+        paths.read_ledger().unwrap().blocks[0].state_root,
+        format!("state_{}", "0".repeat(64))
+    );
 
     std::fs::remove_dir_all(root).unwrap();
 }

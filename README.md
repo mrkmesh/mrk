@@ -229,7 +229,7 @@ mrk node drain
 mrk node withdraw-service-bond
 ```
 
-`mrk node run` starts the Unix administration Socket before registration. Genesis Node 1 registers on its empty chain. Every later Node first runs `mrk node bootstrap`, then `mrk node register`. A downloaded snapshot is accepted only when both its height and full SHA-256 state root match the operator-supplied checkpoint. Obtain that pair from an independent trusted release, quorum announcement, or comparison with multiple operators—not from the peer serving the snapshot. Peers retain the newest 256 finalized checkpoint snapshots, so a pinned checkpoint remains downloadable while the chain advances; the joining Node catches up from that fixed height after installation. The daemon remembers the peer, forwards its signed registration operation, and continuously downloads and verifies finalized catch-up blocks. It enables its public WSS listener after registration succeeds. All later `mrk node` commands also use that Socket. Public `mrk` queries use
+`mrk node run` starts the Unix administration Socket before registration. Genesis Node 1 registers on its empty chain. Every later Node first runs `mrk node bootstrap`, then `mrk node register`. A downloaded snapshot is accepted only when both its height and full SHA-256 state root match the operator-supplied checkpoint. Obtain that pair from an independent trusted release, quorum announcement, or comparison with multiple operators—not from the peer serving the snapshot. Peers retain the newest 24 scheduled checkpoint snapshots. Automatic snapshots are materialized at most once per hour, while an explicitly requested latest snapshot is retained immediately. A pinned checkpoint therefore remains downloadable while the chain advances; the joining Node catches up from that fixed height after installation. The daemon remembers the peer, forwards its signed registration operation, and continuously downloads and verifies finalized catch-up blocks. It enables its public WSS listener after registration succeeds. All later `mrk node` commands also use that Socket. Public `mrk` queries use
 `--rpc-endpoint relay.example.com` (or `MRK_RPC_ENDPOINT`).
 
 The public Node registry and the connectable Relay set are separate queries:
@@ -251,11 +251,17 @@ retains the complete chain history. Chain state is persisted under
 `~/.mrk/chain.redb`; only the `mrk node run` process opens redb. Other `mrk node`
 commands use the single `~/.mrk/mrk.sock`. One data directory runs exactly one
 `mrk node`; the Socket is not split into per-Node directories. A running `LITE` daemon checks every
-60 seconds and retains the newest 65,536 blocks, operation bodies for the newest
-complete-block suffix targeting 262,144 operations, and at most 1,024 retained
+60 seconds and retains seven days of blocks using the current
+`block-interval-seconds` cadence (for example, 201,600 blocks at 3 seconds),
+every operation body referenced by those retained blocks, and at most 1,024 retained
 operation IDs per account. Pending operations and current state are never
-pruned. The finalized prefix is replaced by a height/hash/time checkpoint and
-redb is compacted after deletion. `FULL` never prunes history.
+pruned. Blocks, immutable operation bodies, operation finality, and account-history
+links are stored in separate redb tables. Block production loads only current
+state, the chain tip, and pending operations; finalized history is read on demand
+for queries, verification, backups, and pruning. The finalized prefix is replaced by a
+height/hash/time checkpoint; logical deletion releases pages for reuse without
+running an expensive whole-database compaction after every prune. `FULL` never
+prunes history.
 
 `mrk node backup` asks the running daemon for a transactionally consistent logical backup. It writes a `0600` JSON file under `~/.mrk/backups/` by default, refuses to overwrite an existing file, and records the chain height, state root, and a checksum over the complete payload. `backup-verify` validates the checksum, metadata, complete chain, and optional pinned state root without changing local state. `restore` is deliberately offline: stop `mrk node run`, supply the expected state root through an independent trusted channel, restore atomically, then run `mrk node doctor` before restarting. Copy backups off-host and rehearse this procedure before operating a Validator.
 
@@ -361,6 +367,8 @@ mrk node --node default block verify
 ```
 
 `mrk node run` automatically produces a block every 10 seconds by default, including empty checkpoint blocks so online state continues to be committed. Node 1 may change the interval from 1 to 300 seconds with the governed `block-interval-seconds` parameter. Manual production rejects empty blocks unless `--allow-empty` is provided.
+
+Multi-Validator consensus uses the same chain interval: a proposer cannot create a block before the previous finalized block timestamp plus `block-interval-seconds`, and every Validator enforces that boundary before voting. Empty and non-empty blocks use the same cadence. A slow consensus round delays finality naturally and never causes catch-up blocks to be produced faster than the configured interval.
 
 All non-Node1 signing keys are rejected in Node 1 producer mode. The active Validator committee takes over only when there are at least 20 eligible Nodes and four Active Validators. If either count falls below its threshold, any unfinished consensus round is discarded and Node 1 resumes block production. Direct Node 1 governance is restored only when the eligible Node count falls below 20.
 
