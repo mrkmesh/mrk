@@ -6,16 +6,15 @@ import StatusBadge from '../components/StatusBadge.vue'
 import EntityValue from '../components/EntityValue.vue'
 import { useQuery } from '../composables/useQuery'
 import { relativeTime } from '../utils/format'
-import type { BlockList, ChainStatus, NodeList, SystemPing, TreasuryStatus } from '../types/rpc'
+import type { BlockList, ChainStatus, NodeList, TreasuryStatus } from '../types/rpc'
 
-interface OverviewData { system: SystemPing; chain: ChainStatus; blocks: BlockList; nodes: NodeList; treasury: TreasuryStatus }
+interface OverviewData { chain: ChainStatus; blocks: BlockList; nodes: NodeList; treasury: TreasuryStatus }
 const query = useQuery<OverviewData>(() => Promise.all([
-  rpc<SystemPing>('system.ping'),
   rpc<ChainStatus>('chain.status'),
   rpc<BlockList>('block.list', { limit: 8 }),
   rpc<NodeList>('node.list', { status: 'ACTIVE', limit: 6 }),
   rpc<TreasuryStatus>('treasury.status'),
-]).then(([system, chain, blocks, nodes, treasury]) => ({ system, chain, blocks, nodes, treasury })))
+]).then(([chain, blocks, nodes, treasury]) => ({ chain, blocks, nodes, treasury })))
 let refreshClock: number | undefined
 onMounted(() => {
   refreshClock = window.setInterval(() => { void query.refresh() }, 5_000)
@@ -42,7 +41,6 @@ function availabilityHint(value: string | null): string | null {
             <span>{{ relativeTime(query.data.value.chain.last_block_at) }}</span>
           </div>
           <div class="metric"><span>Consensus</span><StatusBadge :value="query.data.value.chain.mode" /></div>
-          <div class="metric"><span>Node version</span><b><code>{{ query.data.value.system.node_version }}</code></b></div>
           <div class="metric"><span>Validators</span><b>{{ query.data.value.chain.active_validator_count }}</b></div>
           <div class="metric"><span>Pending</span><b>{{ query.data.value.chain.pending_operation_count }}</b></div>
         </section>

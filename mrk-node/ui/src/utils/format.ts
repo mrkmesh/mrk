@@ -12,6 +12,14 @@ export function dateTime(timestamp: number | null | undefined): string {
   }).format(new Date(timestamp * 1000)) + ' UTC'
 }
 
+export function mrkAmount(baseUnits: string): string {
+  const amount = BigInt(baseUnits)
+  const whole = amount / 100_000_000n
+  const fraction = amount % 100_000_000n
+  if (fraction === 0n) return `${whole} MRK`
+  return `${whole}.${fraction.toString().padStart(8, '0').replace(/0+$/, '')} MRK`
+}
+
 export function relativeTime(timestamp: number | null | undefined): string {
   if (!timestamp) return '—'
   const seconds = timestamp - Math.floor(Date.now() / 1000)

@@ -72,9 +72,9 @@ export interface OperationRecord {
   signature: string
   block_height: number | null
   fee_payer?: string | null
-  fee_charged: string | number
-  fee_burned: string | number
-  fee_to_treasury: string | number
+  fee_charged: string
+  fee_burned: string
+  fee_to_treasury: string
 }
 
 export interface BlockOperations {
