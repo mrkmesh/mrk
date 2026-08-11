@@ -9,6 +9,8 @@ export interface SystemPing {
 export interface ChainStatus {
   mode: string
   height: number
+  burned_base_units: string
+  burned_display: string
   last_block_hash: string | null
   last_block_at: number | null
   pending_operation_count: number

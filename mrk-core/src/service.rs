@@ -529,6 +529,8 @@ pub struct GovernanceTallyView {
 pub struct BlockStatusView {
     pub mode: String,
     pub height: u64,
+    pub burned_base_units: String,
+    pub burned_display: String,
     pub last_block_hash: Option<String>,
     pub last_block_at: Option<i64>,
     pub pending_operation_count: usize,
@@ -8186,6 +8188,7 @@ fn multi_validator_block_signing_payload(block: &BlockRecord) -> MultiValidatorB
 
 pub fn block_status(paths: &DataPaths, now: i64) -> Result<BlockStatusView> {
     let ledger = paths.read_ledger()?;
+    let burned = finalized_burned(&ledger);
     let genesis = ledger
         .genesis_authority
         .clone()
@@ -8213,6 +8216,8 @@ pub fn block_status(paths: &DataPaths, now: i64) -> Result<BlockStatusView> {
             "MULTI_VALIDATOR".to_owned()
         },
         height: chain_height(&ledger),
+        burned_base_units: burned.to_string(),
+        burned_display: format_mrk(burned),
         last_block_hash: chain_tip_hash(&ledger).map(str::to_owned),
         last_block_at: chain_tip_timestamp(&ledger),
         pending_operation_count,
@@ -8232,6 +8237,13 @@ pub fn block_status(paths: &DataPaths, now: i64) -> Result<BlockStatusView> {
         retained_block_count: ledger.blocks.len(),
         retained_operation_count: ledger.operations.len(),
     })
+}
+
+fn finalized_burned(ledger: &LedgerState) -> u128 {
+    ledger
+        .finalized_checkpoint
+        .as_deref()
+        .map_or(0, |checkpoint| checkpoint.burned)
 }
 
 pub fn block_by_height(paths: &DataPaths, height: u64) -> Result<BlockRecord> {
@@ -12257,6 +12269,21 @@ fn node_vesting_reward(node: &NodeRecord) -> Result<u128> {
 mod tests {
     use super::*;
     use crate::model::AccountState;
+
+    #[test]
+    fn burned_total_uses_only_finalized_state() {
+        let mut ledger = LedgerState {
+            burned: 25,
+            ..LedgerState::default()
+        };
+        assert_eq!(finalized_burned(&ledger), 0);
+
+        let mut checkpoint = ledger.clone();
+        checkpoint.burned = 10;
+        checkpoint.finalized_checkpoint = None;
+        ledger.finalized_checkpoint = Some(Box::new(checkpoint));
+        assert_eq!(finalized_burned(&ledger), 10);
+    }
 
     fn reset_epoch_context(ledger: &mut LedgerState) {
         ledger.epoch_contexts.clear();

@@ -43,6 +43,7 @@ function availabilityHint(value: string | null): string | null {
           <div class="metric"><span>Consensus</span><StatusBadge :value="query.data.value.chain.mode" /></div>
           <div class="metric"><span>Validators</span><b>{{ query.data.value.chain.active_validator_count }}</b></div>
           <div class="metric"><span>Pending</span><b>{{ query.data.value.chain.pending_operation_count }}</b></div>
+          <div class="metric"><span>Total burned</span><b>{{ query.data.value.chain.burned_display }}</b></div>
         </section>
 
         <div class="section-grid">
