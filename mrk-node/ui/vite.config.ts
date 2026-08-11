@@ -1,0 +1,22 @@
+import { defineConfig } from 'vite'
+import vue from '@vitejs/plugin-vue'
+
+export default defineConfig({
+  base: '/explorer/',
+  plugins: [vue()],
+  build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+    cssCodeSplit: false,
+    rollupOptions: {
+      output: {
+        entryFileNames: 'assets/app.js',
+        chunkFileNames: 'assets/[name].js',
+        assetFileNames: (assetInfo) =>
+          assetInfo.names.some((name) => name.endsWith('.css'))
+            ? 'assets/app.css'
+            : 'assets/[name][extname]',
+      },
+    },
+  },
+})

@@ -1,0 +1,53 @@
+[package]
+name = "mrk-core"
+version = "0.1.0"
+edition = "2024"
+description = "MRK protocol, storage, consensus, and service core"
+license = "MIT"
+
+[[test]]
+name = "blocks"
+path = "../tests/blocks.rs"
+
+[[test]]
+name = "consensus"
+path = "../tests/consensus.rs"
+
+[[test]]
+name = "core_flow"
+path = "../tests/core_flow.rs"
+
+[[test]]
+name = "governance"
+path = "../tests/governance.rs"
+
+[[test]]
+name = "governance_multi"
+path = "../tests/governance_multi.rs"
+
+[[test]]
+name = "registry"
+path = "../tests/registry.rs"
+
+[[test]]
+name = "traffic_payment"
+path = "../tests/traffic_payment.rs"
+
+[[test]]
+name = "treasury"
+path = "../tests/treasury.rs"
+
+[dependencies]
+base64 = "0.22.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+dirs = "6.0.0"
+libc = "0.2.189"
+redb = "4.1.0"
+ring = "0.17.14"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+url = "2.5.8"
+webpki-roots = "1.0.9"

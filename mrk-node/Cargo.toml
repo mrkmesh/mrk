@@ -1,0 +1,16 @@
+[package]
+name = "mrk-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MRK Node daemon and local administration"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.4", features = ["derive"] }
+libc = "0.2.189"
+mrk-core = { path = "../mrk-core" }
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+url = "2.5.8"

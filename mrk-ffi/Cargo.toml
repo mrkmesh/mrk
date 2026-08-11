@@ -1,0 +1,16 @@
+[package]
+name = "mrk-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C ABI bindings for the MRK Relay SDK"
+publish = false
+
+[lib]
+name = "mrk"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+mrk-core = { path = "../mrk-core" }
+mrk-sdk = { path = "../mrk-sdk" }
+tokio = { version = "1.53.1", features = ["io-util", "rt-multi-thread", "sync", "time"] }

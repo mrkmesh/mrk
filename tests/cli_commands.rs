@@ -17,8 +17,11 @@ impl Drop for ChildGuard {
 }
 
 fn temp_root(label: &str) -> std::path::PathBuf {
-    let random = mrk::crypto::random_bytes::<8>().unwrap();
-    std::env::temp_dir().join(format!("mrk-{label}-{}", mrk::crypto::hex_lower(&random)))
+    let random = mrk_core::crypto::random_bytes::<8>().unwrap();
+    std::env::temp_dir().join(format!(
+        "mrk-{label}-{}",
+        mrk_core::crypto::hex_lower(&random)
+    ))
 }
 
 fn run(binary: &str, root: &std::path::Path, args: &[&str]) -> std::process::Output {
@@ -64,6 +67,12 @@ fn run_mrk_rpc(root: &std::path::Path, port: u16, args: &[&str]) -> std::process
         .env("MRK_KEYSTORE_PASSWORD", "cli-integration-password")
         .output()
         .unwrap()
+}
+
+fn block_was_produced_or_already_finalized(output: &std::process::Output) -> bool {
+    output.status.success()
+        || String::from_utf8_lossy(&output.stderr)
+            .contains("there are no pending operations to include")
 }
 
 fn free_port() -> u16 {
@@ -162,12 +171,42 @@ fn node_init_checks_existing_node_and_rolls_back_invalid_password() {
     );
     assert!(!root.join("nodes/default").exists());
 
-    let initialized = run(env!("CARGO_BIN_EXE_mrk"), &root, &["node", "init"]);
+    let initialized = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "init", "--ledger-id", "acme-devnet-1"],
+    );
     assert!(
         initialized.status.success(),
         "{}",
         String::from_utf8_lossy(&initialized.stderr)
     );
+    let initialized_json: serde_json::Value = serde_json::from_slice(&initialized.stdout).unwrap();
+    assert_eq!(initialized_json["ledger_id"], "acme-devnet-1");
+    let paths = mrk_core::storage::DataPaths::new(Some(root.clone())).unwrap();
+    assert_eq!(paths.read_ledger().unwrap().ledger_id, "acme-devnet-1");
+    assert_eq!(paths.initialize_ledger(None).unwrap(), "acme-devnet-1");
+    drop(paths);
+
+    let rename = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &[
+            "node",
+            "--node",
+            "second",
+            "init",
+            "--ledger-id",
+            "another-devnet-1",
+        ],
+    );
+    assert!(!rename.status.success());
+    assert!(
+        String::from_utf8_lossy(&rename.stderr).contains("cannot be renamed"),
+        "{}",
+        String::from_utf8_lossy(&rename.stderr)
+    );
+    assert!(!root.join("nodes/second").exists());
 
     let duplicate = Command::new(env!("CARGO_BIN_EXE_mrk"))
         .arg("--data-dir")
@@ -186,7 +225,22 @@ fn node_init_checks_existing_node_and_rolls_back_invalid_password() {
         String::from_utf8_lossy(&duplicate.stderr)
     );
 
+    let invalid_root = temp_root("invalid-ledger-id");
+    let invalid_ledger_id = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &invalid_root,
+        &["node", "init", "--ledger-id", "Invalid_Name"],
+    );
+    assert!(!invalid_ledger_id.status.success());
+    assert!(
+        String::from_utf8_lossy(&invalid_ledger_id.stderr).contains("lowercase ASCII letters"),
+        "{}",
+        String::from_utf8_lossy(&invalid_ledger_id.stderr)
+    );
+    assert!(!invalid_root.join("nodes/default").exists());
+
     std::fs::remove_dir_all(root).unwrap();
+    std::fs::remove_dir_all(invalid_root).unwrap();
 }
 
 #[test]
@@ -260,6 +314,24 @@ fn account_and_node_cli_commands_emit_json() {
             .unwrap()
             .starts_with("mrk1")
     );
+    let account_address = account_json["address"].as_str().unwrap();
+    let reward_address = node_json["reward_address"].as_str().unwrap();
+    mrk_core::storage::DataPaths::new(Some(root.clone()))
+        .unwrap()
+        .with_ledger_mut(|ledger| {
+            ledger
+                .accounts
+                .entry(account_address.to_owned())
+                .or_default()
+                .balance = mrk_core::amount::MRK_SCALE;
+            ledger
+                .accounts
+                .entry(reward_address.to_owned())
+                .or_default()
+                .balance = mrk_core::amount::MRK_SCALE;
+            Ok(())
+        })
+        .unwrap();
 
     let port = free_port();
     let daemon = Command::new(env!("CARGO_BIN_EXE_mrk"))
@@ -277,30 +349,21 @@ fn account_and_node_cli_commands_emit_json() {
     let daemon_guard = ChildGuard(daemon);
     wait_for_daemon(&root);
 
-    let register = run(
+    let join = run(
         env!("CARGO_BIN_EXE_mrk"),
         &root,
-        &[
-            "node",
-            "register",
-            "--endpoint",
-            "1.1.1.1",
-            "--price-per-gib",
-            "0.02MRK",
-        ],
+        &["node", "join", "--endpoint", "1.1.1.1"],
     );
     assert!(
-        register.status.success(),
+        join.status.success(),
         "{}",
-        String::from_utf8_lossy(&register.stderr)
+        String::from_utf8_lossy(&join.stderr)
     );
-    let register_json: serde_json::Value = serde_json::from_slice(&register.stdout).unwrap();
-    assert_eq!(register_json["ip_slot"], "v4:1.1.1.1");
-    assert_eq!(register_json["status"], "ACTIVE");
-    assert_eq!(
-        register_json["warmup_until"],
-        register_json["registered_at"]
-    );
+    let join_json: serde_json::Value = serde_json::from_slice(&join.stdout).unwrap();
+    assert_eq!(join_json["ip_slot"], "v4:1.1.1.1");
+    assert_eq!(join_json["status"], "ACTIVE");
+    assert_eq!(join_json["warmup_until"], join_json["registered_at"]);
+    assert_eq!(join_json["price_per_gib"], 1_000_000_000);
     wait_for_health(port);
 
     let balance = run_mrk_rpc(&root, port, &["account", "balance", "--account", "default"]);
@@ -310,7 +373,10 @@ fn account_and_node_cli_commands_emit_json() {
         String::from_utf8_lossy(&balance.stderr)
     );
     let balance_json: serde_json::Value = serde_json::from_slice(&balance.stdout).unwrap();
-    assert_eq!(balance_json["balance"], 0);
+    assert_eq!(
+        balance_json["balance"].as_u64(),
+        Some(mrk_core::amount::MRK_SCALE as u64)
+    );
 
     let treasury = run_mrk_rpc(&root, port, &["treasury", "status"]);
     assert!(
@@ -347,6 +413,20 @@ fn account_and_node_cli_commands_emit_json() {
         governance_json["minimum_decentralized_availability_validators"],
         7
     );
+    let effective_epoch = governance_json["current_epoch_number"].as_u64().unwrap() + 2;
+    let effective_epoch_arg = effective_epoch.to_string();
+
+    let governance_bond_status = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "governance", "bond-status"],
+    );
+    assert!(governance_bond_status.status.success());
+    let governance_bond_json: serde_json::Value =
+        serde_json::from_slice(&governance_bond_status.stdout).unwrap();
+    assert_eq!(governance_bond_json["governance_bond_display"], "0 MRK");
+    assert_eq!(governance_bond_json["required_bond_display"], "10000 MRK");
+    assert_eq!(governance_bond_json["matures_at"], serde_json::Value::Null);
 
     let governance_set = run(
         env!("CARGO_BIN_EXE_mrk"),
@@ -359,6 +439,8 @@ fn account_and_node_cli_commands_emit_json() {
             "probe-validity-seconds",
             "--value",
             "600",
+            "--effective-epoch",
+            &effective_epoch_arg,
         ],
     );
     assert!(
@@ -368,9 +450,31 @@ fn account_and_node_cli_commands_emit_json() {
     );
     let governance_receipt: serde_json::Value =
         serde_json::from_slice(&governance_set.stdout).unwrap();
-    assert_eq!(governance_receipt["action"], "SetParameter");
+    assert_eq!(governance_receipt["action"], "SetParameters");
     assert_eq!(governance_receipt["signer_node_id"], 1);
     assert_eq!(governance_receipt["status"], "PENDING");
+    assert_eq!(
+        governance_receipt["payload"]["effective_epoch"],
+        effective_epoch
+    );
+    assert_eq!(
+        governance_receipt["payload"]["epoch_context_activation"],
+        effective_epoch
+    );
+    let governance_operation_id = governance_receipt["operation_id"].as_str().unwrap();
+
+    let governance_status = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "governance", "status"],
+    );
+    assert!(governance_status.status.success());
+    let governance_status: serde_json::Value =
+        serde_json::from_slice(&governance_status.stdout).unwrap();
+    assert_eq!(
+        governance_status["scheduled_parameter_changes"][&effective_epoch_arg]["probe-validity-seconds"],
+        "600"
+    );
 
     let block_status = run_mrk_rpc(&root, port, &["block", "status"]);
     assert!(block_status.status.success());
@@ -391,10 +495,28 @@ fn account_and_node_cli_commands_emit_json() {
         &["node", "block", "produce"],
     );
     assert!(
-        produced.status.success(),
+        block_was_produced_or_already_finalized(&produced),
         "{}",
         String::from_utf8_lossy(&produced.stderr)
     );
+    let operation_status = run_mrk_rpc(
+        &root,
+        port,
+        &["block", "operation", "status", governance_operation_id],
+    );
+    assert!(operation_status.status.success());
+    let operation_status: serde_json::Value =
+        serde_json::from_slice(&operation_status.stdout).unwrap();
+    let operation_height = operation_status["block_height"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let produced = run_mrk_rpc(
+        &root,
+        port,
+        &["block", "show", "--height", &operation_height],
+    );
+    assert!(produced.status.success());
     let produced_json: serde_json::Value = serde_json::from_slice(&produced.stdout).unwrap();
     assert!(produced_json["height"].as_u64().unwrap() >= 1);
     assert_eq!(produced_json["producer_node_id"], 1);
@@ -405,7 +527,6 @@ fn account_and_node_cli_commands_emit_json() {
             .is_empty()
     );
 
-    let governance_operation_id = governance_receipt["operation_id"].as_str().unwrap();
     let finalized = run_mrk_rpc(
         &root,
         port,
@@ -415,6 +536,39 @@ fn account_and_node_cli_commands_emit_json() {
     let finalized_json: serde_json::Value = serde_json::from_slice(&finalized.stdout).unwrap();
     assert_eq!(finalized_json["status"], "FINALIZED");
     assert!(finalized_json["block_height"].as_u64().unwrap() >= 1);
+
+    let checkpoints = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "block", "checkpoints"],
+    );
+    assert!(checkpoints.status.success());
+    let checkpoints: serde_json::Value = serde_json::from_slice(&checkpoints.stdout).unwrap();
+    let checkpoint_height = checkpoints[0]["height"].as_u64().unwrap();
+    assert!(checkpoint_height <= produced_json["height"].as_u64().unwrap());
+    let checkpoint_height_arg = checkpoint_height.to_string();
+    let checkpoint_block = run_mrk_rpc(
+        &root,
+        port,
+        &["block", "show", "--height", &checkpoint_height_arg],
+    );
+    assert!(checkpoint_block.status.success());
+    let checkpoint_block: serde_json::Value =
+        serde_json::from_slice(&checkpoint_block.stdout).unwrap();
+    assert_eq!(checkpoints[0]["state_root"], checkpoint_block["state_root"]);
+
+    let governance_status = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "governance", "status"],
+    );
+    assert!(governance_status.status.success());
+    let governance_status: serde_json::Value =
+        serde_json::from_slice(&governance_status.stdout).unwrap();
+    assert_eq!(
+        governance_status["scheduled_parameter_changes"][&effective_epoch_arg]["probe-validity-seconds"],
+        "600"
+    );
 
     let create_network = run_mrk_rpc(
         &root,
@@ -439,7 +593,7 @@ fn account_and_node_cli_commands_emit_json() {
         &["node", "block", "produce"],
     );
     assert!(
-        produced.status.success(),
+        block_was_produced_or_already_finalized(&produced),
         "{}",
         String::from_utf8_lossy(&produced.stderr)
     );
@@ -496,14 +650,14 @@ fn account_and_node_cli_commands_emit_json() {
         .spawn()
         .unwrap();
     let pending_path = root.join("networks/team/.client-a.issue.pending.json");
-    for _ in 0..100 {
+    for _ in 0..200 {
         if pending_path.exists() {
             break;
         }
         thread::sleep(Duration::from_millis(50));
     }
     assert!(pending_path.exists());
-    let pending: mrk::storage::PendingMemberIssue =
+    let pending: mrk_core::storage::PendingMemberIssue =
         serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
     for _ in 0..100 {
         let status = run_mrk_rpc(
@@ -542,7 +696,7 @@ fn account_and_node_cli_commands_emit_json() {
         &["node", "block", "produce"],
     );
     assert!(
-        produced.status.success(),
+        block_was_produced_or_already_finalized(&produced),
         "{}",
         String::from_utf8_lossy(&produced.stderr)
     );
@@ -626,6 +780,25 @@ fn account_and_node_cli_commands_emit_json() {
     assert_eq!(verified_json["ok"], true);
     assert!(verified_json["height"].as_u64().unwrap() >= 1);
 
+    let update_price = run(
+        env!("CARGO_BIN_EXE_mrk"),
+        &root,
+        &["node", "update-price", "--price-per-gib", "0.03MRK"],
+    );
+    assert!(
+        update_price.status.success(),
+        "{}",
+        String::from_utf8_lossy(&update_price.stderr)
+    );
+    let update_price_json: serde_json::Value =
+        serde_json::from_slice(&update_price.stdout).unwrap();
+    assert_eq!(update_price_json["status"], "PENDING");
+    assert_eq!(update_price_json["node"]["price_per_gib"], 3_000_000);
+    let status = run(env!("CARGO_BIN_EXE_mrk"), &root, &["node", "status"]);
+    assert!(status.status.success());
+    let status_json: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status_json["price_per_gib"], 3_000_000);
+
     let node_doctor = run(env!("CARGO_BIN_EXE_mrk"), &root, &["node", "doctor"]);
     assert!(!node_doctor.status.success());
     let node_doctor_json: serde_json::Value = serde_json::from_slice(&node_doctor.stdout).unwrap();
@@ -646,7 +819,8 @@ fn account_and_node_cli_commands_emit_json() {
     assert!(daemon_help.status.success());
     let daemon_help = String::from_utf8_lossy(&daemon_help.stdout);
     assert!(daemon_help.contains("init"));
-    assert!(daemon_help.contains("register"));
+    assert!(daemon_help.contains("join"));
+    assert!(daemon_help.contains("update-price"));
     assert!(daemon_help.contains("run"));
     assert!(daemon_help.contains("status"));
     assert!(daemon_help.contains("rewards"));
@@ -657,6 +831,14 @@ fn account_and_node_cli_commands_emit_json() {
     assert!(daemon_help.contains("validator"));
     assert!(daemon_help.contains("consensus"));
     assert!(daemon_help.contains("governance"));
+
+    let block_help = Command::new(env!("CARGO_BIN_EXE_mrk"))
+        .args(["node", "block", "--help"])
+        .output()
+        .unwrap();
+    assert!(block_help.status.success());
+    let block_help = String::from_utf8_lossy(&block_help.stdout);
+    assert!(block_help.contains("checkpoints"));
 
     let client_help = Command::new(env!("CARGO_BIN_EXE_mrk"))
         .arg("--help")
@@ -669,6 +851,14 @@ fn account_and_node_cli_commands_emit_json() {
     assert!(!client_help.contains("consensus"));
     assert!(!client_help.contains("governance"));
     assert!(!client_help.contains("doctor"));
+
+    let governance_set_help = Command::new(env!("CARGO_BIN_EXE_mrk"))
+        .args(["node", "governance", "set", "--help"])
+        .output()
+        .unwrap();
+    assert!(governance_set_help.status.success());
+    let governance_set_help = String::from_utf8_lossy(&governance_set_help.stdout);
+    assert!(governance_set_help.contains("--effective-epoch <EFFECTIVE_EPOCH>"));
 
     let account_help = Command::new(env!("CARGO_BIN_EXE_mrk"))
         .args(["account", "--help"])

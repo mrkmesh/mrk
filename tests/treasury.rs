@@ -1,5 +1,5 @@
 use chrono::Utc;
-use mrk::{
+use mrk_core::{
     amount::{GENESIS_TREASURY_ALLOCATION, MRK_SCALE, NODE_EMISSION_ALLOCATION},
     model::{
         GovernanceProposalAction, GovernanceProposalKind, GovernanceProposalStatus,
@@ -10,8 +10,11 @@ use mrk::{
 };
 
 fn temp_root() -> std::path::PathBuf {
-    let random = mrk::crypto::random_bytes::<8>().unwrap();
-    std::env::temp_dir().join(format!("mrk-treasury-{}", mrk::crypto::hex_lower(&random)))
+    let random = mrk_core::crypto::random_bytes::<8>().unwrap();
+    std::env::temp_dir().join(format!(
+        "mrk-treasury-{}",
+        mrk_core::crypto::hex_lower(&random)
+    ))
 }
 
 fn register(
@@ -20,9 +23,9 @@ fn register(
     password: &str,
     endpoint: &str,
     now: i64,
-) -> mrk::model::NodeRecord {
+) -> mrk_core::model::NodeRecord {
     service::init_node(paths, name, password).unwrap();
-    service::register_node(paths, name, password, endpoint, "0.02MRK", now).unwrap()
+    service::join_node(paths, name, password, endpoint, Some("0.02MRK"), now).unwrap()
 }
 
 fn make_fresh(paths: &DataPaths, now: i64) {
@@ -69,7 +72,9 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
         .with_ledger_mut(|ledger| {
             ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
+            ledger.settings.required_governance_bond = 0;
             ledger.settings.validator_bond = 10;
+            ledger.settings.fee_policy.base_fee_per_unit = 0;
             ledger.settings.heartbeat_grace_seconds = 120;
             ledger.settings.probe_validity_seconds = 300;
             for node in ledger.nodes.values_mut() {
@@ -78,7 +83,7 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
                 node.last_probe_success = Some(now);
                 node.total_eligible_seconds = 180 * 86_400;
             }
-            for node_id in 5..=20 {
+            for node_id in 5..=50 {
                 let mut node = node1.clone();
                 node.node_id = node_id;
                 node.name = format!("node{node_id}");
@@ -106,7 +111,7 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
                     },
                 );
             }
-            ledger.next_node_id = 21;
+            ledger.next_node_id = 51;
             for node_id in 1..=4 {
                 let reward = ledger.nodes[&node_id].reward_address.clone();
                 ledger.accounts.get_mut(&reward).unwrap().balance =
@@ -182,8 +187,8 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
                 .proposals
                 .get_mut(&proposal.proposal_id)
                 .unwrap();
-            for node_id in 5..=20 {
-                let choice = if node_id <= 14 {
+            for node_id in 5..=50 {
+                let choice = if node_id <= 34 {
                     GovernanceVoteChoice::Yes
                 } else {
                     GovernanceVoteChoice::No
@@ -276,7 +281,7 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
             veto_proposal.execute_after = execute_at + 1_000;
             veto_proposal.executed_at = None;
             veto_proposal.timelock_vetoes.clear();
-            for node_id in 2..=7 {
+            for node_id in 2..=17 {
                 veto_proposal.timelock_vetoes.insert(
                     node_id,
                     GovernanceVoteRecord {
@@ -319,7 +324,7 @@ fn genesis_treasury_requires_critical_governance_and_enforces_one_percent_limit(
 
     paths
         .with_ledger_mut(|ledger| {
-            ledger.nodes.get_mut(&20).unwrap().status = NodeStatus::WarmingUp;
+            ledger.nodes.get_mut(&50).unwrap().status = NodeStatus::WarmingUp;
             Ok(())
         })
         .unwrap();

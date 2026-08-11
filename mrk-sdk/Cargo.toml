@@ -1,0 +1,16 @@
+[package]
+name = "mrk-sdk"
+version = "0.1.0"
+edition = "2024"
+description = "Async MRK Relay client SDK"
+license = "MIT"
+
+[dependencies]
+base64 = "0.22.1"
+chrono = { version = "0.4.45", features = ["serde"] }
+mrk-core = { path = "../mrk-core" }
+ring = "0.17.14"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+url = "2.5.8"

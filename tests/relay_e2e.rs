@@ -8,7 +8,7 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::Utc;
-use mrk::{
+use mrk_core::{
     amount::MRK_SCALE,
     consensus::ConsensusWireMessage,
     model::{IpSlotRecord, NodeStatus},
@@ -31,8 +31,11 @@ impl Drop for ChildGuard {
 }
 
 fn temp_root() -> std::path::PathBuf {
-    let random = mrk::crypto::random_bytes::<8>().unwrap();
-    std::env::temp_dir().join(format!("mrk-relay-e2e-{}", mrk::crypto::hex_lower(&random)))
+    let random = mrk_core::crypto::random_bytes::<8>().unwrap();
+    std::env::temp_dir().join(format!(
+        "mrk-relay-e2e-{}",
+        mrk_core::crypto::hex_lower(&random)
+    ))
 }
 
 fn copy_tree(source: &std::path::Path, target: &std::path::Path) {
@@ -102,12 +105,12 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
     let (bob_credential, _) =
         service::issue_member(&paths, "owner", password, "team", "bob", 7, now + 2).unwrap();
     service::init_node(&paths, "node1", password).unwrap();
-    let node = service::register_node(
+    let node = service::join_node(
         &paths,
         "node1",
         password,
         "wss://1.1.1.1/v1/relay",
-        "0.02MRK",
+        Some("0.02MRK"),
         now + 3,
     )
     .unwrap();
@@ -123,18 +126,20 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
     let alice_key = paths
         .read_keyfile(&paths.member_key_path("team", "alice").unwrap())
         .unwrap();
-    let session_id = mrk::crypto::hex_lower(&mrk::crypto::random_bytes::<32>().unwrap());
+    let session_id = mrk_core::crypto::hex_lower(&mrk_core::crypto::random_bytes::<32>().unwrap());
     let authorization_operation = service::sign_public_operation(
         &alice_key,
         password,
         service::PublicOperationSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &paths.read_ledger().unwrap().ledger_id,
             module: "TrafficPayment",
             action: "ReserveSession",
             nonce: 1,
-            valid_until: now + 5 + mrk::model::DEFAULT_OPERATION_VALIDITY_SECONDS,
+            valid_until: now + 5 + mrk_core::model::DEFAULT_OPERATION_VALIDITY_SECONDS,
             payload: serde_json::json!({
-                "network": "team",
+                "network_commitment": network.commitment,
                 "node_id": node.node_id,
                 "sender_member_id": alice_credential.member_id,
                 "receiver_member_id": bob_credential.member_id,
@@ -142,12 +147,13 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
                 "max_amount_base_units": MRK_SCALE.to_string(),
                 "authorization_valid_until": now + 3605,
                 "spending_policy_revision": network.spending_policy.revision,
+                "expected_price_per_gib_base_units": node.price_per_gib.to_string(),
             }),
         },
     )
     .unwrap();
     let authorization_id =
-        mrk::crypto::sha256_id("op", &serde_json::to_vec(&authorization_operation).unwrap());
+        mrk_core::crypto::sha256_id("op", &serde_json::to_vec(&authorization_operation).unwrap());
     service::submit_signed_network_operation(
         &paths,
         &alice_key.public_key,
@@ -215,6 +221,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         .unwrap();
     runtime.block_on(async {
         let fixture_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
             .join("tests")
             .join("fixtures");
         let cert_path = fixture_dir.join("localhost-cert.pem");
@@ -283,6 +290,41 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         .await
         .unwrap();
 
+        let mut rpc_endpoint = url::Url::parse(&endpoint).unwrap();
+        rpc_endpoint.set_path("/v1/rpc");
+        let list_output = tokio::task::block_in_place(|| {
+            Command::new(env!("CARGO_BIN_EXE_mrk"))
+                .arg("--data-dir")
+                .arg(&client_root)
+                .arg("--rpc-endpoint")
+                .arg(rpc_endpoint.as_str())
+                .arg("--rpc-tls-ca")
+                .arg(&ca_path)
+                .arg("--output")
+                .arg("json")
+                .arg("member")
+                .arg("list")
+                .arg("--network")
+                .arg("team")
+                .output()
+        })
+        .unwrap();
+        assert!(
+            list_output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&list_output.stderr)
+        );
+        let online_presence: service::MemberPresenceListView =
+            serde_json::from_slice(&list_output.stdout).unwrap();
+        assert_eq!(online_presence.relay_node_id, node.node_id);
+        assert_eq!(online_presence.members.len(), 2);
+        assert!(
+            online_presence
+                .members
+                .iter()
+                .all(|member| member.online && member.connection_count == 1)
+        );
+
         let (opened, accepted) = tokio::join!(
             alice.open(&bob_credential.member_id, &authorization_id, "e2e"),
             bob.accept()
@@ -312,8 +354,25 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         drop(bob);
         tokio::time::sleep(Duration::from_millis(500)).await;
 
-        let mut rpc_endpoint = url::Url::parse(&endpoint).unwrap();
-        rpc_endpoint.set_path("/v1/rpc");
+        let offline_presence: service::MemberPresenceListView = serde_json::from_value(
+            tokio::task::block_in_place(|| {
+                relay_client::run_rpc_call(
+                    rpc_endpoint.as_str(),
+                    "member.list",
+                    serde_json::json!({"network": "team"}),
+                    false,
+                    Some(&ca_path),
+                )
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            offline_presence
+                .members
+                .iter()
+                .all(|member| !member.online && member.connection_count == 0)
+        );
         let unsettled: Vec<service::UnsettledPaymentView> = serde_json::from_value(
             tokio::task::block_in_place(|| {
                 relay_client::run_rpc_call(
@@ -361,7 +420,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
             .arg("--endpoint")
             .arg(&endpoint)
             .arg("--peer")
-            .arg(&bob_credential.member_id)
+            .arg("bob")
             .arg("--tls-ca")
             .arg(&ca_path)
             .arg("--max-auto-recovery-bytes")
@@ -518,22 +577,22 @@ fn validator_authenticates_and_reads_status_over_consensus_websocket() {
     let password = "consensus-wss-e2e-password";
     let now = Utc::now().timestamp();
     service::init_node(&paths, "node1", password).unwrap();
-    let node1 = service::register_node(
+    let node1 = service::join_node(
         &paths,
         "node1",
         password,
         "wss://1.1.1.1/v1/relay",
-        "0.02MRK",
+        Some("0.02MRK"),
         now,
     )
     .unwrap();
     service::init_node(&paths, "node2", password).unwrap();
-    service::register_node(
+    service::join_node(
         &paths,
         "node2",
         password,
         "wss://8.8.8.8/v1/relay",
-        "0.02MRK",
+        Some("0.02MRK"),
         now,
     )
     .unwrap();
@@ -541,6 +600,7 @@ fn validator_authenticates_and_reads_status_over_consensus_websocket() {
         .with_ledger_mut(|ledger| {
             ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
+            ledger.settings.required_governance_bond = 0;
             ledger.settings.validator_bond = 10;
             ledger.settings.warmup_seconds = 0;
             for node in ledger.nodes.values_mut() {
@@ -677,7 +737,7 @@ fn four_independent_validators_gossip_operation_and_finalize() {
         let name = format!("node{}", index + 1);
         service::init_node(&paths, &name, password).unwrap();
         registered.push(
-            service::register_node(&paths, &name, password, endpoint, "0.02MRK", now).unwrap(),
+            service::join_node(&paths, &name, password, endpoint, Some("0.02MRK"), now).unwrap(),
         );
     }
     let recipient = service::create_local_account(&paths, "recipient", password).unwrap();
@@ -685,6 +745,7 @@ fn four_independent_validators_gossip_operation_and_finalize() {
         .with_ledger_mut(|ledger| {
             ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
+            ledger.settings.required_governance_bond = 0;
             ledger.settings.validator_bond = 10;
             ledger.settings.warmup_seconds = 0;
             ledger.settings.heartbeat_grace_seconds = 120;

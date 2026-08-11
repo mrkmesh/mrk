@@ -1,5 +1,6 @@
 use chrono::Utc;
-use mrk::{
+use mrk_core::{
+    amount::MRK_SCALE,
     crypto::{decrypt_key, sign_bytes},
     model::{
         BlockConsensusMode, ConsensusVote, ConsensusVoteType, IpSlotRecord, NodeStatus,
@@ -23,8 +24,11 @@ struct VoteSigningPayload {
 }
 
 fn temp_root(label: &str) -> std::path::PathBuf {
-    let random = mrk::crypto::random_bytes::<8>().unwrap();
-    std::env::temp_dir().join(format!("mrk-{label}-{}", mrk::crypto::hex_lower(&random)))
+    let random = mrk_core::crypto::random_bytes::<8>().unwrap();
+    std::env::temp_dir().join(format!(
+        "mrk-{label}-{}",
+        mrk_core::crypto::hex_lower(&random)
+    ))
 }
 
 fn register(
@@ -33,9 +37,9 @@ fn register(
     password: &str,
     endpoint: &str,
     now: i64,
-) -> mrk::model::NodeRecord {
+) -> mrk_core::model::NodeRecord {
     service::init_node(paths, name, password).unwrap();
-    service::register_node(paths, name, password, endpoint, "0.02MRK", now).unwrap()
+    service::join_node(paths, name, password, endpoint, Some("0.02MRK"), now).unwrap()
 }
 
 #[test]
@@ -63,6 +67,7 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
         .with_ledger_mut(|ledger| {
             ledger.settings.required_service_bond = 0;
             ledger.settings.governance_min_service_seconds = 0;
+            ledger.settings.required_governance_bond = 0;
             ledger.settings.validator_bond = 10;
             ledger.settings.heartbeat_grace_seconds = 120;
             ledger.settings.probe_validity_seconds = 300;
@@ -74,7 +79,7 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
                     .accounts
                     .get_mut(&node.reward_address)
                     .unwrap()
-                    .balance = 10;
+                    .balance = MRK_SCALE;
             }
             Ok(())
         })
@@ -315,7 +320,7 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
         let owner = paths
             .read_keyfile(
                 &paths
-                    .node_owner_key_path(&format!("node{node_id}"))
+                    .node_reward_key_path(&format!("node{node_id}"))
                     .unwrap(),
             )
             .unwrap();
@@ -325,6 +330,8 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
             &owner,
             password,
             service::PublicOperationSigningRequest {
+                max_fee_base_units: u128::MAX,
+                fee_policy_version: 1,
                 ledger_id: &ledger_id,
                 module: "NetworkRegistry",
                 action: "CreateNetwork",
@@ -338,7 +345,7 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
             },
         )
         .unwrap();
-        conflicting.push(mrk::consensus::PendingOperationEnvelope {
+        conflicting.push(mrk_core::consensus::PendingOperationEnvelope {
             public_key: owner.public_key,
             operation,
         });
@@ -355,7 +362,7 @@ fn four_validator_committee_requires_three_precommits_to_finalize() {
     assert!(service::propose_consensus_block(&paths, "node2", password, now + 36).is_err());
     let next = service::propose_consensus_block(&paths, "node2", password, now + 44).unwrap();
     assert_eq!(next.height, 2);
-    assert_eq!(next.operation_ids.len(), 1);
+    assert_eq!(next.operation_ids.len(), 2);
     assert!(service::submit_consensus_proposal(&lagging_paths, next.clone(), now + 36).is_err());
     assert!(
         service::submit_consensus_proposal(&lagging_paths, next.clone(), now + 44)

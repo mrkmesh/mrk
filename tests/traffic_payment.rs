@@ -1,5 +1,5 @@
 use chrono::Utc;
-use mrk::{
+use mrk_core::{
     amount::{MRK_SCALE, parse_mrk},
     model::{DEFAULT_OPERATION_VALIDITY_SECONDS, RelayDirection},
     relay::{relay_transcript_initial_hash, relay_transcript_next_hash},
@@ -14,12 +14,12 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
     let password = "member-reservation-test-password";
     let now = Utc::now().timestamp();
     let config = service::init_node(&paths, "node1", password).unwrap();
-    let node = service::register_node(
+    let node = service::join_node(
         &paths,
         "node1",
         password,
         "wss://1.1.1.1/v1/relay",
-        "0.02MRK",
+        Some("0.02MRK"),
         now,
     )
     .unwrap();
@@ -47,13 +47,15 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
         &owner,
         password,
         service::PublicOperationSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &paths.read_ledger().unwrap().ledger_id,
             module: "NetworkEscrow",
             action: "SetSpendingPolicy",
             nonce: owner_nonce,
             valid_until: now + 5 + DEFAULT_OPERATION_VALIDITY_SECONDS,
             payload: serde_json::json!({
-                "network": "team",
+                "network_commitment": network.commitment,
                 "revision": network.spending_policy.revision + 1,
                 "enabled": true,
                 "max_session_amount_base_units": parse_mrk("0.5MRK").unwrap().to_string(),
@@ -77,13 +79,15 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
             &alice_key,
             password,
             service::PublicOperationSigningRequest {
+                max_fee_base_units: u128::MAX,
+                fee_policy_version: 1,
                 ledger_id: &paths.read_ledger().unwrap().ledger_id,
                 module: "TrafficPayment",
                 action: "ReserveSession",
                 nonce,
                 valid_until: submitted_at + DEFAULT_OPERATION_VALIDITY_SECONDS,
                 payload: serde_json::json!({
-                    "network": "team",
+                    "network_commitment": network.commitment,
                     "node_id": node.node_id,
                     "sender_member_id": alice.member_id,
                     "receiver_member_id": bob.member_id,
@@ -91,6 +95,7 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
                     "max_amount_base_units": parse_mrk("1MRK").unwrap().to_string(),
                     "authorization_valid_until": submitted_at + 3600,
                     "spending_policy_revision": network.spending_policy.revision,
+                    "expected_price_per_gib_base_units": paths.read_ledger().unwrap().nodes[&node.node_id].price_per_gib.to_string(),
                 }),
             },
         )
@@ -99,7 +104,7 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
     let first = reserve(1, 0x11, now + 6);
     let first_id = service::submit_consensus_operation(
         &paths,
-        mrk::consensus::PendingOperationEnvelope {
+        mrk_core::consensus::PendingOperationEnvelope {
             public_key: alice_key.public_key.clone(),
             operation: first,
         },
@@ -111,11 +116,12 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
     assert_eq!(first.payer_address, owner.address);
     assert_eq!(first.initiator_member_id, alice.member_id);
     assert_eq!(first.spending_policy_revision, 2);
+    assert_eq!(first.price_per_gib, parse_mrk("0.02MRK").unwrap());
 
     let second = reserve(2, 0x22, now + 7);
     let second_id = service::submit_consensus_operation(
         &paths,
-        mrk::consensus::PendingOperationEnvelope {
+        mrk_core::consensus::PendingOperationEnvelope {
             public_key: alice_key.public_key.clone(),
             operation: second,
         },
@@ -126,10 +132,10 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
     assert_eq!(second.max_amount, parse_mrk("0.25MRK").unwrap());
 
     let exhausted = reserve(3, 0x33, now + 8);
-    let exhausted_id = mrk::crypto::sha256_id("op", &serde_json::to_vec(&exhausted).unwrap());
+    let exhausted_id = mrk_core::crypto::sha256_id("op", &serde_json::to_vec(&exhausted).unwrap());
     let error = service::submit_consensus_operation(
         &paths,
-        mrk::consensus::PendingOperationEnvelope {
+        mrk_core::consensus::PendingOperationEnvelope {
             public_key: alice_key.public_key.clone(),
             operation: exhausted,
         },
@@ -145,11 +151,30 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
             .contains_key(&exhausted_id)
     );
 
+    let stale_quote = reserve(3, 0x44, now + 9);
+    service::update_node_price(&paths, "node1", password, "0.03MRK", now + 8).unwrap();
+    let stale_quote_error = service::submit_consensus_operation(
+        &paths,
+        mrk_core::consensus::PendingOperationEnvelope {
+            public_key: alice_key.public_key.clone(),
+            operation: stale_quote,
+        },
+        now + 9,
+    )
+    .unwrap_err();
+    assert!(stale_quote_error.to_string().contains("price changed"));
+    assert_eq!(
+        service::payment_authorization(&paths, &first_id)
+            .unwrap()
+            .price_per_gib,
+        parse_mrk("0.02MRK").unwrap()
+    );
+
     let history = service::payment_history(&paths, "team", Some("alice"), 20).unwrap();
     assert_eq!(history.authorizations.len(), 2);
     assert_eq!(history.total_reserved, parse_mrk("0.75MRK").unwrap());
     assert_eq!(history.total_settled, 0);
-    assert_eq!(history.fund_balance, parse_mrk("1.25MRK").unwrap());
+    assert_eq!(history.fund_balance, parse_mrk("1.248MRK").unwrap());
 
     service::produce_node1_block(&paths, "node1", password, false, now + 9).unwrap();
     for (direction, sender, receiver, timestamp) in [
@@ -208,14 +233,14 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
         service::network_by_alias(&paths, "team")
             .unwrap()
             .escrow_balance,
-        parse_mrk("1.75MRK").unwrap()
+        parse_mrk("1.748MRK").unwrap()
     );
 
     let reclaim_at = second.claim_until + 1;
     let replacement = reserve(3, 0x44, reclaim_at);
     let replacement_id = service::submit_consensus_operation(
         &paths,
-        mrk::consensus::PendingOperationEnvelope {
+        mrk_core::consensus::PendingOperationEnvelope {
             public_key: alice_key.public_key.clone(),
             operation: replacement,
         },
@@ -235,7 +260,7 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
         service::network_by_alias(&paths, "team")
             .unwrap()
             .escrow_balance,
-        parse_mrk("1.5MRK").unwrap()
+        parse_mrk("1.497MRK").unwrap()
     );
 
     paths
@@ -271,17 +296,17 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
         service::network_by_alias(&paths, "team")
             .unwrap()
             .escrow_balance,
-        parse_mrk("2MRK").unwrap()
+        parse_mrk("1.997MRK").unwrap()
     );
 
     std::fs::remove_dir_all(root).unwrap();
 }
 
 fn temp_root() -> std::path::PathBuf {
-    let random = mrk::crypto::random_bytes::<8>().unwrap();
+    let random = mrk_core::crypto::random_bytes::<8>().unwrap();
     std::env::temp_dir().join(format!(
         "mrk-traffic-payment-{}",
-        mrk::crypto::hex_lower(&random)
+        mrk_core::crypto::hex_lower(&random)
     ))
 }
 
@@ -292,12 +317,12 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let password = "traffic-payment-test-password";
     let now = Utc::now().timestamp();
     let config = service::init_node(&paths, "node1", password).unwrap();
-    let node = service::register_node(
+    let node = service::join_node(
         &paths,
         "node1",
         password,
         "wss://1.1.1.1/v1/relay",
-        "0.02MRK",
+        Some("0.02MRK"),
         now,
     )
     .unwrap();
@@ -322,18 +347,20 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let alice_key = paths
         .read_keyfile(&paths.member_key_path("team", "alice").unwrap())
         .unwrap();
-    let session_id = mrk::crypto::hex_lower(&mrk::crypto::random_bytes::<32>().unwrap());
+    let session_id = mrk_core::crypto::hex_lower(&mrk_core::crypto::random_bytes::<32>().unwrap());
     let authorization_operation = service::sign_public_operation(
         &alice_key,
         password,
         service::PublicOperationSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &paths.read_ledger().unwrap().ledger_id,
             module: "TrafficPayment",
             action: "ReserveSession",
             nonce: 1,
             valid_until: now + 5 + DEFAULT_OPERATION_VALIDITY_SECONDS,
             payload: serde_json::json!({
-                "network": "team",
+                "network_commitment": network.commitment,
                 "node_id": node.node_id,
                 "sender_member_id": alice.member_id,
                 "receiver_member_id": bob.member_id,
@@ -341,12 +368,13 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
                 "max_amount_base_units": MRK_SCALE.to_string(),
                 "authorization_valid_until": now + 3605,
                 "spending_policy_revision": network.spending_policy.revision,
+                "expected_price_per_gib_base_units": node.price_per_gib.to_string(),
             }),
         },
     )
     .unwrap();
     let authorization_id =
-        mrk::crypto::sha256_id("op", &serde_json::to_vec(&authorization_operation).unwrap());
+        mrk_core::crypto::sha256_id("op", &serde_json::to_vec(&authorization_operation).unwrap());
     paths
         .with_ledger_mut(|ledger| {
             ledger
@@ -359,7 +387,7 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         .unwrap();
     let unfunded_submission = service::submit_consensus_operation(
         &paths,
-        mrk::consensus::PendingOperationEnvelope {
+        mrk_core::consensus::PendingOperationEnvelope {
             public_key: alice_key.public_key.clone(),
             operation: authorization_operation.clone(),
         },
@@ -409,7 +437,7 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         assert_eq!(status.session_id, session_id);
         assert!(matches!(
             status.status,
-            mrk::model::OperationStatus::Pending
+            mrk_core::model::OperationStatus::Pending
         ));
         assert!(status.authorization.is_none());
     }
@@ -444,7 +472,7 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let finalized_status = service::payment_authorization_status(&paths, &session_id).unwrap();
     assert!(matches!(
         finalized_status.status,
-        mrk::model::OperationStatus::Finalized
+        mrk_core::model::OperationStatus::Finalized
     ));
     assert!(finalized_status.authorization.is_some());
     assert!(
@@ -534,7 +562,8 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let before = service::balance(&paths, &config.reward_address)
         .unwrap()
         .balance;
-    service::submit_traffic_settlement(
+    let ledger_before = paths.read_ledger().unwrap();
+    let settlement_id = service::submit_traffic_settlement(
         &paths,
         "node1",
         password,
@@ -547,7 +576,17 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let after = service::balance(&paths, &config.reward_address)
         .unwrap()
         .balance;
-    assert_eq!(after - before, expected);
+    let protocol_fee = expected / 100;
+    let treasury_fee = protocol_fee / 2;
+    let burned_fee = protocol_fee - treasury_fee;
+    assert_eq!(after - before, expected - protocol_fee);
+    let ledger_after = paths.read_ledger().unwrap();
+    assert_eq!(ledger_after.treasury - ledger_before.treasury, treasury_fee);
+    assert_eq!(ledger_after.burned - ledger_before.burned, burned_fee);
+    let settlement = &ledger_after.operations[&settlement_id];
+    assert_eq!(settlement.fee_charged, protocol_fee);
+    assert_eq!(settlement.fee_to_treasury, treasury_fee);
+    assert_eq!(settlement.fee_burned, burned_fee);
     let authorization = service::payment_authorization(&paths, &authorization_id).unwrap();
     assert_eq!(authorization.settled_amount, expected);
     assert_eq!(authorization.reserved_remaining, MRK_SCALE - expected);
@@ -673,6 +712,8 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         &owner,
         password,
         service::PublicOperationSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &paths.read_ledger().unwrap().ledger_id,
             module: "TrafficPayment",
             action: "Refund",
@@ -682,10 +723,11 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         },
     )
     .unwrap();
-    let early_refund_id = mrk::crypto::sha256_id("op", &serde_json::to_vec(&early_refund).unwrap());
+    let early_refund_id =
+        mrk_core::crypto::sha256_id("op", &serde_json::to_vec(&early_refund).unwrap());
     let error = service::submit_consensus_operation(
         &paths,
-        mrk::consensus::PendingOperationEnvelope {
+        mrk_core::consensus::PendingOperationEnvelope {
             public_key: owner.public_key.clone(),
             operation: early_refund,
         },
@@ -703,6 +745,8 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
         &owner,
         password,
         service::PublicOperationSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &paths.read_ledger().unwrap().ledger_id,
             module: "TrafficPayment",
             action: "Refund",

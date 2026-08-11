@@ -217,19 +217,25 @@ NodeRecord {
   region
   service_bond
   service_bond_unlock_at
+  governance_bond
+  governance_bonded_at
+  governance_exit_requested_at
+  governance_bond_unlock_at
   registered_at
   warmup_until
   status
 }
 ```
 
-节点必须控制 WSS 域名及其 TLS 证书，但不由操作者手工填写公网 IP。Registry 从 WSS Endpoint 的 DNS 解析结果自动选择候选 `reward_ip`，运行时重新解析校验，外部 Probe 再确认该地址确实可达。双栈域名优先选择公网 IPv4；没有公网 IPv4 时选择规范排序后的首个公网 IPv6。公网 IPv4 按完整地址形成槽位，IPv6 按 `/64` 前缀形成槽位；同一槽位最多一个 Node 获得在线奖励、治理和 Validator 资格。Registry 可保存签名元数据的 URI/哈希，避免每次更新价格和容量都产生 MSL 状态操作；所有元数据必须由节点身份密钥签名。
+节点必须控制 WSS 域名及其 TLS 证书，但不由操作者手工填写公网 IP。规范化后的 WSS Endpoint 在所有尚未 `EXITED` 的 Node 之间唯一，注册和 Reward IP 更新都在确定性状态转换中拒绝与其他 Node 冲突的 Endpoint；原 Node 退出终局后才能重用。Registry 从 WSS Endpoint 的 DNS 解析结果自动选择候选 `reward_ip`，运行时重新解析校验，外部 Probe 再确认该地址确实可达。双栈域名优先选择公网 IPv4；没有公网 IPv4 时选择规范排序后的首个公网 IPv6。公网 IPv4 按完整地址形成槽位，IPv6 按 `/64` 前缀形成槽位；同一槽位最多一个 Node 获得在线奖励、治理和 Validator 资格。Registry 可保存签名元数据的 URI/哈希，避免每次更新价格和容量都产生 MSL 状态操作；所有元数据必须由节点身份密钥签名。
 
 多个外部 Probe 必须使用声明的 `reward_ip` 直接发起 WSS 连接，同时携带节点域名的 TLS SNI，确认域名、证书、Node 签名和公网地址属于同一服务。不同端口、域名、进程或容器不能绕过槽位唯一性；共享 CDN、共享反向代理或共享 NAT 只能获得一个槽位。
 
 Availability 有显式且受状态根保护的两阶段信任模型。Active Validator 少于 7 个时为 `NODE1_TRUSTED`，协议绝对信任 Node 1 的一票证明并允许 Node 1 自证；在 Epoch 边界拥有至少 7 个 Active Validator 后切换为 `MULTI_VALIDATOR`，默认 Primary 5 选 3并禁止目标自证。委员会再次低于 7 席时自动回退到 `NODE1_TRUSTED`，恢复到至少 7 席后可再次进入 `MULTI_VALIDATOR`。首次激活时间和 Epoch 作为历史记录保留，后续切换不会覆盖。
 
 去中心化阶段的 Probe Challenge 和检查时刻来自验证者 Owner Key 对 Ledger、Epoch、Slot、目标、验证者及 `PRIMARY/AUDIT` 角色的签名 Ticket。目标在收到网络请求前不能预测 Ticket。默认 5% Slot 在至少 9 个 Active Validator 时额外选择与目标及 Primary 集合互不重叠的 3 个 Auditor，并要求 2 票；被审计 Slot 只有同时达到 Primary 和 Audit 法定票数才记账。单次网络失败不触发罚没；连续达到治理阈值仍缺少终局成功证明时，状态机才罚没 Service Bond。Validator Bond 仍只应由双签等密码学冲突证据处罚。
+
+每个 Epoch 保存不可变的 Availability 参数、模式和 Validator 集合，Slot 使用 Epoch 起点相对编号并以 `(epoch, node_id, slot)` 唯一标识。Epoch 边界只关闭旧 Epoch 并启动新 Epoch；旧 Epoch 保留 30 秒接收已签发 Ticket 的终局证明，随后才按独立的 Node Seconds 分桶结算。治理可以在同一提案中原子修改多个参数，全部交叉约束在 Settings 副本上通过后才写入，新的 Epoch Context 从下一边界整体采用。
 
 上述状态结构、Ticket 域和 `mrk-probe-v1` Payload 属于尚未正式发布的协议版本 1。IP Slot 所有权、Reward IP 更新以及退出释放均属于 v1 发布前的确定性区块状态转换。发布前可直接调整协议及磁盘格式，不提供早期开发数据的兼容或静默迁移；已有测试数据应重建，或通过显式可信 Bootstrap 替换。
 
@@ -261,15 +267,15 @@ Indexer 可以缓存这些终局结果并附加区域、延迟等部署数据，
 4. 转发 `DATA`，执行限流和背压，累计可计费 payload 字节。
 5. 定期请求付款凭证，保留每个会话最新有效凭证。
 
-Owner 签署 `DrainNode` 后先进入 `DRAINING`，该操作所在区块终局时确定性转为 `EXITED` 并释放 IP Slot。已经归属的 `claimable_reward` 保留，尚未归属的线性释放余额退回 Treasury。由奖励形成的 Service Bond 从终局时间起默认锁定 30 天，之后由 Owner 签署 `WithdrawServiceBond` 转入 Reward 账户。若 Node 是 Validator，必须先退出委员会并取回 Validator Bond。
+Owner 签署 `DrainNode` 后先进入 `DRAINING`，该操作所在区块终局时确定性转为 `EXITED` 并释放 IP Slot。已经归属的 `claimable_reward` 保留，尚未解锁的 Vesting Bucket 余额退回 Treasury。由奖励形成的 Service Bond 从终局时间起默认锁定 30 天，之后由 Owner 签署 `WithdrawServiceBond` 转入 Reward 账户。若 Node 是 Validator 或持有 Governance Bond，必须先分别退出并取回对应 Bond。
 
-连续 7 天没有新的终局 Availability 成功证明属于可客观重放的长期离线。下一终局区块会强制该 Node 退出并释放 IP Slot，将 Service Bond 与尚未归属的线性奖励一并转入 Treasury，且不建立 Bond 解锁时间；已经归属的奖励不罚没。阈值由 Critical 参数 `offline-slash-seconds` 控制，本机 Heartbeat 不作为证据。没有终局区块时协议时间不推进，罚没只能在共识恢复后执行。
+连续 7 天没有新的终局 Availability 成功证明属于可客观重放的长期离线。已有成功证明时从最近一次证明计时，尚无成功证明时从 `registered_at` 计时，避免遗失 Owner Key 的未验证登记永久占用 IP Slot。下一终局区块会强制该 Node 退出并释放槽位，将 Service Bond 与尚未归属的线性奖励一并转入 Treasury，且不建立 Bond 解锁时间；已经归属的奖励不罚没。阈值由 Critical 参数 `offline-slash-seconds` 控制，本机 Heartbeat 不作为证据。IP 重用冷却默认关闭，槽位在退出终局后可立即重用，治理仍可按需调高。没有终局区块时协议时间不推进，罚没只能在共识恢复后执行。
 
 ### 5.4 Validator 委员会与共识接口
 
-Relay Node 和 Validator 是同一个 `node_id` 的两种职责。正常 Relay 不自动获得出块权；达到治理资格后，Node 可用已经获得的 `50,000 MRK` 锁定 Validator Bond，进入候选池。Active Committee 最多 31 席；候选不超过 31 时全员进入，超过时每个 Epoch 确定性轮换至多 10 席，保证至少 21 席连续性。
+Relay Node 和 Validator 是同一个 `node_id` 的两种职责。正常 Relay 不自动获得出块权；达到治理资格后，Node 可用已经获得的 `50,000 MRK` 锁定 Validator Bond，进入候选池。Active Committee 最多 31 席；候选不超过 31 时全员进入，超过时按照 Critical 治理参数 `validator-rotation-interval-epochs` 指定的 Epoch 间隔确定性轮换，每次至多 10 席，保证至少 21 席连续性。间隔默认 1；不合格席位清退和低于最小席位数的恢复仍在下一 Epoch 边界立即执行。
 
-委员会只有达到 4 个 Active Validator 才接管出块。少于 4 个时始终由 Node 1 出块；这不会改变治理边界，20 个 Governance-Eligible Node 以上仍必须通过分布式提案投票。
+委员会只有达到 4 个 Active Validator 且存在至少 20 个 Governance-Eligible Node 时才接管出块。少于 4 个时始终由 Node 1 出块；这不会改变治理边界。20 至 49 个治理合格 Node 时 Standard 提案投票与 Node 1 直接治理并存，达到 50 个时 Node 1 直接治理关闭并启用 Critical 提案。
 
 共识使用独立连接，不复用成员转发通道：
 
@@ -300,11 +306,11 @@ Sec-WebSocket-Protocol: mrk.consensus.v1
 
 Genesis 固定把 5 亿 MRK 铸入无私钥 Treasury；Genesis 之后，新增 MRK 只有“合格节点在线时长”一个释放渠道。注册、用户身份、流量、连接数、Validator 出批次、治理或 Treasury 支出均不能继续铸币。流量付款和国库支出只转移已有 MRK；Relay 与客户端即使合谋制造虚假流量，也不能扩大 Epoch 发行预算。
 
-新 Node 不需要预先持有 MRK。除 Genesis Node 1 外，注册时按当时的 `warmup-seconds` 固化 `warmup_until`；默认考察期 1 天，Critical 治理可在 0 到 365 天范围修改，但只影响修改后注册的 Node。Node 1 注册后立即为 `ACTIVE`，且 `warmup_until = registered_at`。节点完成预热后，每个 60 秒 Availability Slot 由验证节点按照秘密 Owner-signed Ticket 规定的时刻直连登记 `reward_ip` 并验证 Endpoint TLS 与 Relay Key 签名。少于 7 个 Active Validator 时绝对信任 Node 1 的一票证明并允许自证；达到至少 7 个 Active Validator 的 Epoch 边界后切换为默认 Primary 5 选 3，跌破门槛时自动回退。5% Slot 在至少 9 席时再执行 Auditor 3 选 2。达到全部所需法定票数的 Slot 才累计 Node Seconds，最初获得的奖励先形成 Service Bond；扣除 Bond 后的奖励默认 10% 立即可领取、90% 在 180 天内线性释放，并且只有最终确认区块跨越 Epoch 边界时才推进释放状态。奖励查询保持只读，领取只转移已经最终确认的可领取余额。`reward-immediate-bps` 与 `reward-vesting-seconds` 都是下一 Epoch 快照生效的 Critical 治理参数。所有普通 Node 使用相同释放公式，没有早期节点额外奖励。Active Validator 在 Epoch 检查点签名率达到 95% 时使用 `1.25×` Node Seconds 权重；加成只改变固定预算的分配，不增加发行总额。
+新 Node 不需要预先持有 MRK。除 Genesis Node 1 外，注册时按当时的 `warmup-seconds` 固化 `warmup_until`；默认考察期 1 天，Critical 治理可在 0 到 365 天范围修改，不追溯改写已固定的考察终点。Node 1 注册后立即为 `ACTIVE`，且 `warmup_until = registered_at`。Node 1 更换 Reward IP 时，少于 50 个 Governance-Eligible Node 则跳过时间考察，达到 50 个后恢复普通 `warmup-seconds`；无论时长是否为 0，新 IP 均须先完成一次有效 Availability Probe 才恢复 `ACTIVE`。节点完成预热后，每个 60 秒 Availability Slot 由验证节点按照秘密 Owner-signed Ticket 规定的时刻直连登记 `reward_ip` 并验证 Endpoint TLS 与 Relay Key 签名。少于 7 个 Active Validator 时绝对信任 Node 1 的一票证明并允许自证；达到至少 7 个 Active Validator 的 Epoch 边界后切换为默认 Primary 5 选 3，跌破门槛时自动回退。5% Slot 在至少 9 席时再执行 Auditor 3 选 2。达到全部所需法定票数的 Slot 才累计 Node Seconds，最初获得的奖励先形成 Service Bond；扣除 Bond 后的奖励默认 25% 立即可领取，75% 按累计线性目标拆成每日增量，并向上量化到以 Genesis 时间为基准的 12 小时解锁边界。同一 Node、同一解锁时间的增量合并成一个 Vesting Bucket，只有最终确认区块跨越解锁边界时才进入可领取余额。奖励查询保持只读，领取只转移已经最终确认的可领取余额。`reward-immediate-bps` 与 `reward-vesting-seconds` 都是下一 Epoch 快照生效的 Critical 治理参数。Node 1 单签出块模式下，Genesis Node 1 使用 `2.00×` Node Seconds 权重；多 Validator 出块模式取消，回退单签后的下一 Epoch 自动恢复，且不与 Validator 加成叠加。Active Validator 在 Epoch 检查点签名率达到 95% 时使用 `1.25×` Node Seconds 权重；加成只改变固定预算的分配，不增加发行总额。
 
 ### 6.2 Genesis 国库
 
-Genesis 将 5 亿 MRK 直接记入状态机内的 Treasury 余额，不生成国库私钥或普通账户。国库治理只计算累计合格运行满 180 天的成熟 Node，且至少需要 20 个成熟 Node 和 4 个 Active Validator 才能创建 Critical `TreasurySpend`。Node Power 只来自累计合格运行天数（180 天封顶），不受 MRK 或 Validator Bond 影响；单 Node 上限为动态 `max(1%, 1/N)`。
+Genesis 将 5 亿 MRK 直接记入状态机内的 Treasury 余额，不生成国库私钥或普通账户。国库治理只计算累计合格运行满 180 天的成熟 Node，且至少需要 50 个成熟 Node 和 4 个 Active Validator 才能创建 Critical `TreasurySpend`。Node Power 只来自累计合格运行天数（180 天封顶），不受 MRK 或 Validator Bond 影响；单 Node 上限为动态 `max(1%, 1/N)`。
 
 提案必须同时取得成熟 Node 快照 Power 至少 `2/3` YES 和 Validator 快照至少 `2/3` YES，经过 14 天投票和 30 天时间锁。时间锁期间超过 `1/3` 成熟 Node 快照 Power 的签名 Veto 会取消提案。创建和执行时均检查单笔不超过当前国库 1%、滚动 90 天累计不超过 2%、滚动 365 天不超过 5%。执行由状态机直接扣减 Treasury、增加收款地址余额，不能调用铸币入口。
 
@@ -410,6 +416,7 @@ mrk network policy set --network team --max-session-amount 1MRK \
   --max-member-reserved 10MRK --max-node-price-per-gib 100MRK
 mrk member issue --network team --name client-a
 mrk member show --network team --name client-a
+mrk member list --network team --rpc-endpoint wss://relay.example.com:9443/v1/rpc
 mrk member revoke --network team --serial 42
 
 mrk payment status <AUTHORIZATION_ID_OR_SESSION_ID>
@@ -425,7 +432,11 @@ Operation 写入私有 pending 文件；只有 Operation 终局且链上 Member 
 匹配时才原子提升为正式文件。超时保留 pending 供同一命令恢复，Rejected/Expired 清理 pending，
 并发同名签发不会覆盖密钥。
 
-成员侧把不透明字节流接到 stdin/stdout。接收方省略 `--peer` 并接受第一个入站通道；发起方指定目标随机 `member_id`：
+`member list` 从终局链状态列出完整 Member 注册表，并与 `--rpc-endpoint` 指向 Relay Node 的
+内存连接索引合并。`ONLINE/OFFLINE` 只描述 `observed_at` 时该 Relay 上的实时 Presence，不写链，
+也不代表 Member 是否连接到其他 Relay；RPC 不返回来源 IP、连接 ID 或通道信息。
+
+成员侧把不透明字节流接到 stdin/stdout。接收方省略 `--peer` 并接受第一个入站通道；发起方可指定目标 Member 名称，CLI 通过 Node RPC 将其解析为链上随机 `member_id`。为兼容已有脚本，`--peer` 仍直接接受 `member_id`：
 
 ```text
 mrk pipe --network team --member client-b \
@@ -433,7 +444,7 @@ mrk pipe --network team --member client-b \
 
 mrk pipe --network team --member client-a \
   --endpoint relay.example.com \
-  --peer <CLIENT_B_MEMBER_ID>
+  --peer client-b
 ```
 
 通道建立后，双方使用成员 Ed25519 密钥认证临时 X25519 密钥交换，并以两个独立的 AES-256-GCM 方向密钥端到端加密全部 stdin 数据，不支持明文降级。Relay 继续把 `DATA` payload 当作不透明字节进行转发、流量哈希和计费，因此无法读取内容，但仍可观察成员标识、密文长度和传输时序；密钥交换与 AEAD 开销计入实际 Relay 流量。
@@ -445,14 +456,14 @@ mrk pipe --network team --member client-a \
 ### Relay
 
 ```text
-mrk node init --lite
+mrk node init --lite --ledger-id mrk-devnet-1
 mrk node run --listen 0.0.0.0:8787
 mrk node bootstrap --peer seed.example.com \
   --checkpoint-height 12345 \
   --checkpoint-root state_<64-lowercase-hex>
-mrk node register --endpoint relay.example.com \
-  --price-per-gib 0.02MRK
+mrk node join --endpoint relay.example.com
 mrk node update-reward-ip --endpoint new-relay.example.com
+mrk node update-price --price-per-gib 0.03MRK
 mrk node status
 mrk node backup
 mrk node backup-verify ~/.mrk/backups/mrk-HEIGHT-TIME.json --expected-state-root state_...
@@ -466,10 +477,17 @@ mrk node withdraw-service-bond
 
 启动顺序固定为先 `init`，再启动常驻 `run`。Genesis Node 1 可直接 `register`；其余 Node 必须先执行 `bootstrap`，再 `register`。Bootstrap 通过公开 WSS 下载终局检查点，但只有完整 `state_` SHA-256 根与操作者从独立可信渠道取得的固定值一致才原子安装；不能把提供快照的同一 Peer 当成根的信任来源。守护进程保存 Bootstrap Peer，把本地签名注册 Operation 提交给它，并持续拉取公开 Catch-up 数据；每次安装仍验证链连续性、委员会连续、Commit Certificate、Operation 签名和最终状态根。落后超过 4,096 Block 或越过 Peer 的裁剪边界时必须重新取得并显式固定更新的检查点。`run` 在未注册阶段只监听本地 Unix Socket；注册成功后才启用公网 WSS Listener。此后全部 `mrk node` 管理命令都经该 Socket 执行。
 
+`mrk node update-price` 由 Node Owner 签署 `NodeRegistry.UpdatePrice`，共识状态始终保存明确的 `u128 price_per_gib`。新报价只用于之后创建的 Payment Authorization；已有授权继续使用创建时固定的报价。`ReserveSession` 必须同时签署 `expected_price_per_gib_base_units`，执行时若 Node 报价已变化则拒绝授权，不会静默采用新价。价格更新不修改 Endpoint、Reward IP、IP Slot、Warmup 或 Probe 状态。
+
+`mrk node join` 的 `--price-per-gib` 可选。省略时，从当前共识账本中只选取 `ACTIVE`、仍持有有效 IP Slot 且 Probe 新鲜的 Node，按 `price_per_gib` 排序取中位数；偶数样本取中间两个基础单位的平均值并向下取整，空样本使用 `10MRK/GiB`。该结果在注册签名前计算，`RegisterNode` 仍写入唯一明确的基础单位整数；显式参数总是覆盖默认值。
+
 Node 只定义 `LITE` 与 `FULL` 两种存储模式。`mrk node init --lite` 创建
 `LITE` Node；不带该参数的 `mrk node init` 创建 `FULL` Node。模式写入本地
 Node 配置并由 `mrk node status` 显示，不允许运行时静默切换。`LITE` 的目标是
 只保留当前状态、已验证检查点和有界的近期历史；`FULL` 保留完整链历史。
+首次在 Data Directory 中执行 `node init` 时可通过 `--ledger-id mrk-devnet-1` 指定共识
+Ledger ID。ID 只允许 3–64 位小写 ASCII 字母、数字和连字符，后续 Node 必须沿用已有值；
+Bootstrap 从可信检查点继承该值，任何已初始化 Ledger 均不能改名。
 链状态写入 `~/.mrk/chain.redb`，只有常驻 `mrk node run` 进程打开 redb；
 其余 `mrk node` 命令统一通过数据根目录唯一的 `~/.mrk/mrk.sock` 调用本地
 管理 RPC；一台机器的默认数据目录只运行一个 `mrk node`，不再为 Node 分 Socket 目录。Socket 权限为 `0600` 且服务端校验同一 UID。`LITE` 的有界历史
@@ -477,7 +495,7 @@ Node 配置并由 `mrk node status` 显示，不允许运行时静默切换。`L
 保留最近七天的 Block（3 秒时为 201,600 个），保留这些 Block 引用的全部
 Operation 正文，并将每个账户的
 历史索引限制为最近 1,024 项。待终局 Operation 和完整当前状态永不裁剪；
-Block、Operation 正文与终局状态、账户历史链接分别追加到独立 redb 表。
+Block、Operation 正文与终局状态、账户历史链接以及账户、Network、Node、Slot、Payment Authorization 和无界治理历史分别写入独立 redb 表。Ledger 元数据不再嵌入这些实体，也不再保存完整的 Finalized State 副本；最新 Finalized View 由当前实体行和稀疏差异覆盖层还原。Operation 正文只保存一次完整签名信封，Block Commit 中每票只保存 Validator ID、时间戳和签名，其余字段从所属记录确定性还原。
 出块与共识热事务只读取当前状态、链 Tip 和待终局 Operation，不物化完整历史；
 查询、校验、备份和裁剪再按需读取历史表。
 已删除前缀保存最后高度、Block Hash 与时间戳检查点，释放页面供后续写入
@@ -518,7 +536,7 @@ tests/
   relay_e2e.rs     # 真实 Node、Probe、奖励激活及双成员字节转发
 ```
 
-当前里程碑使用单一 Rust Package 和本地原子 JSON 状态完成 CLI 语义、WSS 成员数据面、Node 1 单签模式、31 席多 Validator 核心共识，以及 20 节点后的提案投票。签名操作包含 `ledger_id/protocol_version/module/action` 域分离并先进入 PENDING 队列，由当前出块模式生成检查点后 FINALIZED。本地存储边界后续可替换为可复制的 MSL API；Witness、Indexer、跨数据目录历史同步和 Peer Discovery 仍需拆分。
+当前里程碑使用单一 Rust Package 和本地原子 JSON 状态完成 CLI 语义、WSS 成员数据面、Node 1 单签模式、31 席多 Validator 核心共识，以及 20 节点后的 Standard 提案和 50 节点后的 Critical 提案投票。签名操作包含 `ledger_id/protocol_version/module/action` 域分离并先进入 PENDING 队列，由当前出块模式生成检查点后 FINALIZED。本地存储边界后续可替换为可复制的 MSL API；Witness、Indexer、跨数据目录历史同步和 Peer Discovery 仍需拆分。
 
 可运维交付包含 `scripts/install.sh`、Nginx TLS 1.3 反向代理示例、Node/Probe systemd 单元及 `mrk node doctor`。生产服务通过 `MRK_KEYSTORE_PASSWORD_FILE` 或 systemd `LoadCredential` 读取密钥密码，不把密码放进命令行参数。
 
@@ -544,9 +562,9 @@ tests/
 
 ### 阶段 D：多 Validator 与节点治理
 
-同时达到 20 个 Governance-Eligible Node 和 4 个 Active Validator 后启用 `>2/3` 批次最终确认；任一门槛失守时恢复 Node 1 出块。普通分布式治理由 20 节点门槛决定，不会因为 Validator 少于 4 个而退回 Node 1；Genesis Treasury 是更严格的例外，要求 20 个运行满 180 天的成熟 Node 与至少 4 个 Validator，并取得双方各自 `2/3` 批准。
+同时达到 20 个 Governance-Eligible Node 和 4 个 Active Validator 后启用 `>2/3` 批次最终确认；任一门槛失守时恢复 Node 1 出块。Standard 分布式治理由 20 节点门槛决定，Critical 治理要求 50 节点；20 至 49 个时 Standard 投票与 Node 1 直接治理并存，达到 50 个时 Node 1 直接治理关闭。治理边界不会因为 Validator 少于 4 个而改变；Genesis Treasury 是更严格的 Critical 例外，要求 50 个运行满 180 天的成熟 Node 与至少 4 个 Validator，并取得双方各自 `2/3` 批准。
 
-验收：冲突检查点不能同时最终确认；任何非节点在线原因都无法调用铸币入口；Governance-Eligible Node 低于 20 个时未执行节点提案自动取消。
+验收：冲突检查点不能同时最终确认；任何非节点在线原因都无法调用铸币入口；Governance-Eligible Node 低于 20 个时未执行 Standard 提案自动取消，低于 50 个时未执行 Critical 提案自动取消。
 
 ## 12. 后续分布式阶段需要固定的参数
 
@@ -555,7 +573,7 @@ tests/
 3. 帧编码选择：固定二进制结构或 Protobuf；建议热路径固定头部、控制载荷 Protobuf。
 4. 单消息、单连接队列、通道数和计费窗口的默认上限。
 
-这些参数不阻塞当前 CLI。CLI 默认 1,800 秒 Epoch、每 Epoch 固定铸造 500 MRK 并由合格活跃 Node 按权重瓜分、除 Node 1 外 1 天新 Node 考察期、60 秒 Availability Slot、启动期 Node 1 一票绝对信任、去中心化阶段 Primary 5 选 3与默认 5% Auditor 3 选 2、7 天 IP 重用冷却、Ed25519 + `mrk1` 地址、`0.001 MRK` 转账费和 10 分钟操作有效期。`epoch-seconds`、`epoch-mint-amount`、`warmup-seconds`、Slot、验证节点数、法定票数及审计参数只能通过 Critical 治理修改；Epoch 时长和铸币量从下一个 Epoch 快照生效，考察期修改只作用于新注册的非 Genesis Node。
+这些参数不阻塞当前 CLI。CLI 默认 1,800 秒 Epoch、每 Epoch 固定铸造 500 MRK 并由合格活跃 Node 按权重瓜分、除 Node 1 外 1 天新 Node 考察期、60 秒 Availability Slot、启动期 Node 1 一票绝对信任、去中心化阶段 Primary 5 选 3与默认 5% Auditor 3 选 2、无 IP 重用冷却、Ed25519 + `mrk1` 地址、`0.001 MRK` 转账费和 10 分钟操作有效期。`epoch-seconds`、`epoch-mint-amount`、`warmup-seconds`、Slot、验证节点数、法定票数及审计参数只能通过 Critical 治理修改；Epoch 时长和铸币量从下一个 Epoch 快照生效，考察期修改不追溯已固定的终点，从后续注册或 Reward IP 更新开始使用。
 
 ## 13. 最小成功指标
 

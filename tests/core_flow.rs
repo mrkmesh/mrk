@@ -1,11 +1,14 @@
 use chrono::Utc;
-use mrk::{
+use mrk_core::{
     amount::MRK_SCALE, model::NodeStorageMode, relay::ChallengePayload, service, storage::DataPaths,
 };
 
 fn temp_root(label: &str) -> std::path::PathBuf {
-    let random = mrk::crypto::random_bytes::<8>().unwrap();
-    std::env::temp_dir().join(format!("mrk-{label}-{}", mrk::crypto::hex_lower(&random)))
+    let random = mrk_core::crypto::random_bytes::<8>().unwrap();
+    std::env::temp_dir().join(format!(
+        "mrk-{label}-{}",
+        mrk_core::crypto::hex_lower(&random)
+    ))
 }
 
 #[test]
@@ -19,7 +22,7 @@ fn node_reward_transfer_and_private_network_flow() {
     let now = Utc::now().timestamp();
 
     let slot_seconds = 60;
-    let epoch_start = now.div_euclid(slot_seconds) * slot_seconds;
+    let epoch_start = now;
     paths
         .with_ledger_mut(|ledger| {
             ledger.epoch_started_at = epoch_start;
@@ -29,16 +32,31 @@ fn node_reward_transfer_and_private_network_flow() {
             ledger.settings.warmup_seconds = 0;
             ledger.settings.heartbeat_grace_seconds = 120;
             ledger.settings.required_service_bond = 0;
+            ledger.epoch_contexts.clear();
+            ledger.epoch_contexts.insert(
+                0,
+                mrk_core::model::EpochContext {
+                    epoch: 0,
+                    started_at: epoch_start,
+                    ended_at: epoch_start + 60,
+                    submission_deadline: epoch_start + 90,
+                    settings: ledger.settings.clone(),
+                    availability_mode: ledger.availability_mode,
+                    validator_ids: Vec::new(),
+                    validator_bonus_ids: Vec::new(),
+                    node1_single_producer: true,
+                },
+            );
             Ok(())
         })
         .unwrap();
 
-    let node = service::register_node(
+    let node = service::join_node(
         &paths,
         "node1",
         password,
         "wss://1.1.1.1/v1/relay",
-        "0.02MRK",
+        Some("0.02MRK"),
         now,
     )
     .unwrap();
@@ -76,9 +94,11 @@ fn node_reward_transfer_and_private_network_flow() {
         "claim must not advance an Epoch before a block is finalized"
     );
 
-    service::produce_node1_block(&paths, "node1", password, false, epoch_start + 61).unwrap();
+    service::produce_node1_block(&paths, "node1", password, false, epoch_start + 91).unwrap();
     let finalized_rewards = service::node_rewards(&paths, "node1").unwrap();
-    let epoch_after_block = paths.read_ledger().unwrap().epoch_number;
+    let ledger_after_block = paths.read_ledger().unwrap();
+    let epoch_after_block = ledger_after_block.epoch_number;
+    let reward_immediate_bps = u128::from(ledger_after_block.reward_immediate_bps_snapshot);
     let repeated_query = service::node_rewards(&paths, "node1").unwrap();
     assert_eq!(
         repeated_query.claimable_reward,
@@ -90,16 +110,21 @@ fn node_reward_transfer_and_private_network_flow() {
     );
     assert_eq!(paths.read_ledger().unwrap().epoch_number, epoch_after_block);
 
-    let (_, claimed) =
-        service::claim_node_rewards(&paths, "node1", password, epoch_start + 61).unwrap();
+    let (claim_operation_id, claimed) =
+        service::claim_node_rewards(&paths, "node1", password, epoch_start + 91).unwrap();
     let expected_epoch_reward = 500 * MRK_SCALE;
-    assert_eq!(claimed, expected_epoch_reward / 10);
+    let expected_immediate_reward = expected_epoch_reward * reward_immediate_bps / 10_000;
+    assert_eq!(claimed, expected_immediate_reward);
     let rewards = service::node_rewards(&paths, "node1").unwrap();
-    assert_eq!(rewards.vesting_reward, expected_epoch_reward * 9 / 10);
-    assert_eq!(rewards.vesting_schedule_count, 1);
+    assert_eq!(
+        rewards.vesting_reward,
+        expected_epoch_reward - expected_immediate_reward
+    );
+    assert_eq!(rewards.vesting_bucket_count, 180);
     let reward_balance = service::balance(&paths, &node_config.reward_address).unwrap();
-    assert_eq!(reward_balance.balance, claimed);
-    service::produce_node1_block(&paths, "node1", password, false, epoch_start + 62).unwrap();
+    let claim_fee = paths.read_ledger().unwrap().operations[&claim_operation_id].fee_charged;
+    assert_eq!(reward_balance.balance, claimed - claim_fee);
+    service::produce_node1_block(&paths, "node1", password, false, epoch_start + 92).unwrap();
 
     let transfer = service::transfer(
         &paths,
@@ -107,7 +132,7 @@ fn node_reward_transfer_and_private_network_flow() {
         password,
         &bob.address,
         "0.05MRK",
-        now + 62,
+        now + 92,
     )
     .unwrap();
     assert_eq!(transfer.amount, MRK_SCALE / 20);
@@ -117,9 +142,9 @@ fn node_reward_transfer_and_private_network_flow() {
     );
 
     let network =
-        service::create_network(&paths, "node:node1", password, "team", now + 63).unwrap();
+        service::create_network(&paths, "node:node1", password, "team", now + 93).unwrap();
     assert_eq!(network.alias, "team");
-    service::fund_network(&paths, "node:node1", password, "team", "0.05MRK", now + 64).unwrap();
+    service::fund_network(&paths, "node:node1", password, "team", "0.05MRK", now + 94).unwrap();
     let (credential, credential_path) = service::issue_member(
         &paths,
         "node:node1",
@@ -127,7 +152,7 @@ fn node_reward_transfer_and_private_network_flow() {
         "team",
         "client-a",
         7,
-        now + 65,
+        now + 95,
     )
     .unwrap();
     assert!(credential_path.exists());
@@ -138,12 +163,12 @@ fn node_reward_transfer_and_private_network_flow() {
         challenge: "integration-challenge-1234567890".into(),
         relay_public_key: relay_key.public_key,
         node_id: node.node_id,
-        timestamp: now + 65,
+        timestamp: now + 95,
     };
     let hello =
-        service::create_member_hello(&paths, "team", "client-a", password, &challenge, now + 65)
+        service::create_member_hello(&paths, "team", "client-a", password, &challenge, now + 95)
             .unwrap();
-    let authenticated = service::authenticate_member(&paths, &challenge, &hello, now + 65).unwrap();
+    let authenticated = service::authenticate_member(&paths, &challenge, &hello, now + 95).unwrap();
     assert_eq!(authenticated.member_id, credential.member_id);
     service::revoke_member(
         &paths,
@@ -151,18 +176,18 @@ fn node_reward_transfer_and_private_network_flow() {
         password,
         "team",
         credential.serial,
-        now + 66,
+        now + 96,
     )
     .unwrap();
-    assert!(service::authenticate_member(&paths, &challenge, &hello, now + 66).is_err());
+    assert!(service::authenticate_member(&paths, &challenge, &hello, now + 96).is_err());
 
     service::init_node(&paths, "node2", password).unwrap();
-    let duplicate = service::register_node(
+    let duplicate = service::join_node(
         &paths,
         "node2",
         password,
-        "wss://1.1.1.1/v1/relay",
-        "0.02MRK",
+        "wss://1.1.1.1:9443/v1/relay",
+        Some("0.02MRK"),
         now + 100,
     )
     .unwrap();
@@ -180,13 +205,13 @@ fn node_reward_transfer_and_private_network_flow() {
     service::produce_node1_block(&paths, "node1", password, false, now + 101).unwrap();
 
     let stale = service::node_tick(&paths, "node1", now + 400).unwrap();
-    assert!(matches!(stale.status, mrk::model::NodeStatus::Active));
+    assert!(matches!(stale.status, mrk_core::model::NodeStatus::Active));
     assert_eq!(stale.total_eligible_seconds, credited_seconds);
     service::drain_node(&paths, "node1", password, now + 401).unwrap();
     service::produce_node1_block(&paths, "node1", password, false, now + 402).unwrap();
     assert!(matches!(
         service::node_record(&paths, "node1").unwrap().status,
-        mrk::model::NodeStatus::Exited
+        mrk_core::model::NodeStatus::Exited
     ));
     assert_eq!(
         paths
@@ -224,6 +249,8 @@ fn externally_signed_transfer_is_verified_and_committed_by_database_owner() {
         &alice,
         password,
         service::TransferSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &ledger_id,
             to: &bob.address,
             amount_text: "2MRK",
@@ -267,6 +294,8 @@ fn consensus_replays_signed_operation_identically_across_databases() {
         &alice,
         password,
         service::TransferSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &first.read_ledger().unwrap().ledger_id,
             to: &bob.address,
             amount_text: "2MRK",
@@ -275,7 +304,7 @@ fn consensus_replays_signed_operation_identically_across_databases() {
         },
     )
     .unwrap();
-    let envelope = mrk::consensus::PendingOperationEnvelope {
+    let envelope = mrk_core::consensus::PendingOperationEnvelope {
         public_key,
         operation,
     };
@@ -306,6 +335,16 @@ fn externally_signed_network_operations_are_committed_by_database_owner() {
     let paths = DataPaths::new(Some(temp_root("signed-network"))).unwrap();
     let password = "integration-test-password";
     let owner = service::create_local_account(&paths, "owner", password).unwrap();
+    paths
+        .with_ledger_mut(|ledger| {
+            ledger
+                .accounts
+                .entry(owner.address.clone())
+                .or_default()
+                .balance = MRK_SCALE;
+            Ok(())
+        })
+        .unwrap();
     let ledger_id = paths.read_ledger().unwrap().ledger_id;
     let now = Utc::now().timestamp();
     let (network_id, commitment) = service::new_network_identity().unwrap();
@@ -313,6 +352,8 @@ fn externally_signed_network_operations_are_committed_by_database_owner() {
         &owner,
         password,
         service::PublicOperationSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &ledger_id,
             module: "NetworkRegistry",
             action: "CreateNetwork",
@@ -332,6 +373,8 @@ fn externally_signed_network_operations_are_committed_by_database_owner() {
         &owner,
         password,
         service::MemberIssueSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &ledger_id,
             network: &network,
             member_name: "client-a",
@@ -345,6 +388,8 @@ fn externally_signed_network_operations_are_committed_by_database_owner() {
         &owner,
         password,
         service::MemberIssueSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &ledger_id,
             network: &network,
             member_name: "client-a",
@@ -356,10 +401,10 @@ fn externally_signed_network_operations_are_committed_by_database_owner() {
     .unwrap();
     service::submit_signed_network_operation(&paths, &owner.public_key, issue, now).unwrap();
     let conflicting_id =
-        mrk::crypto::sha256_id("op", &serde_json::to_vec(&conflicting_issue).unwrap());
+        mrk_core::crypto::sha256_id("op", &serde_json::to_vec(&conflicting_issue).unwrap());
     let conflict = service::submit_consensus_operation(
         &paths,
-        mrk::consensus::PendingOperationEnvelope {
+        mrk_core::consensus::PendingOperationEnvelope {
             public_key: owner.public_key.clone(),
             operation: conflicting_issue,
         },
@@ -380,12 +425,17 @@ fn externally_signed_network_operations_are_committed_by_database_owner() {
         &owner,
         password,
         service::PublicOperationSigningRequest {
+            max_fee_base_units: u128::MAX,
+            fee_policy_version: 1,
             ledger_id: &ledger_id,
             module: "NetworkRegistry",
             action: "RevokeMember",
             nonce: 3,
             valid_until: now + 600,
-            payload: serde_json::json!({ "network": "team", "serial": credential.serial }),
+            payload: serde_json::json!({
+                "network_commitment": commitment,
+                "serial": credential.serial,
+            }),
         },
     )
     .unwrap();

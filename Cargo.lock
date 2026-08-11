@@ -449,16 +449,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "mrk"
+name = "mrk-cli"
 version = "0.1.0"
 dependencies = [
  "base64",
  "chrono",
  "clap",
- "dirs",
  "libc",
- "redb",
- "ring",
+ "mrk-core",
+ "mrk-node",
+ "mrk-sdk",
  "rpassword",
  "rustls",
  "serde",
@@ -466,7 +466,62 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "url",
+]
+
+[[package]]
+name = "mrk-core"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "dirs",
+ "libc",
+ "redb",
+ "ring",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "url",
  "webpki-roots",
+]
+
+[[package]]
+name = "mrk-ffi"
+version = "0.1.0"
+dependencies = [
+ "mrk-core",
+ "mrk-sdk",
+ "tokio",
+]
+
+[[package]]
+name = "mrk-node"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "libc",
+ "mrk-core",
+ "rpassword",
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
+name = "mrk-sdk"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "mrk-core",
+ "ring",
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
 ]
 
 [[package]]

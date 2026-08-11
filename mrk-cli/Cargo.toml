@@ -1,0 +1,38 @@
+[package]
+name = "mrk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MRK command-line client"
+
+[[bin]]
+name = "mrk"
+path = "src/main.rs"
+
+[[test]]
+name = "cli_commands"
+path = "../tests/cli_commands.rs"
+
+[[test]]
+name = "relay_e2e"
+path = "../tests/relay_e2e.rs"
+
+[dependencies]
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6.4", features = ["derive", "env"] }
+libc = "0.2.189"
+mrk-core = { path = "../mrk-core" }
+mrk-node = { path = "../mrk-node" }
+mrk-sdk = { path = "../mrk-sdk" }
+rpassword = "7.5.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = { version = "1.0.151", features = ["arbitrary_precision"] }
+tokio = { version = "1.53.1", features = ["io-std", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+
+[dev-dependencies]
+base64 = "0.22.1"
+libc = "0.2.189"
+rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1.53.1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+url = "2.5.8"

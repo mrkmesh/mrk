@@ -1,0 +1,1 @@
+<template><main class="page"><section class="not-found"><span class="eyebrow">404</span><h1>Nothing at this route</h1><p>The ledger may still contain what you are looking for. Try the global search or return to the overview.</p><RouterLink class="button button--primary" to="/">Back to overview</RouterLink></section></main></template>
