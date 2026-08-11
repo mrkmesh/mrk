@@ -427,7 +427,7 @@ fn empty_node_installs_only_an_explicitly_pinned_bootstrap_checkpoint() {
     assert_eq!(
         source.latest_bootstrap_checkpoint().unwrap().unwrap().0,
         1,
-        "automatic checkpoints inside the one-hour interval must be skipped"
+        "automatic checkpoints inside the scheduled interval must be skipped"
     );
     let latest_snapshot = service::bootstrap_snapshot(&source).unwrap();
     assert_eq!(latest_snapshot.height, 2);
@@ -672,10 +672,10 @@ fn exited_owner_joins_with_a_new_node_id_and_fresh_lifecycle() {
 }
 
 #[test]
-fn automatic_bootstrap_checkpoints_are_hourly() {
-    let root = temp_root("hourly-checkpoint");
+fn automatic_bootstrap_checkpoints_follow_block_cadence() {
+    let root = temp_root("scheduled-checkpoint");
     let paths = DataPaths::new(Some(root.clone())).unwrap();
-    let password = "hourly-checkpoint-password";
+    let password = "scheduled-checkpoint-password";
     let now = Utc::now().timestamp();
     register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
 
@@ -687,7 +687,7 @@ fn automatic_bootstrap_checkpoints_are_hourly() {
     assert_eq!(checkpoints[0].height, 1);
     assert_eq!(checkpoints[0].finalized_at, now + 1);
 
-    service::produce_node1_block(&paths, "node1", password, true, now + 3_601).unwrap();
+    service::produce_node1_block(&paths, "node1", password, true, now + 6 * 3_600 + 1).unwrap();
     assert_eq!(paths.latest_bootstrap_checkpoint().unwrap().unwrap().0, 3);
     let checkpoints = service::bootstrap_checkpoints(&paths).unwrap();
     assert_eq!(

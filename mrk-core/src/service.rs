@@ -584,7 +584,8 @@ pub struct BlockVerificationReport {
 }
 
 pub const BOOTSTRAP_CHECKPOINT_RETENTION: usize = crate::checkpoint::RETENTION;
-pub const BOOTSTRAP_CHECKPOINT_INTERVAL_SECONDS: i64 = crate::checkpoint::INTERVAL_SECONDS;
+pub const BOOTSTRAP_CHECKPOINT_TARGET_BLOCKS: i64 = crate::checkpoint::TARGET_BLOCKS;
+pub const BOOTSTRAP_CHECKPOINT_MAX_INTERVAL_SECONDS: i64 = crate::checkpoint::MAX_INTERVAL_SECONDS;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConsensusCatchUpChunk {
