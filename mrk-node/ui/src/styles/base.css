@@ -35,7 +35,7 @@ nav a.router-link-active { color: var(--text); }
 .notice { margin-bottom: 18px; padding: 11px 14px; border: 1px solid #5d4b27; border-radius: 8px; background: #251f14; color: #dbc995; }
 .notice b { margin-right: 8px; }
 
-.hero-grid { margin-bottom: 28px; display: grid; grid-template-columns: minmax(300px, 2fr) repeat(4, 1fr); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
+.hero-grid { margin-bottom: 28px; display: grid; grid-template-columns: minmax(300px, 2fr) repeat(5, minmax(0, 1fr)); border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); overflow: hidden; }
 .hero-primary { min-height: 150px; padding: 26px; display: flex; flex-direction: column; justify-content: center; border-right: 1px solid var(--border); }
 .hero-primary strong { font-size: clamp(38px, 6vw, 62px); line-height: 1; letter-spacing: -.055em; }
 .hero-primary > span:last-child { margin-top: 12px; color: var(--muted); }
@@ -142,6 +142,9 @@ tbody tr:hover { background: var(--surface-raised); }
   .search { order: 3; min-width: 100%; }
   .hero-grid { grid-template-columns: repeat(2, 1fr); }
   .hero-primary { grid-column: 1 / -1; border-right: 0; border-bottom: 1px solid var(--border); }
+  .metric { border-bottom: 1px solid var(--border-soft); }
+  .metric:nth-child(odd) { border-right: 0; }
+  .metric:last-child { grid-column: 1 / -1; border-bottom: 0; }
   .section-grid { grid-template-columns: 1fr; }
   .detail-grid, .summary-strip { grid-template-columns: repeat(2, 1fr); }
   .epoch-details { grid-template-columns: repeat(3, 1fr); }
@@ -154,6 +157,7 @@ tbody tr:hover { background: var(--surface-raised); }
   .hero-grid { grid-template-columns: 1fr; }
   .hero-primary { grid-column: auto; }
   .metric { border-right: 0; border-bottom: 1px solid var(--border-soft); }
+  .metric:last-child { grid-column: auto; border-bottom: 0; }
   .detail-grid, .summary-strip { grid-template-columns: 1fr; }
   .epoch-details { grid-template-columns: 1fr 1fr; }
   .detail-grid > *, .summary-strip > div { border-right: 0; border-bottom: 1px solid var(--border-soft); }
