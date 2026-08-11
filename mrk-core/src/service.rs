@@ -531,6 +531,8 @@ pub struct BlockStatusView {
     pub height: u64,
     pub burned_base_units: String,
     pub burned_display: String,
+    pub total_settled_traffic_bytes: String,
+    pub total_settled_traffic_display: String,
     pub last_block_hash: Option<String>,
     pub last_block_at: Option<i64>,
     pub pending_operation_count: usize,
@@ -3748,6 +3750,10 @@ fn apply_traffic_settlement(
     let amount = total_owed
         .checked_sub(previous.settled_amount)
         .ok_or_else(|| Error::msg("traffic settlement amount moved backwards"))?;
+    let newly_settled_bytes = checkpoint
+        .cumulative_sent_bytes
+        .checked_sub(previous.settled_payload_bytes)
+        .ok_or_else(|| Error::msg("traffic settlement bytes moved backwards"))?;
     if amount > authorization.reserved_remaining {
         return Err(Error::msg(
             "traffic settlement exceeds the remaining payment authorization",
@@ -3800,6 +3806,10 @@ fn apply_traffic_settlement(
             .checked_add(released)
             .ok_or_else(|| Error::msg("Network Fund overflow while closing Relay session"))?;
     }
+    ledger.total_settled_traffic_bytes = ledger
+        .total_settled_traffic_bytes
+        .checked_add(u128::from(newly_settled_bytes))
+        .ok_or_else(|| Error::msg("total settled traffic overflow"))?;
     let protocol_fee = amount
         .checked_mul(u128::from(authorization.traffic_protocol_fee_bps))
         .ok_or_else(|| Error::msg("traffic protocol fee overflow"))?
@@ -8188,7 +8198,7 @@ fn multi_validator_block_signing_payload(block: &BlockRecord) -> MultiValidatorB
 
 pub fn block_status(paths: &DataPaths, now: i64) -> Result<BlockStatusView> {
     let ledger = paths.read_ledger()?;
-    let burned = finalized_burned(&ledger);
+    let (burned, total_settled_traffic_bytes) = finalized_network_totals(&ledger);
     let genesis = ledger
         .genesis_authority
         .clone()
@@ -8218,6 +8228,8 @@ pub fn block_status(paths: &DataPaths, now: i64) -> Result<BlockStatusView> {
         height: chain_height(&ledger),
         burned_base_units: burned.to_string(),
         burned_display: format_mrk(burned),
+        total_settled_traffic_bytes: total_settled_traffic_bytes.to_string(),
+        total_settled_traffic_display: format_bytes(total_settled_traffic_bytes),
         last_block_hash: chain_tip_hash(&ledger).map(str::to_owned),
         last_block_at: chain_tip_timestamp(&ledger),
         pending_operation_count,
@@ -8239,11 +8251,35 @@ pub fn block_status(paths: &DataPaths, now: i64) -> Result<BlockStatusView> {
     })
 }
 
-fn finalized_burned(ledger: &LedgerState) -> u128 {
+fn finalized_network_totals(ledger: &LedgerState) -> (u128, u128) {
     ledger
         .finalized_checkpoint
         .as_deref()
-        .map_or(0, |checkpoint| checkpoint.burned)
+        .map_or((0, 0), |checkpoint| {
+            (checkpoint.burned, checkpoint.total_settled_traffic_bytes)
+        })
+}
+
+fn format_bytes(bytes: u128) -> String {
+    const UNITS: [&str; 9] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB", "ZiB", "YiB"];
+    let mut unit = 0;
+    let mut scale = 1_u128;
+    while unit + 1 < UNITS.len() && bytes >= scale * 1_024 {
+        unit += 1;
+        scale *= 1_024;
+    }
+    if unit == 0 {
+        return format!("{bytes} B");
+    }
+    let whole = bytes / scale;
+    let hundredths = (bytes % scale) * 100 / scale;
+    if hundredths == 0 {
+        format!("{whole} {}", UNITS[unit])
+    } else if hundredths.is_multiple_of(10) {
+        format!("{whole}.{} {}", hundredths / 10, UNITS[unit])
+    } else {
+        format!("{whole}.{hundredths:02} {}", UNITS[unit])
+    }
 }
 
 pub fn block_by_height(paths: &DataPaths, height: u64) -> Result<BlockRecord> {
@@ -12271,18 +12307,27 @@ mod tests {
     use crate::model::AccountState;
 
     #[test]
-    fn burned_total_uses_only_finalized_state() {
+    fn network_totals_use_only_finalized_state() {
         let mut ledger = LedgerState {
             burned: 25,
+            total_settled_traffic_bytes: 5_000,
             ..LedgerState::default()
         };
-        assert_eq!(finalized_burned(&ledger), 0);
+        assert_eq!(finalized_network_totals(&ledger), (0, 0));
 
         let mut checkpoint = ledger.clone();
         checkpoint.burned = 10;
+        checkpoint.total_settled_traffic_bytes = 2_048;
         checkpoint.finalized_checkpoint = None;
         ledger.finalized_checkpoint = Some(Box::new(checkpoint));
-        assert_eq!(finalized_burned(&ledger), 10);
+        assert_eq!(finalized_network_totals(&ledger), (10, 2_048));
+    }
+
+    #[test]
+    fn settled_traffic_uses_compact_binary_units() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1_024), "1 KiB");
+        assert_eq!(format_bytes(1_610_612_736), "1.5 GiB");
     }
 
     fn reset_epoch_context(ledger: &mut LedgerState) {

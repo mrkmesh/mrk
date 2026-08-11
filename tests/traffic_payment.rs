@@ -583,6 +583,10 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
     let ledger_after = paths.read_ledger().unwrap();
     assert_eq!(ledger_after.treasury - ledger_before.treasury, treasury_fee);
     assert_eq!(ledger_after.burned - ledger_before.burned, burned_fee);
+    assert_eq!(
+        ledger_after.total_settled_traffic_bytes - ledger_before.total_settled_traffic_bytes,
+        payload.len() as u128
+    );
     let settlement = &ledger_after.operations[&settlement_id];
     assert_eq!(settlement.fee_charged, protocol_fee);
     assert_eq!(settlement.fee_to_treasury, treasury_fee);

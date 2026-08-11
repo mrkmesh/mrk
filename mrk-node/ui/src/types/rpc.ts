@@ -11,6 +11,8 @@ export interface ChainStatus {
   height: number
   burned_base_units: string
   burned_display: string
+  total_settled_traffic_bytes: string
+  total_settled_traffic_display: string
   last_block_hash: string | null
   last_block_at: number | null
   pending_operation_count: number

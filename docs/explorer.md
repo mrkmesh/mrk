@@ -7,6 +7,8 @@ browser History API, so paths such as `/explorer/blocks/42` can be opened or ref
 The Explorer never handles keystores or signs and submits operations. It currently covers chain
 status (including the serving Node's runtime version), retained blocks, bootstrap checkpoints,
 operations, accounts, the Node registry, governance proposals, and the protocol treasury. The
+overview reports finalized lifetime Burn and settled Relay DATA payload bytes directly from
+consensus state. Unsettled traffic and protocol overhead are not included. The
 checkpoint page reports only what the serving
 Node retains and warns operators to verify roots through an independent channel. Network membership
 and payment-session metadata are intentionally not indexed in the UI.

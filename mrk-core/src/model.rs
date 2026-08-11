@@ -564,6 +564,7 @@ pub struct LedgerState {
     pub lifetime_minted: u128,
     pub pool_remaining: u128,
     pub burned: u128,
+    pub total_settled_traffic_bytes: u128,
     pub treasury: u128,
     #[serde(default = "default_fee_multiplier_bps")]
     pub fee_multiplier_bps: u32,
@@ -655,6 +656,7 @@ impl Default for LedgerState {
             lifetime_minted: GENESIS_TREASURY_ALLOCATION,
             pool_remaining: NODE_EMISSION_ALLOCATION,
             burned: 0,
+            total_settled_traffic_bytes: 0,
             treasury: GENESIS_TREASURY_ALLOCATION,
             fee_multiplier_bps: default_fee_multiplier_bps(),
             fee_units_used_in_epoch: 0,
