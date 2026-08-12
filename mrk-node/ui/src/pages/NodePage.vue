@@ -15,6 +15,13 @@ const route = useRoute()
 const nodeId = computed(() => Number(route.params.id))
 const query = useQuery(() => rpc<NodeRecord>('node.get', { node_id: nodeId.value }), [nodeId])
 let refreshClock: number | undefined
+
+function paymentWindowSize(bytes: number): string {
+  const mebibytes = bytes / (1024 * 1024)
+  const display = Number.isInteger(mebibytes) ? mebibytes.toString() : mebibytes.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')
+  return `${display} MiB (${bytes.toLocaleString()} bytes)`
+}
+
 onMounted(() => {
   refreshClock = window.setInterval(() => { void query.refresh() }, 5_000)
 })
@@ -40,6 +47,9 @@ onBeforeUnmount(() => {
             { label: 'Offline exit at', value: dateTime(query.data.value.offline_exit_at) },
             { label: 'Service bond', value: query.data.value.service_bond_display },
             { label: 'Governance bond', value: query.data.value.governance_bond_display },
+            { label: 'Relay capability revision', value: query.data.value.relay_capability_revision },
+            { label: 'Payment window bytes', value: paymentWindowSize(query.data.value.payment_window_bytes) },
+            { label: 'Payment window time', value: `${query.data.value.payment_window_seconds}s` },
           ]" />
           <div class="hash-rows">
             <div><span>Endpoint</span><code>{{ query.data.value.endpoint }}</code></div>

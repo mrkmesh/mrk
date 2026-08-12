@@ -119,6 +119,9 @@ export interface NodeRecord {
   endpoint: string
   reward_ip: string
   price_per_gib_display: string
+  relay_capability_revision: number
+  payment_window_bytes: number
+  payment_window_seconds: number
   status: string
   registered_at: number
   warmup_until: number
