@@ -39,6 +39,8 @@ struct Cli {
     rpc_tls_ca: Option<PathBuf>,
     #[arg(long, global = true, value_enum, default_value_t = Output::Text)]
     output: Output,
+    #[arg(long, global = true)]
+    yes: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -144,8 +146,6 @@ enum AccountCommand {
         to: String,
         #[arg(long)]
         amount: String,
-        #[arg(long)]
-        yes: bool,
         #[arg(long)]
         dry_run: bool,
     },
@@ -353,7 +353,13 @@ fn run() -> Result<()> {
     };
     match cli.command {
         Command::Node { node, command } => {
-            node_cli::run_node_command(&paths, node, matches!(cli.output, Output::Json), command)?;
+            node_cli::run_node_command(
+                &paths,
+                node,
+                matches!(cli.output, Output::Json),
+                cli.yes,
+                command,
+            )?;
         }
         Command::Account { command } => match command {
             AccountCommand::Init { name } => {
@@ -396,7 +402,6 @@ fn run() -> Result<()> {
                 account,
                 to,
                 amount,
-                yes,
                 dry_run,
             } => {
                 let now = Utc::now().timestamp();
@@ -437,16 +442,6 @@ fn run() -> Result<()> {
                     print_value(cli.output, &preview, || transfer_preview_text(&preview))?;
                     return Ok(());
                 }
-                if !yes {
-                    println!("{}", transfer_preview_text(&preview));
-                    print!("\nType \"yes\" to sign and submit: ");
-                    io::stdout().flush()?;
-                    let mut answer = String::new();
-                    io::stdin().read_line(&mut answer)?;
-                    if answer.trim() != "yes" {
-                        return Err(Error::msg("transfer cancelled"));
-                    }
-                }
                 let password = read_password("Keystore password: ")?;
                 let (public_key, operation) = service::sign_transfer_for_submission(
                     &keyfile,
@@ -461,6 +456,8 @@ fn run() -> Result<()> {
                         fee_policy_version: fee_quote.policy_version,
                     },
                 )?;
+                eprintln!("{}", transfer_preview_text(&preview));
+                confirm_service_fee(&fee_quote, cli.yes)?;
                 let receipt = rpc.call(
                     "operation.submit",
                     serde_json::json!({
@@ -512,6 +509,7 @@ fn run() -> Result<()> {
                         payload,
                     },
                 )?;
+                confirm_service_fee(&fee_quote, cli.yes)?;
                 let result = rpc.call(
                     "operation.submit",
                     serde_json::json!({ "public_key": keyfile.public_key, "operation": operation }),
@@ -548,6 +546,7 @@ fn run() -> Result<()> {
                         payload,
                     },
                 )?;
+                confirm_service_fee(&fee_quote, cli.yes)?;
                 let result = rpc.call(
                     "operation.submit",
                     serde_json::json!({ "public_key": keyfile.public_key, "operation": operation }),
@@ -645,6 +644,7 @@ fn run() -> Result<()> {
                             payload,
                         },
                     )?;
+                    confirm_service_fee(&fee_quote, cli.yes)?;
                     let result = rpc.call(
                         "operation.submit",
                         serde_json::json!({
@@ -752,6 +752,7 @@ fn run() -> Result<()> {
                         fee_policy_version: fee_quote.policy_version,
                     },
                 )?;
+                confirm_service_fee(&fee_quote, cli.yes)?;
                 let operation_id =
                     mrk_core::crypto::sha256_id("op", &serde_json::to_vec(&operation)?);
                 let pending = mrk_core::storage::PendingMemberIssue {
@@ -809,6 +810,7 @@ fn run() -> Result<()> {
                         payload,
                     },
                 )?;
+                confirm_service_fee(&fee_quote, cli.yes)?;
                 let result = rpc.call(
                     "operation.submit",
                     serde_json::json!({ "public_key": keyfile.public_key, "operation": operation }),
@@ -908,6 +910,7 @@ fn run() -> Result<()> {
                         payload,
                     },
                 )?;
+                confirm_service_fee(&fee_quote, cli.yes)?;
                 let result = rpc.call(
                     "operation.submit",
                     serde_json::json!({
@@ -1008,6 +1011,7 @@ fn run() -> Result<()> {
                 allow_insecure_local,
                 tls_ca,
                 max_auto_recovery_bytes,
+                yes: cli.yes,
             })?;
         }
         Command::Block { command } => match command {
@@ -1267,6 +1271,29 @@ fn rpc_fee_quote(
         }),
     )?)
     .map_err(Into::into)
+}
+
+fn confirm_service_fee(quote: &RpcFeeQuote, yes: bool) -> Result<()> {
+    confirm_service_fee_amounts(quote.fee, quote.recommended_max_fee, yes)
+}
+
+fn confirm_service_fee_amounts(fee: u128, recommended_max_fee: u128, yes: bool) -> Result<()> {
+    if fee == 0 {
+        return Ok(());
+    }
+    eprintln!("Service fee: {}", format_mrk(fee));
+    eprintln!("Maximum service fee: {}", format_mrk(recommended_max_fee));
+    if yes {
+        return Ok(());
+    }
+    eprint!("Type \"yes\" to confirm and submit: ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "yes" {
+        return Err(Error::msg("operation cancelled"));
+    }
+    Ok(())
 }
 
 fn resolve_address(paths: &DataPaths, target: &AccountOrAddress) -> Result<String> {

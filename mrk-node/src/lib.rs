@@ -178,6 +178,8 @@ struct AdminRequest {
     node: String,
     output: Output,
     command: DaemonCommand,
+    #[serde(default)]
+    fee_only: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -185,6 +187,15 @@ struct AdminResponse {
     ok: bool,
     output: Vec<u8>,
     error: Option<String>,
+    #[serde(default)]
+    fee_quote: Option<AdminFeeQuote>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AdminFeeQuote {
+    fee: u128,
+    fee_display: String,
+    recommended_max_fee_display: String,
 }
 
 #[derive(Subcommand, Serialize, Deserialize)]
@@ -1965,6 +1976,7 @@ pub fn run_node_command(
     paths: &DataPaths,
     node: String,
     output_json: bool,
+    yes: bool,
     command: DaemonCommand,
 ) -> Result<()> {
     let output = if output_json {
@@ -1979,9 +1991,127 @@ pub fn run_node_command(
             | DaemonCommand::BackupVerify { .. }
             | DaemonCommand::Restore { .. }
     ) {
+        if command_may_require_service_fee(&command) {
+            let quote = request_admin_service_fee(paths, &node, output, &command)?;
+            confirm_command_service_fee(quote.as_ref(), yes)?;
+        }
         return call_admin_socket(paths, node, output, command);
     }
     execute_daemon_command(paths, node, output, command)
+}
+
+fn command_may_require_service_fee(command: &DaemonCommand) -> bool {
+    matches!(
+        command,
+        DaemonCommand::Join { .. }
+            | DaemonCommand::UpdateRewardIp { .. }
+            | DaemonCommand::UpdatePrice { .. }
+            | DaemonCommand::Claim
+            | DaemonCommand::WithdrawServiceBond
+            | DaemonCommand::Validator {
+                command: ValidatorCommand::Join | ValidatorCommand::WithdrawBond,
+            }
+            | DaemonCommand::Governance {
+                command: GovernanceCommand::Bond
+                    | GovernanceCommand::WithdrawBond
+                    | GovernanceCommand::ProposeSet { .. }
+                    | GovernanceCommand::ProposePause { .. }
+                    | GovernanceCommand::ProposeResume { .. }
+                    | GovernanceCommand::ProposeTreasurySpend { .. },
+            }
+    )
+}
+
+fn command_service_fee(
+    paths: &DataPaths,
+    node: &str,
+    command: &DaemonCommand,
+) -> Result<Option<AdminFeeQuote>> {
+    let fee_action = match command {
+        DaemonCommand::Join { .. } => {
+            let previous_node_id = paths.read_node_config(node)?.node_id;
+            Some((
+                "NodeRegistry",
+                "RegisterNode",
+                serde_json::json!({ "previous_node_id": previous_node_id }),
+            ))
+        }
+        DaemonCommand::UpdateRewardIp { .. } => {
+            Some(("NodeRegistry", "UpdateRewardIp", serde_json::Value::Null))
+        }
+        DaemonCommand::UpdatePrice { .. } => {
+            Some(("NodeRegistry", "UpdatePrice", serde_json::Value::Null))
+        }
+        DaemonCommand::Claim => Some((
+            "NodeEmissionController",
+            "ClaimNodeReward",
+            serde_json::Value::Null,
+        )),
+        DaemonCommand::WithdrawServiceBond => Some((
+            "NodeRegistry",
+            "WithdrawServiceBond",
+            serde_json::Value::Null,
+        )),
+        DaemonCommand::Validator {
+            command: ValidatorCommand::Join,
+        } => Some(("StakeVault", "BondValidator", serde_json::Value::Null)),
+        DaemonCommand::Validator {
+            command: ValidatorCommand::WithdrawBond,
+        } => Some((
+            "StakeVault",
+            "WithdrawValidatorBond",
+            serde_json::Value::Null,
+        )),
+        DaemonCommand::Governance {
+            command: GovernanceCommand::Bond,
+        } => Some(("StakeVault", "BondGovernance", serde_json::Value::Null)),
+        DaemonCommand::Governance {
+            command: GovernanceCommand::WithdrawBond,
+        } => Some((
+            "StakeVault",
+            "WithdrawGovernanceBond",
+            serde_json::Value::Null,
+        )),
+        DaemonCommand::Governance {
+            command:
+                GovernanceCommand::ProposeSet { .. }
+                | GovernanceCommand::ProposePause { .. }
+                | GovernanceCommand::ProposeResume { .. }
+                | GovernanceCommand::ProposeTreasurySpend { .. },
+        } => Some(("Governance", "CreateProposal", serde_json::Value::Null)),
+        _ => None,
+    };
+    let Some((module, action, payload)) = fee_action else {
+        return Ok(None);
+    };
+    let quote = service::fee_quote(paths, module, action, &payload)?;
+    Ok(Some(AdminFeeQuote {
+        fee: quote.fee,
+        fee_display: quote.fee_display,
+        recommended_max_fee_display: quote.recommended_max_fee_display,
+    }))
+}
+
+fn confirm_command_service_fee(quote: Option<&AdminFeeQuote>, yes: bool) -> Result<()> {
+    let Some(quote) = quote else {
+        return Ok(());
+    };
+    if quote.fee == 0 {
+        return Ok(());
+    }
+    eprintln!("Service fee: {}", quote.fee_display);
+    eprintln!("Maximum service fee: {}", quote.recommended_max_fee_display);
+    if yes {
+        return Ok(());
+    }
+    eprint!("Type \"yes\" to confirm and submit: ");
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if answer.trim() != "yes" {
+        return Err(Error::msg("operation cancelled"));
+    }
+    Ok(())
 }
 
 fn execute_daemon_command(
@@ -2532,6 +2662,7 @@ fn call_admin_socket(
         node,
         output,
         command,
+        fee_only: false,
     })?;
     stream.write_all(&request)?;
     stream.shutdown(std::net::Shutdown::Write)?;
@@ -2546,6 +2677,41 @@ fn call_admin_socket(
             response
                 .error
                 .unwrap_or_else(|| "mrk node request failed".to_owned()),
+        ))
+    }
+}
+
+fn request_admin_service_fee(
+    paths: &DataPaths,
+    node: &str,
+    output: Output,
+    command: &DaemonCommand,
+) -> Result<Option<AdminFeeQuote>> {
+    let socket_path = paths.daemon_socket_path();
+    let mut stream = UnixStream::connect(&socket_path).map_err(|error| {
+        Error::msg(format!(
+            "cannot connect to mrk node at {}: {error}; start it with 'mrk node --node {node} run'",
+            socket_path.display()
+        ))
+    })?;
+    let request = serde_json::to_vec(&AdminRequest {
+        node: node.to_owned(),
+        output,
+        command: serde_json::from_value(serde_json::to_value(command)?)?,
+        fee_only: true,
+    })?;
+    stream.write_all(&request)?;
+    stream.shutdown(std::net::Shutdown::Write)?;
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let response: AdminResponse = serde_json::from_slice(&response)?;
+    if response.ok {
+        Ok(response.fee_quote)
+    } else {
+        Err(Error::msg(
+            response
+                .error
+                .unwrap_or_else(|| "mrk node fee quote failed".to_owned()),
         ))
     }
 }
@@ -3761,6 +3927,25 @@ fn handle_admin_connection(
         ));
     }
 
+    if request.fee_only {
+        let response = match command_service_fee(paths, node_name, &request.command) {
+            Ok(fee_quote) => AdminResponse {
+                ok: true,
+                output: Vec::new(),
+                error: None,
+                fee_quote,
+            },
+            Err(error) => AdminResponse {
+                ok: false,
+                output: Vec::new(),
+                error: Some(error.to_string()),
+                fee_quote: None,
+            },
+        };
+        stream.write_all(&serde_json::to_vec(&response)?)?;
+        return Ok(());
+    }
+
     ADMIN_PASSWORD.with(|slot| *slot.borrow_mut() = Some(password.to_owned()));
     ADMIN_OUTPUT.with(|slot| *slot.borrow_mut() = Some(Vec::new()));
     let result = execute_daemon_command(paths, request.node, request.output, request.command);
@@ -3771,11 +3956,13 @@ fn handle_admin_connection(
             ok: true,
             output,
             error: None,
+            fee_quote: None,
         },
         Err(error) => AdminResponse {
             ok: false,
             output,
             error: Some(error.to_string()),
+            fee_quote: None,
         },
     };
     stream.write_all(&serde_json::to_vec(&response)?)?;

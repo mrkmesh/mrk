@@ -413,6 +413,14 @@ pub struct RelayConnection {
     inner: Arc<ConnectionInner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceFeeQuote {
+    pub fee: u128,
+    pub recommended_max_fee: u128,
+}
+
+type FeeConfirmation = Box<dyn FnOnce(ServiceFeeQuote) -> Result<(), RelayError> + Send + 'static>;
+
 struct ConnectionInner {
     options: ClientOptions,
     commands: mpsc::Sender<DriverCommand>,
@@ -430,9 +438,28 @@ impl RelayConnection {
         &self,
         peer_id: impl Into<String>,
     ) -> Result<EncryptedStream, RelayError> {
-        let peer_id = peer_id.into();
+        self.open_auto_inner(peer_id.into(), None).await
+    }
+
+    pub async fn open_auto_with_fee_confirmation<F>(
+        &self,
+        peer_id: impl Into<String>,
+        confirm: F,
+    ) -> Result<EncryptedStream, RelayError>
+    where
+        F: FnOnce(ServiceFeeQuote) -> Result<(), RelayError> + Send + 'static,
+    {
+        self.open_auto_inner(peer_id.into(), Some(Box::new(confirm)))
+            .await
+    }
+
+    async fn open_auto_inner(
+        &self,
+        peer_id: String,
+        confirm_fee: Option<FeeConfirmation>,
+    ) -> Result<EncryptedStream, RelayError> {
         let _guard = self.inner.open_lock.lock().await;
-        let authorization_id = self.reserve_member_session(&peer_id).await?;
+        let authorization_id = self.reserve_member_session(&peer_id, confirm_fee).await?;
         let view = self
             .resolve_authorization(&authorization_id, true, &peer_id, false)
             .await?;
@@ -607,7 +634,11 @@ impl RelayConnection {
         .map_err(|error| RelayError::Authorization(error.to_string()))
     }
 
-    async fn reserve_member_session(&self, peer_id: &str) -> Result<String, RelayError> {
+    async fn reserve_member_session(
+        &self,
+        peer_id: &str,
+        confirm_fee: Option<FeeConfirmation>,
+    ) -> Result<String, RelayError> {
         let configured_network = self
             .inner
             .options
@@ -717,6 +748,12 @@ impl RelayConnection {
             .to_string()
             .parse::<u128>()
             .map_err(|_| RelayError::Authorization("invalid maximum fee".to_owned()))?;
+        let fee = fee_quote
+            .get("fee")
+            .ok_or_else(|| RelayError::Authorization("invalid fee quote".to_owned()))?
+            .to_string()
+            .parse::<u128>()
+            .map_err(|_| RelayError::Authorization("invalid service fee".to_owned()))?;
         let fee_policy_version = fee_quote
             .get("policy_version")
             .and_then(serde_json::Value::as_u64)
@@ -740,6 +777,12 @@ impl RelayConnection {
             )?,
             unsigned,
         };
+        if let Some(confirm_fee) = confirm_fee {
+            confirm_fee(ServiceFeeQuote {
+                fee,
+                recommended_max_fee: max_fee_base_units,
+            })?;
+        }
         let submission = self
             .rpc(
                 "operation.submit",

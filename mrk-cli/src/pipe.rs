@@ -14,7 +14,7 @@ use mrk_core::{
 };
 use tokio::io::{AsyncWriteExt, split};
 
-use mrk_sdk::{ClientOptions, MemberIdentity, RelayClient};
+use mrk_sdk::{ClientOptions, MemberIdentity, RelayClient, RelayError};
 
 const PIPE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 static PIPE_INTERRUPTED: AtomicBool = AtomicBool::new(false);
@@ -111,6 +111,7 @@ pub struct StdioPipeOptions {
     pub allow_insecure_local: bool,
     pub tls_ca: Option<PathBuf>,
     pub max_auto_recovery_bytes: u64,
+    pub yes: bool,
 }
 
 pub struct RecoverySettlementOptions {
@@ -142,6 +143,7 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 allow_insecure_local,
                 tls_ca,
                 max_auto_recovery_bytes,
+                yes,
             } = options;
             let peer = match peer {
                 Some(peer) => Some(
@@ -213,7 +215,14 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                         .map_err(|error| Error::msg(error.to_string()))?;
                 }
                 connection
-                    .open_auto(peer_id)
+                    .open_auto_with_fee_confirmation(peer_id, move |quote| {
+                        super::confirm_service_fee_amounts(
+                            quote.fee,
+                            quote.recommended_max_fee,
+                            yes,
+                        )
+                        .map_err(|error| RelayError::Authorization(error.to_string()))
+                    })
                     .await
                     .map_err(|error| Error::msg(error.to_string()))?
             } else {

@@ -52,7 +52,7 @@ mrk account history --account default --limit 20
 
 Signed operations are applied to the local state machine in deterministic submission order and initially return `PENDING`. They become `FINALIZED` only when included in either a Node 1 block or a block carrying a valid multi-Validator commit certificate. The operation ID is unchanged by finalization.
 
-Use `--dry-run` to validate a transfer without signing, or `--yes --output json` for automation. A private key is never accepted as a CLI argument. Keystores use Ed25519 keys encrypted with PBKDF2-HMAC-SHA256 and AES-256-GCM.
+Use `--dry-run` to validate a transfer without signing. Every operation with a non-zero service fee unlocks its keystore first, displays the current and maximum service fee, and requires confirmation before submission; use the global `--yes` flag with `--output json` for automation. A private key is never accepted as a CLI argument. Keystores use Ed25519 keys encrypted with PBKDF2-HMAC-SHA256 and AES-256-GCM.
 
 For non-interactive development and tests, the password can be provided through `MRK_KEYSTORE_PASSWORD`. Production automation should set `MRK_KEYSTORE_PASSWORD_FILE` to a root/service-managed file readable only by its owner; files accessible by group or others are rejected. The systemd example uses `LoadCredential` so the secret is not stored in the unit or process arguments.
 

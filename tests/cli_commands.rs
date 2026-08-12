@@ -570,6 +570,31 @@ fn account_and_node_cli_commands_emit_json() {
         "600"
     );
 
+    let invalid_password = Command::new(env!("CARGO_BIN_EXE_mrk"))
+        .arg("--data-dir")
+        .arg(&root)
+        .arg("--output")
+        .arg("json")
+        .arg("--rpc-endpoint")
+        .arg(format!("ws://127.0.0.1:{port}/v1/rpc"))
+        .arg("--rpc-allow-insecure-local")
+        .args([
+            "network",
+            "create",
+            "--name",
+            "invalid-password",
+            "--account",
+            "default",
+            "--yes",
+        ])
+        .env("MRK_KEYSTORE_PASSWORD", "incorrect-password")
+        .output()
+        .unwrap();
+    assert!(!invalid_password.status.success());
+    let invalid_password_error = String::from_utf8_lossy(&invalid_password.stderr);
+    assert!(invalid_password_error.contains("invalid keystore password"));
+    assert!(!invalid_password_error.contains("Service fee:"));
+
     let create_network = run_mrk_rpc(
         &root,
         port,
@@ -580,6 +605,7 @@ fn account_and_node_cli_commands_emit_json() {
             "team",
             "--account",
             "default",
+            "--yes",
         ],
     );
     assert!(
@@ -587,6 +613,7 @@ fn account_and_node_cli_commands_emit_json() {
         "{}",
         String::from_utf8_lossy(&create_network.stderr)
     );
+    assert!(String::from_utf8_lossy(&create_network.stderr).contains("Service fee: 0.1 MRK"));
     let produced = run(
         env!("CARGO_BIN_EXE_mrk"),
         &root,
@@ -643,6 +670,7 @@ fn account_and_node_cli_commands_emit_json() {
             "client-a",
             "--account",
             "default",
+            "--yes",
         ])
         .env("MRK_KEYSTORE_PASSWORD", "cli-integration-password")
         .stdout(Stdio::piped())
@@ -706,6 +734,7 @@ fn account_and_node_cli_commands_emit_json() {
         "{}",
         String::from_utf8_lossy(&issued.stderr)
     );
+    assert!(String::from_utf8_lossy(&issued.stderr).contains("Service fee: 0.01 MRK"));
     let issued_json: serde_json::Value = serde_json::from_slice(&issued.stdout).unwrap();
     assert_eq!(issued_json["status"], "FINALIZED");
     assert!(!pending_path.exists());
@@ -783,13 +812,20 @@ fn account_and_node_cli_commands_emit_json() {
     let update_price = run(
         env!("CARGO_BIN_EXE_mrk"),
         &root,
-        &["node", "update-price", "--price-per-gib", "0.03MRK"],
+        &[
+            "node",
+            "update-price",
+            "--price-per-gib",
+            "0.03MRK",
+            "--yes",
+        ],
     );
     assert!(
         update_price.status.success(),
         "{}",
         String::from_utf8_lossy(&update_price.stderr)
     );
+    assert!(String::from_utf8_lossy(&update_price.stderr).contains("Service fee: 0.01 MRK"));
     let update_price_json: serde_json::Value =
         serde_json::from_slice(&update_price.stdout).unwrap();
     assert_eq!(update_price_json["status"], "PENDING");
