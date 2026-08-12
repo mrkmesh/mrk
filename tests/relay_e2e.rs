@@ -99,6 +99,13 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
     let password = "relay-e2e-password";
     let now = Utc::now().timestamp();
     service::create_account(&paths, "owner", password).unwrap();
+    let owner = service::account_keyfile(&paths, "owner").unwrap();
+    paths
+        .with_ledger_mut(|ledger| {
+            ledger.accounts.get_mut(&owner.address).unwrap().balance = 10 * MRK_SCALE;
+            Ok(())
+        })
+        .unwrap();
     service::create_network(&paths, "owner", password, "team", now).unwrap();
     let (alice_credential, _) =
         service::issue_member(&paths, "owner", password, "team", "alice", 7, now + 1).unwrap();
@@ -114,14 +121,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         now + 3,
     )
     .unwrap();
-    let owner = service::account_keyfile(&paths, "owner").unwrap();
-    paths
-        .with_ledger_mut(|ledger| {
-            ledger.accounts.get_mut(&owner.address).unwrap().balance = 10 * MRK_SCALE;
-            Ok(())
-        })
-        .unwrap();
-    service::fund_network(&paths, "owner", password, "team", "2MRK", now + 4).unwrap();
+    service::fund_network(&paths, "owner", password, "team", "3MRK", now + 4).unwrap();
     let network = service::network_by_alias(&paths, "team").unwrap();
     let alice_key = paths
         .read_keyfile(&paths.member_key_path("team", "alice").unwrap())
@@ -212,7 +212,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    let child_guard = ChildGuard(child);
+    let mut child_guard = ChildGuard(child);
     wait_for_health(port);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -412,6 +412,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         let mut alice_cli = Command::new(env!("CARGO_BIN_EXE_mrk"))
             .arg("--data-dir")
             .arg(&alice_cli_root)
+            .arg("--yes")
             .arg("pipe")
             .arg("--network")
             .arg("team")
@@ -480,6 +481,13 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
             .unwrap()
             .unwrap();
         assert_eq!(&from_bob, b"cli-bob-to-alice");
+        for _ in 0..80 {
+            alice_stdin.write_all(b"a").unwrap();
+            alice_stdin.flush().unwrap();
+            bob_stdin.write_all(b"b").unwrap();
+            bob_stdin.flush().unwrap();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
         let unsettled: Vec<service::UnsettledPaymentView> = serde_json::from_value(
             tokio::task::block_in_place(|| {
                 relay_client::run_rpc_call(
@@ -494,26 +502,52 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
         )
         .unwrap();
         assert!(unsettled.is_empty());
-        // SAFETY: `alice_cli.id()` is the live child process spawned above.
+        // SAFETY: The Node daemon is the live child process spawned above.
         assert_eq!(
-            unsafe { libc::kill(alice_cli.id() as i32, libc::SIGINT) },
+            unsafe { libc::kill(child_guard.0.id() as i32, libc::SIGTERM) },
             0
         );
-        drop(alice_stdin);
-        drop(bob_stdin);
         let trailing = bob_eof_rx
             .recv_timeout(Duration::from_secs(30))
             .unwrap()
             .unwrap();
-        assert!(trailing.is_empty());
+        assert_eq!(trailing, vec![b'b'; 80]);
         let trailing = alice_eof_rx
             .recv_timeout(Duration::from_secs(30))
             .unwrap()
             .unwrap();
-        assert!(trailing.is_empty());
+        assert_eq!(trailing, vec![b'a'; 80]);
 
         assert!(alice_cli.wait().unwrap().success());
         assert!(bob_cli.wait().unwrap().success());
+        drop(alice_stdin);
+        drop(bob_stdin);
+        assert!(child_guard.0.wait().unwrap().success());
+        DataPaths::new(Some(root.clone()))
+            .unwrap()
+            .with_ledger_mut(|ledger| {
+                ledger.nodes.get_mut(&node.node_id).unwrap().endpoint =
+                    format!("ws://127.0.0.1:{port}/v1/relay");
+                Ok(())
+            })
+            .unwrap();
+        let restarted = Command::new(env!("CARGO_BIN_EXE_mrk"))
+            .arg("--data-dir")
+            .arg(&root)
+            .arg("node")
+            .arg("--node")
+            .arg("node1")
+            .arg("run")
+            .arg("--listen")
+            .arg(format!("127.0.0.1:{port}"))
+            .arg("--allow-insecure-local")
+            .env("MRK_KEYSTORE_PASSWORD", password)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let restarted_guard = ChildGuard(restarted);
+        wait_for_health(port);
         let mut finalized_after_cli_exit = false;
         for _ in 0..30 {
             let history = tokio::task::block_in_place(|| {
@@ -545,6 +579,7 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
             finalized_after_cli_exit,
             "Node should finalize persisted receipts after both pipe CLIs exit"
         );
+        drop(restarted_guard);
         proxy.abort();
     });
 

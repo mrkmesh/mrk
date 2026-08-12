@@ -169,7 +169,7 @@ EncryptedStream: AsyncRead + AsyncWrite
 - 加密上下文绑定 Ledger、Node、Channel、Authorization、Session、双方 Member ID 和握手 transcript；Relay 修改、重排、重放或跨通道替换密文都会认证失败。
 - `AsyncWrite::shutdown()` 发送认证 FIN 和最终累计 Checkpoint，并等待 Receipt；Relay 在认证 FIN 完成前关闭通道属于截断错误。
 - `mrk pipe` 第一次收到 Ctrl+C 时停止读取 stdin，发送加密 FIN 和 `CloseIntent`；Node 返回 final `CheckpointRequest`，双方签出普通 final receipt。Node 持久化双方 final receipt 后两侧即可退出，并在后台完成结算终局和未消费 reservation 释放。第二次 Ctrl+C 强制退出。
-- 进程崩溃或网络中断时，Node 只把未签尾部保留在内存，并持久化不含 DATA、Sequence、字节数和 Transcript 的小型 authorization hold。重启后的 `mrk pipe` 先恢复匹配会话，仅在 Node 报告的双向增量总和不超过本次 `--max-auto-recovery-bytes` 时补签；默认值为 0，该参数不上链。Node 重启后精确尾部丢失，不能补签。Node Owner 可手动提交普通 Refund，或按默认策略及具体 Network 覆盖设置 `max_auto_abandon_bytes`；自动放弃额度按 Network 和 Member 做 24 小时累计审计。
+- 客户端崩溃或网络中断时，运行中的 Node 只把未签尾部保留在内存，并持久化不含 DATA、Sequence、字节数和 Transcript 的小型 authorization hold。重连后的 `mrk pipe` 先恢复匹配会话，仅在 Node 报告的双向增量总和不超过本次 `--max-auto-recovery-bytes` 时补签；默认值为 0，该参数不上链。SIGINT/SIGTERM 会让 Node 停止接收新 Relay channel，并通知现有 channel 在当前付款边界立即交换 FIN、最终 checkpoint 和 receipt；全部 receipt 落盘后才退出。第二次信号或 30 秒超时会强制退出。此类非优雅退出后精确尾部已经丢失，Node 下次启动时直接提交 Owner 签名的 abandon 操作清理对应 hold，不再要求客户端恢复一个不存在的尾部；已落盘、待上链的双签 receipt 不会被放弃。运行中断线会话的自动放弃仍按 Network 和 Member 做 24 小时累计审计。
 - SDK 使用有界队列和有界字节缓冲暴露背压，不能无限占用内存。
 - 同一通道内按 `sequence` 有序；连接断开后旧通道失效，由上层应用决定是否重新建立并重放业务数据。
 - WSS 基于 TCP，存在队头阻塞。这是当前协议选择的已知取舍，上层不要把它当成无序数据报服务。

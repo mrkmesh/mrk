@@ -247,6 +247,7 @@ pub enum FrameType {
     ReceiverReceipt = 14,
     CheckpointRequest = 15,
     CloseIntent = 16,
+    Drain = 17,
 }
 
 impl TryFrom<u8> for FrameType {
@@ -270,6 +271,7 @@ impl TryFrom<u8> for FrameType {
             14 => Ok(Self::ReceiverReceipt),
             15 => Ok(Self::CheckpointRequest),
             16 => Ok(Self::CloseIntent),
+            17 => Ok(Self::Drain),
             _ => Err(Error::msg(format!("unknown relay frame type {value}"))),
         }
     }

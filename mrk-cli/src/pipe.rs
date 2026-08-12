@@ -1,4 +1,5 @@
 use std::{
+    fs::OpenOptions,
     path::PathBuf,
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -36,13 +37,12 @@ fn peer_member_id(network: &NetworkRecord, peer: &str) -> Result<String> {
     )))
 }
 
-async fn resolve_peer_member_id(
+async fn load_network_record(
     endpoint: &str,
     network: &str,
-    peer: &str,
     allow_insecure_local: bool,
     tls_ca: Option<&std::path::Path>,
-) -> Result<String> {
+) -> Result<NetworkRecord> {
     let mut rpc_endpoint = normalize_websocket_url(endpoint, RELAY_PATH)?;
     rpc_endpoint.set_path(RPC_PATH);
     rpc_endpoint.set_query(None);
@@ -55,7 +55,7 @@ async fn resolve_peer_member_id(
         tls_ca,
     )
     .await?;
-    peer_member_id(&serde_json::from_value(value)?, peer)
+    serde_json::from_value(value).map_err(Into::into)
 }
 
 extern "C" fn record_pipe_interrupt(_: libc::c_int) {
@@ -126,13 +126,47 @@ pub struct RecoverySettlementOptions {
     pub max_auto_recovery_bytes: u64,
 }
 
+fn confirm_pipe_service_fee(fee: u128, recommended_max_fee: u128, yes: bool) -> Result<()> {
+    if fee == 0 {
+        return Ok(());
+    }
+    eprintln!("Service fee: {}", super::format_mrk(fee));
+    eprintln!(
+        "Maximum service fee: {}",
+        super::format_mrk(recommended_max_fee)
+    );
+    if yes {
+        return Ok(());
+    }
+
+    let tty = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| {
+            Error::msg(
+                "mrk pipe needs --yes to confirm a service fee when no controlling terminal is available",
+            )
+        })?;
+    let mut reader = std::io::BufReader::new(tty.try_clone()?);
+    let mut writer = tty;
+    std::io::Write::write_all(&mut writer, b"Type \"yes\" to confirm and submit: ")?;
+    std::io::Write::flush(&mut writer)?;
+    let mut answer = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut answer)?;
+    if answer.trim() != "yes" {
+        return Err(Error::msg("operation cancelled"));
+    }
+    Ok(())
+}
+
 pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
     let _interrupt_guard = PipeInterruptGuard::install()?;
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-        .map_err(Error::Io)?
-        .block_on(async move {
+        .map_err(Error::Io)?;
+    let result = runtime.block_on(async move {
             let StdioPipeOptions {
                 paths,
                 network,
@@ -145,31 +179,32 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 max_auto_recovery_bytes,
                 yes,
             } = options;
-            let peer = match peer {
-                Some(peer) => Some(
-                    resolve_peer_member_id(
-                        &endpoint,
-                        &network,
-                        &peer,
-                        allow_insecure_local,
-                        tls_ca.as_deref(),
-                    )
-                    .await?,
-                ),
-                None => None,
-            };
-            let identity = MemberIdentity::from_relay(
+            if let Some(peer) = &peer {
+                eprintln!("pipe: resolving peer {peer} on Network {network}");
+            } else {
+                eprintln!("pipe: loading Network {network}");
+            }
+            let network_record = load_network_record(
+                &endpoint,
+                &network,
+                allow_insecure_local,
+                tls_ca.as_deref(),
+            )
+            .await?;
+            let peer = peer
+                .map(|peer| peer_member_id(&network_record, &peer))
+                .transpose()?;
+            eprintln!("pipe: loading Member {member} identity");
+            let identity = MemberIdentity::from_data_paths_with_network_record(
                 &paths,
                 &network,
                 &member,
                 &password,
-                &endpoint,
-                allow_insecure_local,
-                tls_ca.as_deref(),
+                &network_record,
             )
-            .await
             .map_err(|error| Error::msg(error.to_string()))?;
             let unsettled = if peer.is_some() && max_auto_recovery_bytes > 0 {
+                eprintln!("pipe: checking interrupted Relay sessions");
                 let mut rpc_endpoint = normalize_websocket_url(&endpoint, RELAY_PATH)?;
                 rpc_endpoint.set_path(RPC_PATH);
                 rpc_endpoint.set_query(None);
@@ -192,9 +227,11 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
             if let Some(path) = &tls_ca {
                 client_options = client_options.tls_ca(path);
             }
+            eprintln!("pipe: connecting to Relay {endpoint}");
             let connection = RelayClient::connect(client_options)
                 .await
                 .map_err(|error| Error::msg(error.to_string()))?;
+            eprintln!("pipe: Relay connection authenticated");
             let stream = if let Some(peer_id) = peer {
                 for item in unsettled.into_iter().filter(|item| {
                     let authorization = &item.authorization;
@@ -214,18 +251,16 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                         .await
                         .map_err(|error| Error::msg(error.to_string()))?;
                 }
+                eprintln!("pipe: authorizing encrypted stream to member {peer_id}");
                 connection
                     .open_auto_with_fee_confirmation(peer_id, move |quote| {
-                        super::confirm_service_fee_amounts(
-                            quote.fee,
-                            quote.recommended_max_fee,
-                            yes,
-                        )
-                        .map_err(|error| RelayError::Authorization(error.to_string()))
+                        confirm_pipe_service_fee(quote.fee, quote.recommended_max_fee, yes)
+                            .map_err(|error| RelayError::Authorization(error.to_string()))
                     })
                     .await
                     .map_err(|error| Error::msg(error.to_string()))?
             } else {
+                eprintln!("pipe: waiting for an incoming encrypted stream");
                 loop {
                     let incoming = connection
                         .accept()
@@ -249,7 +284,7 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
                 }
             };
             eprintln!(
-                "End-to-end encrypted Relay stream connected to member {}; piping stdin/stdout",
+                "pipe: ready; encrypted Relay stream connected to member {}; piping stdin/stdout",
                 stream.peer_id(),
             );
             let (mut stream_reader, mut stream_writer) = split(stream);
@@ -310,7 +345,12 @@ pub fn run_stdio_pipe(options: StdioPipeOptions) -> Result<()> {
             result.map_err(|error| Error::msg(format!("pipe member {member}: {error}")))?;
             eprintln!("Relay stream closed; final receipts persisted by Node");
             Ok(())
-        })
+        });
+    // `tokio::io::stdin` uses a blocking reader thread. If the remote side closes while
+    // stdin remains open (notably during Node drain), waiting for the Runtime destructor
+    // would keep the CLI alive until another byte or EOF arrived on stdin.
+    runtime.shutdown_background();
+    result
 }
 
 pub fn run_recovery_settlement(options: RecoverySettlementOptions) -> Result<()> {

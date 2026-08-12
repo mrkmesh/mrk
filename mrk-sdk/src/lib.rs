@@ -651,7 +651,8 @@ impl RelayConnection {
                         .to_owned(),
                 )
             })?;
-        let (network_value, relay_value) = tokio::try_join!(
+        let signer_address = self.inner.options.identity.signer_address()?;
+        let (network_value, relay_value, balance, chain) = tokio::try_join!(
             self.rpc(
                 "network.get",
                 serde_json::json!({"alias": configured_network.alias}),
@@ -660,6 +661,11 @@ impl RelayConnection {
                 "node.get",
                 serde_json::json!({"node_id": self.inner.node_id}),
             ),
+            self.rpc(
+                "account.balance",
+                serde_json::json!({"address": signer_address}),
+            ),
+            self.rpc("system.ping", serde_json::json!({})),
         )?;
         let network: NetworkRecord = serde_json::from_value(network_value)
             .map_err(|error| RelayError::Authorization(error.to_string()))?;
@@ -701,19 +707,11 @@ impl RelayConnection {
                 "a Relay member credential has expired".to_owned(),
             ));
         }
-        let signer_address = self.inner.options.identity.signer_address()?;
-        let balance = self
-            .rpc(
-                "account.balance",
-                serde_json::json!({"address": signer_address}),
-            )
-            .await?;
         let nonce = balance
             .get("nonce")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| RelayError::Authorization("invalid account nonce".to_owned()))?
             .saturating_add(1);
-        let chain = self.rpc("system.ping", serde_json::json!({})).await?;
         let ledger_id = chain
             .get("ledger_id")
             .and_then(serde_json::Value::as_str)
@@ -1167,6 +1165,7 @@ async fn run_connection_driver(
                             | FrameType::CheckpointRequest
                             | FrameType::SenderCheckpoint
                             | FrameType::ReceiverReceipt
+                            | FrameType::Drain
                             | FrameType::Close => {
                                 let channel_id = frame.channel_id;
                                 let Some(sender) = routes.get(&channel_id).cloned() else {
@@ -2496,6 +2495,7 @@ async fn run_stream_loop(
     let mut remote_fin = false;
     let mut local_fin_receipted = false;
     let mut remote_fin_receipted = false;
+    let mut drain_requested = false;
     loop {
         let window_remaining = RELAY_PAYMENT_WINDOW_BYTES.saturating_sub(
             channel
@@ -2531,8 +2531,30 @@ async fn run_stream_loop(
                 .await?;
             return Ok(());
         }
+        if drain_requested && !local_fin && !channel.outgoing.awaiting_receipt {
+            sdk_debug("Relay Node drain reached a payment boundary; sending authenticated FIN");
+            send_encrypted_record(
+                &channel.transport,
+                &channel.cipher,
+                channel.outgoing_direction,
+                &mut channel.outgoing,
+                RECORD_FIN,
+                &[],
+            )
+            .await?;
+            local_fin = true;
+            send_close_intent(
+                &channel.transport,
+                view,
+                channel.outgoing_direction,
+                &channel.outgoing,
+            )
+            .await?;
+            continue;
+        }
         tokio::select! {
-            input_result = application_input.read(&mut input[..read_capacity]), if !local_fin
+            input_result = application_input.read(&mut input[..read_capacity]), if !drain_requested
+                && !local_fin
                 && !channel.outgoing.awaiting_receipt
                 && read_capacity > 0
                 && channel.outgoing.window_started_at.is_none_or(|started| {
@@ -2668,6 +2690,15 @@ async fn run_stream_loop(
                             local_fin_receipted_signal.complete();
                         }
                     }
+                    FrameType::Drain => {
+                        if !frame.payload.is_empty() {
+                            return Err(RelayError::Protocol(
+                                "Relay Drain frame must not have a payload".to_owned(),
+                            ));
+                        }
+                        sdk_debug("Relay Node is draining; stopping application input");
+                        drain_requested = true;
+                    }
                     FrameType::Close => {
                         if !channel.initiator
                             && local_fin
@@ -2756,9 +2787,7 @@ async fn send_checkpoint(
     if request.authorization_id != view.authorization.authorization_id
         || request.session_id != view.authorization.session_id
         || request.direction != direction
-        || request.sequence != state.sequence
-        || request.cumulative_sent_bytes != state.cumulative_bytes
-        || request.transcript_hash != state.transcript_hash
+        || !checkpoint_request_matches_outgoing_state(request, state)
         || state.awaiting_receipt
     {
         return Err(RelayError::Protocol(
@@ -2798,6 +2827,19 @@ async fn send_checkpoint(
     state.awaiting_receipt = true;
     state.pending_checkpoint = Some(checkpoint);
     Ok(())
+}
+
+fn checkpoint_request_matches_outgoing_state(
+    request: &CheckpointRequest,
+    state: &DirectionState,
+) -> bool {
+    let exact = request.sequence == state.sequence
+        && request.cumulative_sent_bytes == state.cumulative_bytes
+        && request.transcript_hash == state.transcript_hash;
+    exact
+        || (!request.final_checkpoint
+            && request.sequence < state.sequence
+            && request.cumulative_sent_bytes < state.cumulative_bytes)
 }
 
 fn sdk_debug(message: &str) {
@@ -2985,6 +3027,37 @@ mod tests {
 
         drop(paths);
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn periodic_checkpoint_request_accepts_a_newer_local_prefix() {
+        let mut request = CheckpointRequest {
+            authorization_id: "authorization".to_owned(),
+            session_id: "session".to_owned(),
+            direction: RelayDirection::SenderToReceiver,
+            sequence: 1,
+            cumulative_sent_bytes: 10,
+            transcript_hash: "old-transcript".to_owned(),
+            requested_at: 1,
+            final_checkpoint: false,
+        };
+        let state = DirectionState {
+            sequence: 2,
+            cumulative_bytes: 20,
+            transcript_hash: "new-transcript".to_owned(),
+            window_started_at: None,
+            window_started_bytes: 0,
+            awaiting_receipt: false,
+            pending_checkpoint: None,
+        };
+
+        assert!(checkpoint_request_matches_outgoing_state(&request, &state));
+        request.final_checkpoint = true;
+        assert!(!checkpoint_request_matches_outgoing_state(&request, &state));
+        request.sequence = state.sequence;
+        request.cumulative_sent_bytes = state.cumulative_bytes;
+        request.transcript_hash = state.transcript_hash.clone();
+        assert!(checkpoint_request_matches_outgoing_state(&request, &state));
     }
 
     #[test]

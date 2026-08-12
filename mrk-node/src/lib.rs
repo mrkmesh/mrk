@@ -16,6 +16,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{self, SyncSender},
     },
     thread,
@@ -58,6 +59,10 @@ const MAX_RPC_REQUESTS_PER_MINUTE: u32 = 120;
 const MAX_RPC_MUTATIONS_PER_MINUTE: u32 = 20;
 const RELAY_RECOVERY_GRACE_SECONDS: i64 = 30;
 const RELAY_UNKNOWN_TAIL_MAX_BYTES: u64 = 2 * RELAY_PAYMENT_WINDOW_BYTES;
+const RELAY_CHECKPOINT_IN_FLIGHT_MAX_BYTES: u64 = MAX_FRAME_PAYLOAD as u64;
+const RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS: i64 = 5;
+const NODE_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+static NODE_SHUTDOWN_SIGNALS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalNodeLedgerState {
@@ -134,6 +139,7 @@ struct HubState {
     routes: HashMap<u32, Route>,
     interrupted_routes: HashMap<String, InterruptedRoute>,
     last_recovery_policy_at: i64,
+    draining: bool,
 }
 
 struct RelayHub {
@@ -609,7 +615,7 @@ impl RelayHub {
         node_password: String,
     ) -> Result<Self> {
         paths.promote_active_relay_sessions(Utc::now().timestamp())?;
-        auto_abandon_lost_relay_sessions(
+        abandon_lost_relay_sessions(
             &paths,
             &node_name,
             &node_password,
@@ -632,6 +638,9 @@ impl RelayHub {
             .state
             .lock()
             .map_err(|_| Error::msg("relay connection state lock is poisoned"))?;
+        if state.draining {
+            return Err(Error::msg("Relay Node is shutting down"));
+        }
         let key = (member.network_id.clone(), member.member_id.clone());
         let current = state.member_connections.get(&key).map_or(0, Vec::len);
         if current >= member.max_connections as usize {
@@ -724,12 +733,14 @@ impl RelayHub {
                 ))
             })
             .collect::<Vec<_>>();
-        for (channel_id, source, destination, authorization, route) in closed {
+        for (channel_id, source, destination, authorization, mut route) in closed {
             state.routes.remove(&channel_id);
             if let (Some(paths), Some(view)) = (&self.paths, authorization)
                 && !(route.source_direction.final_receipt_persisted
                     && route.destination_direction.final_receipt_persisted)
             {
+                reset_direction_for_recovery(&mut route.source_direction);
+                reset_direction_for_recovery(&mut route.destination_direction);
                 let interrupted_at = Utc::now().timestamp();
                 let authorization_id = view.authorization.authorization_id.clone();
                 state.interrupted_routes.insert(
@@ -944,7 +955,7 @@ impl RelayHub {
                 }
             }
         }
-        auto_abandon_lost_relay_sessions(
+        abandon_lost_relay_sessions(
             paths,
             node_name,
             password,
@@ -966,6 +977,13 @@ impl RelayHub {
             .ok_or_else(|| Error::msg("relay connection is not registered"))?;
         match frame.frame_type {
             FrameType::Open => {
+                if state.draining {
+                    return send_protocol_error(
+                        &source_peer.sender,
+                        "NODE_DRAINING",
+                        "Relay Node is shutting down",
+                    );
+                }
                 if state
                     .routes
                     .values()
@@ -1116,8 +1134,8 @@ impl RelayHub {
                             ));
                         }
                         (
-                            recovery.source_direction.clone(),
-                            recovery.destination_direction.clone(),
+                            direction_for_recovery(&recovery.source_direction),
+                            direction_for_recovery(&recovery.destination_direction),
                             recovery.source_sequence,
                             recovery.destination_sequence,
                             authorization.session_id.clone(),
@@ -1313,7 +1331,17 @@ impl RelayHub {
                     ));
                 }
                 if current_direction.awaiting_receipt
-                    || current_direction.checkpoint_request.is_some()
+                    || current_direction
+                        .checkpoint_request
+                        .as_ref()
+                        .is_some_and(|request| {
+                            !checkpoint_allows_in_flight_data(
+                                request,
+                                current_direction,
+                                frame.payload.len(),
+                                Utc::now().timestamp(),
+                            )
+                        })
                 {
                     return Err(Error::msg(
                         "relay direction is paused for a Node-requested checkpoint",
@@ -1415,6 +1443,7 @@ impl RelayHub {
                         &frame.payload,
                     );
                     if !route.recovery
+                        && direction.checkpoint_request.is_none()
                         && direction
                             .cumulative_bytes
                             .saturating_sub(direction.window_started_bytes)
@@ -1565,9 +1594,7 @@ impl RelayHub {
                         }
                     || checkpoint.cumulative_sent_bytes != direction.cumulative_bytes
                     || checkpoint.transcript_hash != direction.transcript_hash
-                    || checkpoint.sequence != request.sequence
-                    || checkpoint.cumulative_sent_bytes != request.cumulative_sent_bytes
-                    || checkpoint.transcript_hash != request.transcript_hash
+                    || !checkpoint_covers_request(&checkpoint, request)
                     || checkpoint.final_checkpoint != request.final_checkpoint
                     || checkpoint.checkpoint_at < request.requested_at
                     || checkpoint.checkpoint_at < view.authorization.created_at
@@ -1727,6 +1754,48 @@ impl RelayHub {
             )),
         }
     }
+
+    fn begin_graceful_shutdown(&self) -> Result<usize> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| Error::msg("relay connection state lock is poisoned"))?;
+        state.draining = true;
+        let routes = state
+            .routes
+            .iter()
+            .filter(|(_, route)| !route.recovery)
+            .map(|(channel_id, route)| (*channel_id, route.source, route.destination))
+            .collect::<Vec<_>>();
+        for (channel_id, source, destination) in &routes {
+            for connection_id in [source, destination] {
+                if let Some(peer) = state.peers.get(connection_id)
+                    && let Err(error) = send_relay_frame(
+                        &peer.sender,
+                        RelayFrame {
+                            frame_type: FrameType::Drain,
+                            flags: 0,
+                            channel_id: *channel_id,
+                            sequence: 0,
+                            payload: Vec::new(),
+                        },
+                    )
+                {
+                    eprintln!(
+                        "could not notify Relay connection {connection_id} to drain channel {channel_id}: {error}"
+                    );
+                }
+            }
+        }
+        Ok(routes.len())
+    }
+
+    fn active_route_count(&self) -> Result<usize> {
+        self.state
+            .lock()
+            .map(|state| state.routes.len())
+            .map_err(|_| Error::msg("relay connection state lock is poisoned"))
+    }
 }
 
 fn schedule_checkpoint_request(
@@ -1750,6 +1819,45 @@ fn schedule_checkpoint_request(
     state.checkpoint_due = true;
     state.checkpoint_request = Some(request.clone());
     request
+}
+
+fn reset_direction_for_recovery(direction: &mut DirectionState) {
+    direction.window_started_at = None;
+    direction.checkpoint_due = false;
+    direction.awaiting_receipt = false;
+    direction.pending_checkpoint = None;
+    direction.checkpoint_request = None;
+}
+
+fn direction_for_recovery(direction: &DirectionState) -> DirectionState {
+    let mut direction = direction.clone();
+    reset_direction_for_recovery(&mut direction);
+    direction
+}
+
+fn checkpoint_covers_request(checkpoint: &SenderCheckpoint, request: &CheckpointRequest) -> bool {
+    let exact = checkpoint.sequence == request.sequence
+        && checkpoint.cumulative_sent_bytes == request.cumulative_sent_bytes
+        && checkpoint.transcript_hash == request.transcript_hash;
+    exact
+        || (!request.final_checkpoint
+            && checkpoint.sequence > request.sequence
+            && checkpoint.cumulative_sent_bytes > request.cumulative_sent_bytes)
+}
+
+fn checkpoint_allows_in_flight_data(
+    request: &CheckpointRequest,
+    state: &DirectionState,
+    payload_bytes: usize,
+    now: i64,
+) -> bool {
+    !request.final_checkpoint
+        && now.saturating_sub(request.requested_at) <= RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS
+        && state
+            .cumulative_bytes
+            .saturating_add(payload_bytes as u64)
+            .saturating_sub(request.cumulative_sent_bytes)
+            <= RELAY_CHECKPOINT_IN_FLIGHT_MAX_BYTES
 }
 
 fn active_unsettled_relay_sessions(
@@ -1806,7 +1914,7 @@ fn record_auto_abandon_budget(
     }
 }
 
-fn auto_abandon_lost_relay_sessions(
+fn abandon_lost_relay_sessions(
     paths: &DataPaths,
     node_name: &str,
     password: &str,
@@ -1814,13 +1922,6 @@ fn auto_abandon_lost_relay_sessions(
     now: i64,
     excluded_authorizations: &HashSet<String>,
 ) {
-    let config = match paths.read_node_config(node_name) {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("could not read Relay auto-abandon policy: {error}");
-            return;
-        }
-    };
     let ledger = match paths.read_ledger() {
         Ok(ledger) => ledger,
         Err(error) => {
@@ -1854,32 +1955,16 @@ fn auto_abandon_lost_relay_sessions(
         let Some(authorization) = ledger.payment_authorizations.get(&hold.authorization_id) else {
             continue;
         };
-        let limit = config
-            .relay_auto_abandon
-            .max_bytes_for(&authorization.network_commitment);
-        if limit < RELAY_UNKNOWN_TAIL_MAX_BYTES
-            || !record_auto_abandon_budget(
-                paths,
-                authorization,
-                RELAY_UNKNOWN_TAIL_MAX_BYTES,
-                limit,
-                now,
-            )
-        {
-            continue;
-        }
         match service::abandon_traffic_authorization_with_note(
             paths,
             node_name,
             password,
             &authorization.authorization_id,
-            &format!(
-                "node automatically abandoned an unknown Relay tail bounded by {RELAY_UNKNOWN_TAIL_MAX_BYTES} bytes after restart"
-            ),
+            "node abandoned an unsigned Relay tail after an unclean restart",
             now,
         ) {
             Ok(operation_id) => eprintln!(
-                "Relay auto-abandoned unknown tail up to {RELAY_UNKNOWN_TAIL_MAX_BYTES} bytes for {} ({operation_id})",
+                "Relay abandoned unsigned tail for {} after unclean restart ({operation_id})",
                 authorization.authorization_id
             ),
             Err(error) => eprintln!(
@@ -1998,6 +2083,59 @@ pub fn run_node_command(
         return call_admin_socket(paths, node, output, command);
     }
     execute_daemon_command(paths, node, output, command)
+}
+
+extern "C" fn record_node_shutdown(_: libc::c_int) {
+    NODE_SHUTDOWN_SIGNALS.fetch_add(1, Ordering::Relaxed);
+}
+
+struct NodeShutdownGuard {
+    previous_sigint: libc::sighandler_t,
+    previous_sigterm: libc::sighandler_t,
+}
+
+impl NodeShutdownGuard {
+    fn install() -> Result<Self> {
+        NODE_SHUTDOWN_SIGNALS.store(0, Ordering::Release);
+        // SAFETY: Both handlers only update a process-global atomic counter.
+        let previous_sigint = unsafe {
+            libc::signal(
+                libc::SIGINT,
+                record_node_shutdown as *const () as libc::sighandler_t,
+            )
+        };
+        if previous_sigint == libc::SIG_ERR {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: The handler only updates a process-global atomic counter.
+        let previous_sigterm = unsafe {
+            libc::signal(
+                libc::SIGTERM,
+                record_node_shutdown as *const () as libc::sighandler_t,
+            )
+        };
+        if previous_sigterm == libc::SIG_ERR {
+            // SAFETY: `previous_sigint` came from the successful installation above.
+            unsafe {
+                libc::signal(libc::SIGINT, previous_sigint);
+            }
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self {
+            previous_sigint,
+            previous_sigterm,
+        })
+    }
+}
+
+impl Drop for NodeShutdownGuard {
+    fn drop(&mut self) {
+        // SAFETY: Both previous handlers came from successful signal installations.
+        unsafe {
+            libc::signal(libc::SIGINT, self.previous_sigint);
+            libc::signal(libc::SIGTERM, self.previous_sigterm);
+        }
+    }
 }
 
 fn command_may_require_service_fee(command: &DaemonCommand) -> bool {
@@ -3500,6 +3638,7 @@ fn run_node_server(
     listen: SocketAddr,
     allow_insecure_local: bool,
 ) -> Result<()> {
+    let _shutdown_guard = NodeShutdownGuard::install()?;
     let owner_file = paths.read_keyfile(&paths.node_owner_key_path(name)?)?;
     decrypt_key(&owner_file, password)?;
     service::ensure_runtime_compatibility(paths, name)?;
@@ -3512,7 +3651,9 @@ fn run_node_server(
     let mut public_sync_worker_started = false;
     let mut ledger_recovery_waiting = false;
     let mut exited_node_waiting = false;
-    let mut hub = None;
+    let mut hub: Option<Arc<RelayHub>> = None;
+    let mut graceful_shutdown_started = None;
+    let traffic_settlement_lock = Arc::new(Mutex::new(()));
     let mut last_history_prune = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
@@ -3527,6 +3668,42 @@ fn run_node_server(
         );
     }
     loop {
+        let shutdown_signals = NODE_SHUTDOWN_SIGNALS.load(Ordering::Acquire);
+        if shutdown_signals >= 2 {
+            eprintln!("Second shutdown signal received; exiting immediately");
+            return Ok(());
+        }
+        if shutdown_signals == 1 && graceful_shutdown_started.is_none() {
+            public_listener = None;
+            let active_routes = if let Some(hub) = &hub {
+                hub.begin_graceful_shutdown()?
+            } else {
+                0
+            };
+            println!("Shutdown signal received; draining {active_routes} active Relay channel(s)");
+            graceful_shutdown_started = Some(Instant::now());
+        }
+        if let Some(started) = graceful_shutdown_started {
+            let active_routes = hub
+                .as_ref()
+                .map(|hub| hub.active_route_count())
+                .transpose()?
+                .unwrap_or_default();
+            if active_routes == 0 {
+                let _settlement_guard = traffic_settlement_lock
+                    .lock()
+                    .map_err(|_| Error::msg("traffic settlement lock is poisoned"))?;
+                flush_pending_traffic_settlements(paths, name, password)?;
+                println!("Relay channels drained; Node stopped cleanly.");
+                return Ok(());
+            }
+            if started.elapsed() >= NODE_GRACEFUL_SHUTDOWN_TIMEOUT {
+                eprintln!(
+                    "Relay drain did not finish within 30 seconds; exiting and abandoning unsigned tails on next startup"
+                );
+                return Ok(());
+            }
+        }
         match admin_listener.accept() {
             Ok((stream, _)) => {
                 let paths = paths.clone();
@@ -3618,6 +3795,7 @@ fn run_node_server(
                 paths.clone(),
                 name.to_owned(),
                 password.to_owned(),
+                traffic_settlement_lock.clone(),
             );
             hub = Some(Arc::new(RelayHub::production(
                 paths.clone(),
@@ -3629,7 +3807,7 @@ fn run_node_server(
             spawn_consensus_gossip(paths.clone(), name.to_owned(), password.to_owned());
         }
 
-        if public_listener.is_none() {
+        if public_listener.is_none() && graceful_shutdown_started.is_none() {
             let public_ip = if allow_insecure_local {
                 let endpoint = service::node_record(paths, name)?.endpoint;
                 let host = url::Url::parse(&endpoint)
@@ -3744,12 +3922,8 @@ fn run_node_server(
             }
             Err(error) => eprintln!("consensus driver error: {error}"),
         }
-        match public_listener
-            .as_ref()
-            .expect("listener initialized")
-            .accept()
-        {
-            Ok((stream, remote)) => {
+        match public_listener.as_ref().map(TcpListener::accept) {
+            Some(Ok((stream, remote))) => {
                 let Some(connection_guard) = public_connection_limiter.try_acquire(remote.ip())
                 else {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -3766,8 +3940,9 @@ fn run_node_server(
                     }
                 });
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error.into()),
+            Some(Err(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Some(Err(error)) => return Err(error.into()),
+            None => {}
         }
         thread::sleep(Duration::from_secs(1));
     }
@@ -3777,11 +3952,13 @@ fn spawn_traffic_settlement_worker(
     paths: DataPaths,
     name: String,
     password: String,
+    settlement_lock: Arc<Mutex<()>>,
 ) -> SyncSender<()> {
     let (wakeup, receiver) = mpsc::sync_channel(1);
     thread::spawn(move || {
         loop {
-            if let Err(error) = flush_pending_traffic_settlements(&paths, &name, &password)
+            if let Ok(_guard) = settlement_lock.lock()
+                && let Err(error) = flush_pending_traffic_settlements(&paths, &name, &password)
                 && std::env::var_os("MRK_RELAY_DEBUG").is_some()
             {
                 eprintln!("traffic settlement flush failed: {error}");
@@ -5052,6 +5229,122 @@ mod tests {
         assert_eq!(request.cumulative_sent_bytes, 10);
         assert_eq!(request.transcript_hash, "transcript");
         assert!(!request.final_checkpoint);
+    }
+
+    #[test]
+    fn periodic_checkpoint_may_cover_data_that_was_in_flight() {
+        let request = CheckpointRequest {
+            authorization_id: "authorization".to_owned(),
+            session_id: "session".to_owned(),
+            direction: RelayDirection::SenderToReceiver,
+            sequence: 1,
+            cumulative_sent_bytes: 10,
+            transcript_hash: "old-transcript".to_owned(),
+            requested_at: 1,
+            final_checkpoint: false,
+        };
+        let mut direction = DirectionState {
+            cumulative_bytes: request.cumulative_sent_bytes,
+            ..DirectionState::default()
+        };
+        assert!(checkpoint_allows_in_flight_data(
+            &request,
+            &direction,
+            MAX_FRAME_PAYLOAD,
+            request.requested_at + RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS,
+        ));
+        assert!(!checkpoint_allows_in_flight_data(
+            &request,
+            &direction,
+            1,
+            request.requested_at + RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS + 1,
+        ));
+        direction.cumulative_bytes += RELAY_CHECKPOINT_IN_FLIGHT_MAX_BYTES;
+        assert!(!checkpoint_allows_in_flight_data(
+            &request,
+            &direction,
+            1,
+            request.requested_at,
+        ));
+        let mut checkpoint = SenderCheckpoint {
+            ledger_id: "ledger".to_owned(),
+            protocol_version: mrk_core::model::PROTOCOL_VERSION,
+            node_id: 1,
+            authorization_id: request.authorization_id.clone(),
+            session_id: request.session_id.clone(),
+            direction: request.direction,
+            sequence: 2,
+            cumulative_sent_bytes: 20,
+            transcript_hash: "new-transcript".to_owned(),
+            checkpoint_at: 2,
+            sender_member_id: "sender".to_owned(),
+            final_checkpoint: false,
+            sender_signature: "signature".to_owned(),
+        };
+
+        assert!(checkpoint_covers_request(&checkpoint, &request));
+        checkpoint.sequence = request.sequence;
+        checkpoint.cumulative_sent_bytes = request.cumulative_sent_bytes;
+        checkpoint.transcript_hash = request.transcript_hash.clone();
+        assert!(checkpoint_covers_request(&checkpoint, &request));
+
+        let mut final_request = request;
+        final_request.final_checkpoint = true;
+        checkpoint.sequence += 1;
+        checkpoint.cumulative_sent_bytes += 1;
+        assert!(!checkpoint_covers_request(&checkpoint, &final_request));
+    }
+
+    #[test]
+    fn recovery_discards_checkpoint_handshake_state_but_keeps_the_traffic_prefix() {
+        let checkpoint = SenderCheckpoint {
+            ledger_id: "ledger".to_owned(),
+            protocol_version: mrk_core::model::PROTOCOL_VERSION,
+            node_id: 1,
+            authorization_id: "authorization".to_owned(),
+            session_id: "session".to_owned(),
+            direction: RelayDirection::SenderToReceiver,
+            sequence: 7,
+            cumulative_sent_bytes: 42,
+            transcript_hash: "transcript".to_owned(),
+            checkpoint_at: 10,
+            sender_member_id: "sender".to_owned(),
+            final_checkpoint: false,
+            sender_signature: "signature".to_owned(),
+        };
+        let request = CheckpointRequest {
+            authorization_id: checkpoint.authorization_id.clone(),
+            session_id: checkpoint.session_id.clone(),
+            direction: checkpoint.direction,
+            sequence: checkpoint.sequence,
+            cumulative_sent_bytes: checkpoint.cumulative_sent_bytes,
+            transcript_hash: checkpoint.transcript_hash.clone(),
+            requested_at: 10,
+            final_checkpoint: false,
+        };
+        let direction = DirectionState {
+            cumulative_bytes: 42,
+            transcript_hash: "transcript".to_owned(),
+            window_started_at: Some(10),
+            window_started_bytes: 12,
+            checkpoint_due: true,
+            awaiting_receipt: true,
+            pending_checkpoint: Some(checkpoint),
+            checkpoint_request: Some(request),
+            final_receipt_persisted: false,
+        };
+
+        let recovered = direction_for_recovery(&direction);
+
+        assert_eq!(recovered.cumulative_bytes, 42);
+        assert_eq!(recovered.transcript_hash, "transcript");
+        assert_eq!(recovered.window_started_bytes, 12);
+        assert!(!recovered.final_receipt_persisted);
+        assert_eq!(recovered.window_started_at, None);
+        assert!(!recovered.checkpoint_due);
+        assert!(!recovered.awaiting_receipt);
+        assert!(recovered.pending_checkpoint.is_none());
+        assert!(recovered.checkpoint_request.is_none());
     }
 
     #[test]

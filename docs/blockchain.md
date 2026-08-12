@@ -388,7 +388,7 @@ amount = total_owed - settled_amount_for_direction
 - Node 不服务时无法取得接收方签名，未使用押币不会释放给 Node；
 - Session 正常关闭时，两个方向分别为尾部发送带签名的 Final Checkpoint 并取得对端 Receipt；两方向都最终确认后，剩余预留立即退回 Network Fund。异常断线时 Node 最多损失当前未回执窗口；
 - Node 把每个方向最新的完整双签名回执写入本地 redb，并以覆盖方式聚合；后台默认每 5 分钟提交，重启后继续领取。结算操作最终确认前不得删除本地回执；
-- 未签尾部只存在于 Node 和客户端进程内存，不持久化。客户端进程重启后只能在本次 `mrk pipe` 或 `payment settle` 显式给出的 `max_auto_recovery_bytes` 范围内接受 Node 报告并补签；该参数不是链上 Network policy。Node 重启后精确尾部丢失，只能依据 Node Owner 的本地自动放弃策略或手动 Refund 收尾；
+- 未签尾部只存在于 Node 和客户端进程内存，不持久化。客户端进程重启后只能在本次 `mrk pipe` 或 `payment settle` 显式给出的 `max_auto_recovery_bytes` 范围内接受仍在运行的 Node 报告并补签；该参数不是链上 Network policy。Node 收到 SIGINT/SIGTERM 时会停止新会话并要求现有会话在当前窗口边界立即生成双签最终 receipt。强制退出导致精确尾部丢失时，下次启动由 Node Owner 自动签署 abandon 操作清理 hold；已经持久化的双签 receipt 继续正常结算，不会被清理；
 - 授权到期后保留 7 天 Relay Claim Window，随后由下一次自动预留回收未使用余额；
 - 有效结算回执可把 `last_relay_receipt_at` 更新为布尔服务证据，但流量数量不得增加 Node Seconds、铸币、治理权或 Validator 权重；
 - 自报流量、回执、Heartbeat 和 Probe 均不能从流量结算模块铸币；
