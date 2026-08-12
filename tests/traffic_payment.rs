@@ -96,6 +96,9 @@ fn owner_policy_allows_a_member_to_reserve_shared_fund_with_auditable_caps() {
                     "authorization_valid_until": submitted_at + 3600,
                     "spending_policy_revision": network.spending_policy.revision,
                     "expected_price_per_gib_base_units": paths.read_ledger().unwrap().nodes[&node.node_id].price_per_gib.to_string(),
+                    "relay_capability_revision": node.relay_capability_revision,
+                    "payment_window_bytes": node.payment_window_bytes,
+                    "payment_window_seconds": node.payment_window_seconds,
                 }),
             },
         )
@@ -369,6 +372,9 @@ fn dual_signed_cumulative_receipt_releases_only_authorized_escrow() {
                 "authorization_valid_until": now + 3605,
                 "spending_policy_revision": network.spending_policy.revision,
                 "expected_price_per_gib_base_units": node.price_per_gib.to_string(),
+                "relay_capability_revision": node.relay_capability_revision,
+                "payment_window_bytes": node.payment_window_bytes,
+                "payment_window_seconds": node.payment_window_seconds,
             }),
         },
     )

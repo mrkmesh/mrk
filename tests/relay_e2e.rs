@@ -148,6 +148,9 @@ fn two_members_exchange_bidirectional_bytes_through_real_relay() {
                 "authorization_valid_until": now + 3605,
                 "spending_policy_revision": network.spending_policy.revision,
                 "expected_price_per_gib_base_units": node.price_per_gib.to_string(),
+                "relay_capability_revision": node.relay_capability_revision,
+                "payment_window_bytes": node.payment_window_bytes,
+                "payment_window_seconds": node.payment_window_seconds,
             }),
         },
     )

@@ -36,6 +36,7 @@ pub fn operation_fee_units(module: &str, action: &str, payload: &Value) -> u64 {
         }
         ("NodeRegistry", "UpdateRewardIp") => 100,
         ("NodeRegistry", "UpdatePrice") => 10,
+        ("NodeRegistry", "UpdateRelayCapabilities") => 10,
         ("NodeRegistry", "DrainNode") => 0,
         ("NodeRegistry", "WithdrawServiceBond") => 1,
         ("NodeEmissionController", "ClaimNodeReward") => 1,

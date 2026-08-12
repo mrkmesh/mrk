@@ -15,8 +15,12 @@ pub const RELAY_PROTOCOL: &str = "mrk.relay.v1";
 pub const FRAME_VERSION: u8 = 1;
 pub const FRAME_HEADER_LEN: usize = 20;
 pub const MAX_FRAME_PAYLOAD: usize = 1024 * 1024;
-pub const RELAY_PAYMENT_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
-pub const RELAY_PAYMENT_WINDOW_SECONDS: i64 = 15;
+pub const RELAY_PAYMENT_WINDOW_BYTES: u64 = 32 * 1024 * 1024;
+pub const RELAY_PAYMENT_WINDOW_SECONDS: i64 = 30;
+pub const MIN_RELAY_PAYMENT_WINDOW_BYTES: u64 = 1024 * 1024;
+pub const MAX_RELAY_PAYMENT_WINDOW_BYTES: u64 = 64 * 1024 * 1024;
+pub const MIN_RELAY_PAYMENT_WINDOW_SECONDS: i64 = 5;
+pub const MAX_RELAY_PAYMENT_WINDOW_SECONDS: i64 = 300;
 pub const RELAY_PAYMENT_CLAIM_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const RELAY_CHECKPOINT_FINAL_FLAG: u16 = 1;
 
@@ -165,6 +169,23 @@ pub struct WelcomePayload {
     pub max_channels: u32,
     pub max_message_size: u32,
     pub heartbeat_seconds: u32,
+    pub relay_capability_revision: u64,
+    pub payment_window_bytes: u64,
+    pub payment_window_seconds: i64,
+}
+
+pub fn validate_relay_payment_window(bytes: u64, seconds: i64) -> Result<()> {
+    if !(MIN_RELAY_PAYMENT_WINDOW_BYTES..=MAX_RELAY_PAYMENT_WINDOW_BYTES).contains(&bytes) {
+        return Err(Error::msg(
+            "Relay payment window bytes must be between 1 MiB and 64 MiB",
+        ));
+    }
+    if !(MIN_RELAY_PAYMENT_WINDOW_SECONDS..=MAX_RELAY_PAYMENT_WINDOW_SECONDS).contains(&seconds) {
+        return Err(Error::msg(
+            "Relay payment window seconds must be between 5 and 300",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -665,5 +686,15 @@ mod tests {
         let mut bytes = Vec::new();
         write_ws_message(&mut bytes, &WsMessage::Binary(b"unmasked".to_vec()), false).unwrap();
         assert!(read_ws_message(&mut Cursor::new(bytes), true).is_err());
+    }
+
+    #[test]
+    fn relay_payment_window_bounds_are_enforced() {
+        assert!(validate_relay_payment_window(1024 * 1024, 5).is_ok());
+        assert!(validate_relay_payment_window(64 * 1024 * 1024, 300).is_ok());
+        assert!(validate_relay_payment_window(1024 * 1024 - 1, 5).is_err());
+        assert!(validate_relay_payment_window(64 * 1024 * 1024 + 1, 300).is_err());
+        assert!(validate_relay_payment_window(1024 * 1024, 4).is_err());
+        assert!(validate_relay_payment_window(1024 * 1024, 301).is_err());
     }
 }

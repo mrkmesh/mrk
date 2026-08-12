@@ -58,9 +58,6 @@ const MAX_PUBLIC_CONNECTIONS_PER_IP: usize = 128;
 const MAX_RPC_REQUESTS_PER_MINUTE: u32 = 120;
 const MAX_RPC_MUTATIONS_PER_MINUTE: u32 = 20;
 const RELAY_RECOVERY_GRACE_SECONDS: i64 = 30;
-const RELAY_UNKNOWN_TAIL_MAX_BYTES: u64 = 2 * RELAY_PAYMENT_WINDOW_BYTES;
-const RELAY_CHECKPOINT_IN_FLIGHT_MAX_BYTES: u64 = MAX_FRAME_PAYLOAD as u64;
-const RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS: i64 = 5;
 const NODE_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 static NODE_SHUTDOWN_SIGNALS: AtomicUsize = AtomicUsize::new(0);
 
@@ -123,10 +120,12 @@ struct DirectionState {
     transcript_hash: String,
     window_started_at: Option<i64>,
     window_started_bytes: u64,
+    receipted_bytes: u64,
     checkpoint_due: bool,
     awaiting_receipt: bool,
     pending_checkpoint: Option<SenderCheckpoint>,
     checkpoint_request: Option<CheckpointRequest>,
+    close_pending: bool,
     final_receipt_persisted: bool,
 }
 
@@ -253,6 +252,12 @@ pub enum DaemonCommand {
     UpdatePrice {
         #[arg(long)]
         price_per_gib: String,
+    },
+    UpdateRelayCapabilities {
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1048576..=67108864))]
+        payment_window_bytes: u64,
+        #[arg(long, value_parser = clap::value_parser!(i64).range(5..=300))]
+        payment_window_seconds: i64,
     },
     Run {
         #[arg(long, default_value = "0.0.0.0:8787")]
@@ -818,7 +823,7 @@ impl RelayHub {
                 ),
             ] {
                 let elapsed = direction_state.window_started_at.is_some_and(|started| {
-                    now.saturating_sub(started) >= RELAY_PAYMENT_WINDOW_SECONDS
+                    now.saturating_sub(started) >= view.authorization.payment_window_seconds
                 });
                 if elapsed
                     && direction_state.cumulative_bytes > direction_state.window_started_bytes
@@ -889,12 +894,12 @@ impl RelayHub {
                     let unsigned_bytes = route
                         .source_direction
                         .cumulative_bytes
-                        .saturating_sub(route.source_direction.window_started_bytes)
+                        .saturating_sub(route.source_direction.receipted_bytes)
                         .saturating_add(
                             route
                                 .destination_direction
                                 .cumulative_bytes
-                                .saturating_sub(route.destination_direction.window_started_bytes),
+                                .saturating_sub(route.destination_direction.receipted_bytes),
                         );
                     (
                         authorization_id.clone(),
@@ -1108,10 +1113,12 @@ impl RelayHub {
                             transcript_hash: settled.settled_transcript_hash.unwrap_or(initial),
                             window_started_at: None,
                             window_started_bytes: settled.settled_payload_bytes,
+                            receipted_bytes: settled.settled_payload_bytes,
                             checkpoint_due: false,
                             awaiting_receipt: false,
                             pending_checkpoint: None,
                             checkpoint_request: None,
+                            close_pending: false,
                             final_receipt_persisted: settled.finalized,
                         }
                     };
@@ -1330,21 +1337,25 @@ impl RelayHub {
                         "recovery channel permits checkpoint and receipt frames only",
                     ));
                 }
-                if current_direction.awaiting_receipt
-                    || current_direction
-                        .checkpoint_request
+                if !direction_accepts_more_data(
+                    current_direction,
+                    route
+                        .authorization
                         .as_ref()
-                        .is_some_and(|request| {
-                            !checkpoint_allows_in_flight_data(
-                                request,
-                                current_direction,
-                                frame.payload.len(),
-                                Utc::now().timestamp(),
-                            )
-                        })
-                {
+                        .map_or(RELAY_PAYMENT_WINDOW_BYTES, |view| {
+                            view.authorization.payment_window_bytes
+                        }),
+                    route
+                        .authorization
+                        .as_ref()
+                        .map_or(RELAY_PAYMENT_WINDOW_SECONDS, |view| {
+                            view.authorization.payment_window_seconds
+                        }),
+                    frame.payload.len(),
+                    Utc::now().timestamp(),
+                ) {
                     return Err(Error::msg(
-                        "relay direction is paused for a Node-requested checkpoint",
+                        "relay direction exhausted its two-window payment allowance",
                     ));
                 }
                 if frame.sequence != current_sequence.saturating_add(1) {
@@ -1360,16 +1371,6 @@ impl RelayHub {
                         }
                     {
                         return Err(Error::msg("payment authorization has expired"));
-                    }
-                    let next_window_bytes = current_direction
-                        .cumulative_bytes
-                        .saturating_sub(current_direction.window_started_bytes)
-                        .checked_add(frame.payload.len() as u64)
-                        .ok_or_else(|| Error::msg("Relay payment window overflow"))?;
-                    if next_window_bytes > RELAY_PAYMENT_WINDOW_BYTES {
-                        return Err(Error::msg(
-                            "Relay DATA frame crosses the payment window boundary",
-                        ));
                     }
                     let source_bytes = route
                         .source_direction
@@ -1447,7 +1448,7 @@ impl RelayHub {
                         && direction
                             .cumulative_bytes
                             .saturating_sub(direction.window_started_bytes)
-                            >= RELAY_PAYMENT_WINDOW_BYTES
+                            >= view.authorization.payment_window_bytes
                     {
                         checkpoint_request = Some(schedule_checkpoint_request(
                             view,
@@ -1504,8 +1505,7 @@ impl RelayHub {
                         return Err(Error::msg("connection does not own relay channel"));
                     };
                 let now = Utc::now().timestamp();
-                if direction.awaiting_receipt
-                    || intent.authorization_id != view.authorization.authorization_id
+                if intent.authorization_id != view.authorization.authorization_id
                     || intent.session_id != view.authorization.session_id
                     || intent.direction != expected_direction
                     || intent.sequence != expected_sequence
@@ -1516,12 +1516,16 @@ impl RelayHub {
                 {
                     return Err(Error::msg("invalid Relay CloseIntent"));
                 }
+                if direction.awaiting_receipt
+                    || direction
+                        .checkpoint_request
+                        .as_ref()
+                        .is_some_and(|request| !request.final_checkpoint)
+                {
+                    direction.close_pending = true;
+                    return Ok(());
+                }
                 let request = if let Some(request) = &direction.checkpoint_request {
-                    if !request.final_checkpoint {
-                        return Err(Error::msg(
-                            "periodic checkpoint must finish before closing Relay direction",
-                        ));
-                    }
                     request.clone()
                 } else {
                     schedule_checkpoint_request(
@@ -1615,6 +1619,8 @@ impl RelayHub {
                     &sender_checkpoint_signing_bytes(&checkpoint)?,
                     &checkpoint.sender_signature,
                 )?;
+                direction.window_started_at = None;
+                direction.window_started_bytes = checkpoint.cumulative_sent_bytes;
                 direction.awaiting_receipt = true;
                 direction.pending_checkpoint = Some(checkpoint);
                 let destination = state.peers.get(&destination).expect("route destination");
@@ -1630,28 +1636,30 @@ impl RelayHub {
                     .as_ref()
                     .ok_or_else(|| Error::msg("relay channel has no payment authorization"))?;
                 let receipt: ReceiverReceipt = serde_json::from_slice(&frame.payload)?;
-                let (destination, direction, expected_receiver, public_key) = if route.destination
-                    == connection_id
-                    && receipt.direction == RelayDirection::SenderToReceiver
-                {
-                    (
-                        route.source,
-                        &mut route.source_direction,
-                        view.authorization.receiver_member_id.as_str(),
-                        view.receiver_public_key.as_str(),
-                    )
-                } else if route.source == connection_id
-                    && receipt.direction == RelayDirection::ReceiverToSender
-                {
-                    (
-                        route.destination,
-                        &mut route.destination_direction,
-                        view.authorization.sender_member_id.as_str(),
-                        view.sender_public_key.as_str(),
-                    )
-                } else {
-                    return Err(Error::msg("ReceiverReceipt came from the wrong member"));
-                };
+                let (destination, sequence, direction, expected_receiver, public_key) =
+                    if route.destination == connection_id
+                        && receipt.direction == RelayDirection::SenderToReceiver
+                    {
+                        (
+                            route.source,
+                            route.source_sequence,
+                            &mut route.source_direction,
+                            view.authorization.receiver_member_id.as_str(),
+                            view.receiver_public_key.as_str(),
+                        )
+                    } else if route.source == connection_id
+                        && receipt.direction == RelayDirection::ReceiverToSender
+                    {
+                        (
+                            route.destination,
+                            route.destination_sequence,
+                            &mut route.destination_direction,
+                            view.authorization.sender_member_id.as_str(),
+                            view.sender_public_key.as_str(),
+                        )
+                    } else {
+                        return Err(Error::msg("ReceiverReceipt came from the wrong member"));
+                    };
                 let checkpoint = direction
                     .pending_checkpoint
                     .as_ref()
@@ -1692,13 +1700,27 @@ impl RelayHub {
                         let _ = wakeup.try_send(());
                     }
                 }
-                direction.final_receipt_persisted = checkpoint.final_checkpoint;
-                direction.window_started_at = None;
-                direction.window_started_bytes = direction.cumulative_bytes;
+                let checkpoint_direction = checkpoint.direction;
+                let checkpoint_final = checkpoint.final_checkpoint;
+                direction.final_receipt_persisted = checkpoint_final;
+                direction.receipted_bytes = checkpoint.cumulative_sent_bytes;
                 direction.checkpoint_due = false;
                 direction.awaiting_receipt = false;
                 direction.pending_checkpoint = None;
                 direction.checkpoint_request = None;
+                let next_final_request = if direction.close_pending && !checkpoint_final {
+                    direction.close_pending = false;
+                    Some(schedule_checkpoint_request(
+                        view,
+                        checkpoint_direction,
+                        sequence,
+                        direction,
+                        true,
+                        Utc::now().timestamp(),
+                    ))
+                } else {
+                    None
+                };
                 let fully_final = route.source_direction.final_receipt_persisted
                     && route.destination_direction.final_receipt_persisted;
                 let authorization_id = view.authorization.authorization_id.clone();
@@ -1714,7 +1736,21 @@ impl RelayHub {
                 if fully_final {
                     state.interrupted_routes.remove(&authorization_id);
                 }
-                send_relay_frame(&destination_sender, frame)
+                let channel_id = frame.channel_id;
+                send_relay_frame(&destination_sender, frame)?;
+                if let Some(request) = next_final_request {
+                    send_relay_frame(
+                        &destination_sender,
+                        RelayFrame {
+                            frame_type: FrameType::CheckpointRequest,
+                            flags: RELAY_CHECKPOINT_FINAL_FLAG,
+                            channel_id,
+                            sequence: request.sequence,
+                            payload: serde_json::to_vec(&request)?,
+                        },
+                    )?;
+                }
+                Ok(())
             }
             FrameType::Close => {
                 let route = state
@@ -1818,6 +1854,8 @@ fn schedule_checkpoint_request(
     };
     state.checkpoint_due = true;
     state.checkpoint_request = Some(request.clone());
+    state.window_started_at = None;
+    state.window_started_bytes = state.cumulative_bytes;
     request
 }
 
@@ -1827,6 +1865,7 @@ fn reset_direction_for_recovery(direction: &mut DirectionState) {
     direction.awaiting_receipt = false;
     direction.pending_checkpoint = None;
     direction.checkpoint_request = None;
+    direction.close_pending = false;
 }
 
 fn direction_for_recovery(direction: &DirectionState) -> DirectionState {
@@ -1845,19 +1884,35 @@ fn checkpoint_covers_request(checkpoint: &SenderCheckpoint, request: &Checkpoint
             && checkpoint.cumulative_sent_bytes > request.cumulative_sent_bytes)
 }
 
-fn checkpoint_allows_in_flight_data(
-    request: &CheckpointRequest,
+fn direction_accepts_more_data(
     state: &DirectionState,
+    payment_window_bytes: u64,
+    payment_window_seconds: i64,
     payload_bytes: usize,
     now: i64,
 ) -> bool {
-    !request.final_checkpoint
-        && now.saturating_sub(request.requested_at) <= RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS
-        && state
-            .cumulative_bytes
-            .saturating_add(payload_bytes as u64)
-            .saturating_sub(request.cumulative_sent_bytes)
-            <= RELAY_CHECKPOINT_IN_FLIGHT_MAX_BYTES
+    if state
+        .checkpoint_request
+        .as_ref()
+        .is_some_and(|request| request.final_checkpoint)
+    {
+        return false;
+    }
+    let next_cumulative = state.cumulative_bytes.saturating_add(payload_bytes as u64);
+    if next_cumulative.saturating_sub(state.receipted_bytes)
+        > payment_window_bytes.saturating_mul(2)
+    {
+        return false;
+    }
+    let payment_in_flight = state.awaiting_receipt || state.checkpoint_request.is_some();
+    if !payment_in_flight {
+        return true;
+    }
+    let next_window_bytes = next_cumulative.saturating_sub(state.window_started_bytes);
+    let window_timed_out = state
+        .window_started_at
+        .is_some_and(|started| now.saturating_sub(started) >= payment_window_seconds);
+    next_window_bytes <= payment_window_bytes && !window_timed_out
 }
 
 fn active_unsettled_relay_sessions(
@@ -2144,6 +2199,7 @@ fn command_may_require_service_fee(command: &DaemonCommand) -> bool {
         DaemonCommand::Join { .. }
             | DaemonCommand::UpdateRewardIp { .. }
             | DaemonCommand::UpdatePrice { .. }
+            | DaemonCommand::UpdateRelayCapabilities { .. }
             | DaemonCommand::Claim
             | DaemonCommand::WithdrawServiceBond
             | DaemonCommand::Validator {
@@ -2180,6 +2236,11 @@ fn command_service_fee(
         DaemonCommand::UpdatePrice { .. } => {
             Some(("NodeRegistry", "UpdatePrice", serde_json::Value::Null))
         }
+        DaemonCommand::UpdateRelayCapabilities { .. } => Some((
+            "NodeRegistry",
+            "UpdateRelayCapabilities",
+            serde_json::Value::Null,
+        )),
         DaemonCommand::Claim => Some((
             "NodeEmissionController",
             "ClaimNodeReward",
@@ -2382,6 +2443,36 @@ fn execute_daemon_command(
                     format!(
                         "SUBMITTED\nOperation: {operation_id}\nStatus: PENDING\nPrice/GiB: {}",
                         format_mrk(node.price_per_gib)
+                    )
+                },
+            )?;
+        }
+        DaemonCommand::UpdateRelayCapabilities {
+            payment_window_bytes,
+            payment_window_seconds,
+        } => {
+            let password = read_password("Node Owner password: ")?;
+            let (operation_id, node) = service::update_node_relay_capabilities(
+                paths,
+                &cli.node,
+                &password,
+                payment_window_bytes,
+                payment_window_seconds,
+                Utc::now().timestamp(),
+            )?;
+            print_value(
+                cli.output,
+                &serde_json::json!({
+                    "operation_id": operation_id,
+                    "status": "PENDING",
+                    "node": node,
+                }),
+                || {
+                    format!(
+                        "SUBMITTED\nOperation: {operation_id}\nStatus: PENDING\nRelay capability revision: {}\nPayment window: {} bytes / {} seconds",
+                        node.relay_capability_revision,
+                        node.payment_window_bytes,
+                        node.payment_window_seconds,
                     )
                 },
             )?;
@@ -3924,6 +4015,7 @@ fn run_node_server(
         }
         match public_listener.as_ref().map(TcpListener::accept) {
             Some(Ok((stream, remote))) => {
+                stream.set_nonblocking(false)?;
                 let Some(connection_guard) = public_connection_limiter.try_acquire(remote.ip())
                 else {
                     let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -4827,6 +4919,9 @@ fn handle_relay_connection(
                 max_channels: MAX_CHANNELS_PER_CONNECTION as u32,
                 max_message_size: MAX_FRAME_PAYLOAD as u32,
                 heartbeat_seconds: 30,
+                relay_capability_revision: node.relay_capability_revision,
+                payment_window_bytes: node.payment_window_bytes,
+                payment_window_seconds: node.payment_window_seconds,
             })?,
         ),
     )?;
@@ -5180,6 +5275,9 @@ mod tests {
             receiver_member_id: "bob".to_owned(),
             session_id: "11".repeat(32),
             price_per_gib: 1,
+            relay_capability_revision: 1,
+            payment_window_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            payment_window_seconds: RELAY_PAYMENT_WINDOW_SECONDS,
             max_amount: 1,
             reserved_remaining: 1,
             settled_amount: 0,
@@ -5229,10 +5327,15 @@ mod tests {
         assert_eq!(request.cumulative_sent_bytes, 10);
         assert_eq!(request.transcript_hash, "transcript");
         assert!(!request.final_checkpoint);
+        let state = hub.state.lock().unwrap();
+        let direction = &state.routes.get(&7).unwrap().source_direction;
+        assert_eq!(direction.window_started_at, None);
+        assert_eq!(direction.window_started_bytes, 10);
+        assert_eq!(direction.receipted_bytes, 0);
     }
 
     #[test]
-    fn periodic_checkpoint_may_cover_data_that_was_in_flight() {
+    fn checkpoint_pipeline_allows_one_more_window_while_payment_is_in_flight() {
         let request = CheckpointRequest {
             authorization_id: "authorization".to_owned(),
             session_id: "session".to_owned(),
@@ -5244,27 +5347,71 @@ mod tests {
             final_checkpoint: false,
         };
         let mut direction = DirectionState {
-            cumulative_bytes: request.cumulative_sent_bytes,
+            cumulative_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            window_started_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            receipted_bytes: 0,
+            awaiting_receipt: true,
+            pending_checkpoint: Some(SenderCheckpoint {
+                ledger_id: "ledger".to_owned(),
+                protocol_version: mrk_core::model::PROTOCOL_VERSION,
+                node_id: 1,
+                authorization_id: request.authorization_id.clone(),
+                session_id: request.session_id.clone(),
+                direction: request.direction,
+                sequence: 1,
+                cumulative_sent_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+                transcript_hash: "invoice".to_owned(),
+                checkpoint_at: request.requested_at,
+                sender_member_id: "sender".to_owned(),
+                final_checkpoint: false,
+                sender_signature: "signature".to_owned(),
+            }),
             ..DirectionState::default()
         };
-        assert!(checkpoint_allows_in_flight_data(
-            &request,
-            &direction,
-            MAX_FRAME_PAYLOAD,
-            request.requested_at + RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS,
+        let mut not_yet_billed = DirectionState {
+            cumulative_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            window_started_at: Some(request.requested_at - RELAY_PAYMENT_WINDOW_SECONDS),
+            receipted_bytes: 0,
+            ..DirectionState::default()
+        };
+        assert!(direction_accepts_more_data(
+            &not_yet_billed,
+            RELAY_PAYMENT_WINDOW_BYTES,
+            RELAY_PAYMENT_WINDOW_SECONDS,
+            RELAY_PAYMENT_WINDOW_BYTES as usize,
+            request.requested_at,
         ));
-        assert!(!checkpoint_allows_in_flight_data(
-            &request,
-            &direction,
-            1,
-            request.requested_at + RELAY_CHECKPOINT_IN_FLIGHT_GRACE_SECONDS + 1,
-        ));
-        direction.cumulative_bytes += RELAY_CHECKPOINT_IN_FLIGHT_MAX_BYTES;
-        assert!(!checkpoint_allows_in_flight_data(
-            &request,
-            &direction,
+        not_yet_billed.cumulative_bytes = 2 * RELAY_PAYMENT_WINDOW_BYTES;
+        assert!(!direction_accepts_more_data(
+            &not_yet_billed,
+            RELAY_PAYMENT_WINDOW_BYTES,
+            RELAY_PAYMENT_WINDOW_SECONDS,
             1,
             request.requested_at,
+        ));
+        assert!(direction_accepts_more_data(
+            &direction,
+            RELAY_PAYMENT_WINDOW_BYTES,
+            RELAY_PAYMENT_WINDOW_SECONDS,
+            RELAY_PAYMENT_WINDOW_BYTES as usize,
+            request.requested_at,
+        ));
+        direction.cumulative_bytes = 2 * RELAY_PAYMENT_WINDOW_BYTES;
+        assert!(!direction_accepts_more_data(
+            &direction,
+            RELAY_PAYMENT_WINDOW_BYTES,
+            RELAY_PAYMENT_WINDOW_SECONDS,
+            1,
+            request.requested_at,
+        ));
+        direction.cumulative_bytes = RELAY_PAYMENT_WINDOW_BYTES;
+        direction.window_started_at = Some(request.requested_at);
+        assert!(!direction_accepts_more_data(
+            &direction,
+            RELAY_PAYMENT_WINDOW_BYTES,
+            RELAY_PAYMENT_WINDOW_SECONDS,
+            1,
+            request.requested_at + RELAY_PAYMENT_WINDOW_SECONDS,
         ));
         let mut checkpoint = SenderCheckpoint {
             ledger_id: "ledger".to_owned(),
@@ -5327,10 +5474,12 @@ mod tests {
             transcript_hash: "transcript".to_owned(),
             window_started_at: Some(10),
             window_started_bytes: 12,
+            receipted_bytes: 12,
             checkpoint_due: true,
             awaiting_receipt: true,
             pending_checkpoint: Some(checkpoint),
             checkpoint_request: Some(request),
+            close_pending: true,
             final_receipt_persisted: false,
         };
 
@@ -5339,12 +5488,14 @@ mod tests {
         assert_eq!(recovered.cumulative_bytes, 42);
         assert_eq!(recovered.transcript_hash, "transcript");
         assert_eq!(recovered.window_started_bytes, 12);
+        assert_eq!(recovered.receipted_bytes, 12);
         assert!(!recovered.final_receipt_persisted);
         assert_eq!(recovered.window_started_at, None);
         assert!(!recovered.checkpoint_due);
         assert!(!recovered.awaiting_receipt);
         assert!(recovered.pending_checkpoint.is_none());
         assert!(recovered.checkpoint_request.is_none());
+        assert!(!recovered.close_pending);
     }
 
     #[test]

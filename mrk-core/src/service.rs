@@ -49,9 +49,11 @@ use crate::{
         sort_pending as sort_pending_operation_ids, verify as verify_operation,
     },
     relay::{
-        ChallengePayload, HelloPayload, ProbePayload, RELAY_PAYMENT_CLAIM_SECONDS, ReceiverReceipt,
+        ChallengePayload, HelloPayload, ProbePayload, RELAY_PAYMENT_CLAIM_SECONDS,
+        RELAY_PAYMENT_WINDOW_BYTES, RELAY_PAYMENT_WINDOW_SECONDS, ReceiverReceipt,
         SenderCheckpoint, credential_signing_bytes, hello_signing_bytes,
         receiver_receipt_signing_bytes, sender_checkpoint_hash, sender_checkpoint_signing_bytes,
+        validate_relay_payment_window,
     },
     storage::{DataPaths, UnsettledRelaySession, atomic_write_json, read_json, validate_name},
 };
@@ -210,6 +212,9 @@ pub struct RegistryNodeView {
     pub reward_ip: String,
     pub price_per_gib_base_units: String,
     pub price_per_gib_display: String,
+    pub relay_capability_revision: u64,
+    pub payment_window_bytes: u64,
+    pub payment_window_seconds: i64,
     pub status: NodeStatus,
     pub registered_at: i64,
     pub warmup_until: i64,
@@ -257,6 +262,9 @@ pub struct RelayDiscoveryView {
     pub reward_ip: String,
     pub price_per_gib_base_units: String,
     pub price_per_gib_display: String,
+    pub relay_capability_revision: u64,
+    pub payment_window_bytes: u64,
+    pub payment_window_seconds: i64,
     pub last_probe_success: i64,
     pub probe_valid_until: i64,
     pub validator: bool,
@@ -2046,6 +2054,28 @@ pub fn submit_signed_network_operation(
                     &operation.unsigned.payload,
                     "expected_price_per_gib_base_units",
                 )?)?;
+                let expected_relay_capability_revision = operation
+                    .unsigned
+                    .payload
+                    .get("relay_capability_revision")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::msg("Relay capability revision is invalid"))?;
+                let expected_payment_window_bytes = operation
+                    .unsigned
+                    .payload
+                    .get("payment_window_bytes")
+                    .and_then(Value::as_u64)
+                    .ok_or_else(|| Error::msg("Relay payment window bytes are invalid"))?;
+                let expected_payment_window_seconds = operation
+                    .unsigned
+                    .payload
+                    .get("payment_window_seconds")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| Error::msg("Relay payment window seconds are invalid"))?;
+                validate_relay_payment_window(
+                    expected_payment_window_bytes,
+                    expected_payment_window_seconds,
+                )?;
                 let node = ledger
                     .nodes
                     .get(&node_id)
@@ -2059,6 +2089,14 @@ pub fn submit_signed_network_operation(
                 if node.price_per_gib != expected_price_per_gib {
                     return Err(Error::msg(
                         "Relay Node price changed; refresh the quote before reserving a session",
+                    ));
+                }
+                if node.relay_capability_revision != expected_relay_capability_revision
+                    || node.payment_window_bytes != expected_payment_window_bytes
+                    || node.payment_window_seconds != expected_payment_window_seconds
+                {
+                    return Err(Error::msg(
+                        "Relay Node capabilities changed; refresh them before reserving a session",
                     ));
                 }
                 let price_per_gib = expected_price_per_gib;
@@ -2154,6 +2192,9 @@ pub fn submit_signed_network_operation(
                     receiver_member_id,
                     session_id,
                     price_per_gib,
+                    relay_capability_revision: expected_relay_capability_revision,
+                    payment_window_bytes: expected_payment_window_bytes,
+                    payment_window_seconds: expected_payment_window_seconds,
                     max_amount,
                     reserved_remaining: max_amount,
                     settled_amount: 0,
@@ -2548,6 +2589,7 @@ fn stage_consensus_candidate(
                 "RegisterNode"
                     | "UpdateRewardIp"
                     | "UpdatePrice"
+                    | "UpdateRelayCapabilities"
                     | "DrainNode"
                     | "WithdrawServiceBond"
             )
@@ -2863,6 +2905,21 @@ fn submit_signed_node_operation(
                     payload,
                     "price_per_gib_base_units",
                 )?)?;
+                let relay_capability_revision = payload["relay_capability_revision"]
+                    .as_u64()
+                    .ok_or_else(|| Error::msg("Relay capability revision is invalid"))?;
+                if relay_capability_revision != 1 {
+                    return Err(Error::msg(
+                        "initial Relay capability revision must be 1",
+                    ));
+                }
+                let payment_window_bytes = payload["payment_window_bytes"]
+                    .as_u64()
+                    .ok_or_else(|| Error::msg("Relay payment window bytes are invalid"))?;
+                let payment_window_seconds = payload["payment_window_seconds"]
+                    .as_i64()
+                    .ok_or_else(|| Error::msg("Relay payment window seconds are invalid"))?;
+                validate_relay_payment_window(payment_window_bytes, payment_window_seconds)?;
                 let endpoint = parse_wss_endpoint(payload_str(payload, "endpoint")?)?.to_string();
                 ensure_node_endpoint_available(ledger, &endpoint, None)?;
                 let registered_at = payload["registered_at"].as_i64().unwrap_or(executed_at);
@@ -2880,6 +2937,9 @@ fn submit_signed_node_operation(
                     reward_ip,
                     ip_slot: ip_slot.clone(),
                     price_per_gib,
+                    relay_capability_revision,
+                    payment_window_bytes,
+                    payment_window_seconds,
                     status,
                     registered_at,
                     warmup_until,
@@ -2965,6 +3025,30 @@ fn submit_signed_node_operation(
                     ledger,
                     node_id,
                     parse_payload_u128(payload, "price_per_gib_base_units")?,
+                )?;
+            }
+            ("NodeRegistry", "UpdateRelayCapabilities") => {
+                let node_id = payload["node_id"]
+                    .as_u64()
+                    .ok_or_else(|| Error::msg("Node ID is invalid"))?;
+                ensure_replicated_node_owner(
+                    ledger,
+                    node_id,
+                    &operation.unsigned.signer,
+                    public_key,
+                )?;
+                apply_node_relay_capabilities_update(
+                    ledger,
+                    node_id,
+                    payload["relay_capability_revision"]
+                        .as_u64()
+                        .ok_or_else(|| Error::msg("Relay capability revision is invalid"))?,
+                    payload["payment_window_bytes"]
+                        .as_u64()
+                        .ok_or_else(|| Error::msg("Relay payment window bytes are invalid"))?,
+                    payload["payment_window_seconds"]
+                        .as_i64()
+                        .ok_or_else(|| Error::msg("Relay payment window seconds are invalid"))?,
                 )?;
             }
             ("NodeRegistry", "DrainNode") => {
@@ -5219,6 +5303,9 @@ pub fn join_node(
             "reward_public_key": reward_file.public_key,
             "registered_at": now,
             "price_per_gib_base_units": price_per_gib.to_string(),
+            "relay_capability_revision": 1,
+            "payment_window_bytes": RELAY_PAYMENT_WINDOW_BYTES,
+            "payment_window_seconds": RELAY_PAYMENT_WINDOW_SECONDS,
         });
         let signed = sign_operation(
             ledger,
@@ -5245,6 +5332,9 @@ pub fn join_node(
             reward_ip: reward_ip.to_string(),
             ip_slot: ip_slot.clone(),
             price_per_gib,
+            relay_capability_revision: 1,
+            payment_window_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            payment_window_seconds: RELAY_PAYMENT_WINDOW_SECONDS,
             status,
             registered_at: now,
             warmup_until,
@@ -5355,6 +5445,46 @@ pub fn update_node_price(
             })
         },
         move |ledger, node_id| apply_node_price_update(ledger, node_id, price_per_gib),
+    )
+}
+
+pub fn update_node_relay_capabilities(
+    paths: &DataPaths,
+    name: &str,
+    password: &str,
+    payment_window_bytes: u64,
+    payment_window_seconds: i64,
+    now: i64,
+) -> Result<(String, NodeRecord)> {
+    validate_relay_payment_window(payment_window_bytes, payment_window_seconds)?;
+    let node = node_record(paths, name)?;
+    let relay_capability_revision = node
+        .relay_capability_revision
+        .checked_add(1)
+        .ok_or_else(|| Error::msg("Relay capability revision overflow"))?;
+    submit_node_registry_update(
+        paths,
+        name,
+        password,
+        "UpdateRelayCapabilities",
+        now,
+        move |node_id| {
+            json!({
+                "node_id": node_id,
+                "relay_capability_revision": relay_capability_revision,
+                "payment_window_bytes": payment_window_bytes,
+                "payment_window_seconds": payment_window_seconds,
+            })
+        },
+        move |ledger, node_id| {
+            apply_node_relay_capabilities_update(
+                ledger,
+                node_id,
+                relay_capability_revision,
+                payment_window_bytes,
+                payment_window_seconds,
+            )
+        },
     )
 }
 
@@ -6259,6 +6389,9 @@ pub fn discover_relays(
                     reward_ip: node.reward_ip.clone(),
                     price_per_gib_base_units: node.price_per_gib.to_string(),
                     price_per_gib_display: format_mrk(node.price_per_gib),
+                    relay_capability_revision: node.relay_capability_revision,
+                    payment_window_bytes: node.payment_window_bytes,
+                    payment_window_seconds: node.payment_window_seconds,
                     last_probe_success,
                     probe_valid_until: last_probe_success.saturating_add(validity),
                     validator: node.validator,
@@ -6340,6 +6473,9 @@ fn registry_node_view(node: &NodeRecord, ledger: &LedgerState, now: i64) -> Regi
         reward_ip: node.reward_ip.clone(),
         price_per_gib_base_units: node.price_per_gib.to_string(),
         price_per_gib_display: format_mrk(node.price_per_gib),
+        relay_capability_revision: node.relay_capability_revision,
+        payment_window_bytes: node.payment_window_bytes,
+        payment_window_seconds: node.payment_window_seconds,
         status: node.status,
         registered_at: node.registered_at,
         warmup_until: node.warmup_until,
@@ -11760,6 +11896,38 @@ fn apply_node_price_update(
     Ok(())
 }
 
+fn apply_node_relay_capabilities_update(
+    ledger: &mut LedgerState,
+    node_id: u64,
+    relay_capability_revision: u64,
+    payment_window_bytes: u64,
+    payment_window_seconds: i64,
+) -> Result<()> {
+    validate_relay_payment_window(payment_window_bytes, payment_window_seconds)?;
+    let node = ledger
+        .nodes
+        .get_mut(&node_id)
+        .ok_or_else(|| Error::msg("registered node is missing from the ledger"))?;
+    if matches!(node.status, NodeStatus::Draining | NodeStatus::Exited) {
+        return Err(Error::msg(
+            "Relay capabilities cannot be updated while the node is draining or exited",
+        ));
+    }
+    let expected_revision = node
+        .relay_capability_revision
+        .checked_add(1)
+        .ok_or_else(|| Error::msg("Relay capability revision overflow"))?;
+    if relay_capability_revision != expected_revision {
+        return Err(Error::msg(
+            "Relay capability revision is not the next revision",
+        ));
+    }
+    node.relay_capability_revision = relay_capability_revision;
+    node.payment_window_bytes = payment_window_bytes;
+    node.payment_window_seconds = payment_window_seconds;
+    Ok(())
+}
+
 fn apply_reward_ip_update(
     ledger: &mut LedgerState,
     node_id: u64,
@@ -12630,6 +12798,9 @@ mod tests {
             reward_ip: format!("9.8.7.{node_id}"),
             ip_slot: format!("v4:9.8.7.{node_id}"),
             price_per_gib: 0,
+            relay_capability_revision: 1,
+            payment_window_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            payment_window_seconds: RELAY_PAYMENT_WINDOW_SECONDS,
             status: NodeStatus::Active,
             registered_at: 0,
             warmup_until: 0,
@@ -13511,6 +13682,9 @@ mod tests {
                     reward_ip: format!("9.8.7.{node_id}"),
                     ip_slot: format!("v4:9.8.7.{node_id}"),
                     price_per_gib: 0,
+                    relay_capability_revision: 1,
+                    payment_window_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+                    payment_window_seconds: RELAY_PAYMENT_WINDOW_SECONDS,
                     status: NodeStatus::Active,
                     registered_at: 0,
                     warmup_until: 0,
@@ -13588,6 +13762,9 @@ mod tests {
                 reward_ip: "1.1.1.1".into(),
                 ip_slot: "v4:1.1.1.1".into(),
                 price_per_gib: 0,
+                relay_capability_revision: 1,
+                payment_window_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+                payment_window_seconds: RELAY_PAYMENT_WINDOW_SECONDS,
                 status: NodeStatus::Active,
                 registered_at: now,
                 warmup_until: now,
@@ -13821,6 +13998,9 @@ mod tests {
             reward_ip: "1.1.1.1".into(),
             ip_slot: "v4:1.1.1.1".into(),
             price_per_gib: 0,
+            relay_capability_revision: 1,
+            payment_window_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            payment_window_seconds: RELAY_PAYMENT_WINDOW_SECONDS,
             status: NodeStatus::Active,
             registered_at: 0,
             warmup_until: 0,

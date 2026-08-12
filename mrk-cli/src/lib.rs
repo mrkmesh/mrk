@@ -1472,7 +1472,7 @@ fn registry_list_text(view: &service::RegistryNodeListView) -> String {
 
 fn registry_node_text(node: &service::RegistryNodeView) -> String {
     format!(
-        "Node ID: {}\nPrevious Node ID: {}\nName: {}\nStatus: {}\nEndpoint: {}\nReward IP: {}\nPrice/GiB: {}\nOwner: {}\nReward address: {}\nRegistered at: {}\nLast Probe: {}\nValidator: {}\nValidator candidate: {}",
+        "Node ID: {}\nPrevious Node ID: {}\nName: {}\nStatus: {}\nEndpoint: {}\nReward IP: {}\nPrice/GiB: {}\nRelay capability revision: {}\nPayment window: {} bytes / {} seconds\nOwner: {}\nReward address: {}\nRegistered at: {}\nLast Probe: {}\nValidator: {}\nValidator candidate: {}",
         node.node_id,
         node.previous_node_id
             .map_or_else(|| "none".to_owned(), |value| value.to_string()),
@@ -1481,6 +1481,9 @@ fn registry_node_text(node: &service::RegistryNodeView) -> String {
         node.endpoint,
         node.reward_ip,
         node.price_per_gib_display,
+        node.relay_capability_revision,
+        node.payment_window_bytes,
+        node.payment_window_seconds,
         node.owner_address,
         node.reward_address,
         node.registered_at,
@@ -1499,13 +1502,19 @@ fn relay_discovery_text(view: &service::RelayDiscoveryListView) -> String {
     if view.relays.is_empty() {
         return "No currently discoverable Relays.".to_owned();
     }
-    let mut lines = vec!["NODE ID\tENDPOINT\tPRICE/GiB\tPROBE VALID UNTIL\tVALIDATOR".to_owned()];
+    let mut lines = vec![
+        "NODE ID\tENDPOINT\tPRICE/GiB\tPAYMENT WINDOW\tCAP REV\tPROBE VALID UNTIL\tVALIDATOR"
+            .to_owned(),
+    ];
     lines.extend(view.relays.iter().map(|relay| {
         format!(
-            "{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{} bytes / {}s\t{}\t{}\t{}",
             relay.node_id,
             relay.endpoint,
             relay.price_per_gib_display,
+            relay.payment_window_bytes,
+            relay.payment_window_seconds,
+            relay.relay_capability_revision,
             relay.probe_valid_until,
             if relay.validator { "yes" } else { "no" }
         )

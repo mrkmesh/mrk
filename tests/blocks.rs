@@ -317,6 +317,65 @@ fn node_price_updates_are_owner_signed_and_finalized_deterministically() {
 }
 
 #[test]
+fn relay_capability_updates_are_revisioned_and_finalized_deterministically() {
+    let root = temp_root("relay-capability-update");
+    let paths = DataPaths::new(Some(root.clone())).unwrap();
+    let password = "relay-capability-update-password";
+    let now = Utc::now().timestamp();
+    let original = register(&paths, "node1", password, "wss://1.1.1.1/v1/relay", now);
+    paths
+        .with_ledger_mut(|ledger| {
+            ledger
+                .accounts
+                .get_mut(&original.reward_address)
+                .unwrap()
+                .balance = MRK_SCALE;
+            Ok(())
+        })
+        .unwrap();
+
+    let payment_window_bytes = 8 * 1024 * 1024;
+    let payment_window_seconds = 45;
+    let (operation_id, node) = service::update_node_relay_capabilities(
+        &paths,
+        "node1",
+        password,
+        payment_window_bytes,
+        payment_window_seconds,
+        now + 1,
+    )
+    .unwrap();
+    assert_eq!(node.relay_capability_revision, 2);
+    assert_eq!(node.payment_window_bytes, payment_window_bytes);
+    assert_eq!(node.payment_window_seconds, payment_window_seconds);
+
+    let ledger = paths.read_ledger().unwrap();
+    let operation = &ledger.operations[&operation_id];
+    assert_eq!(operation.kind, "NodeRegistry.UpdateRelayCapabilities");
+    assert_eq!(operation.payload["relay_capability_revision"], 2);
+    assert_eq!(
+        operation.payload["payment_window_bytes"],
+        payment_window_bytes
+    );
+    assert_eq!(
+        operation.payload["payment_window_seconds"],
+        payment_window_seconds
+    );
+    assert!(matches!(operation.status, OperationStatus::Pending));
+    drop(ledger);
+
+    service::produce_node1_block(&paths, "node1", password, false, now + 2).unwrap();
+    let ledger = paths.read_ledger().unwrap();
+    let finalized = &ledger.finalized_checkpoint.as_ref().unwrap().nodes[&1];
+    assert_eq!(finalized.relay_capability_revision, 2);
+    assert_eq!(finalized.payment_window_bytes, payment_window_bytes);
+    assert_eq!(finalized.payment_window_seconds, payment_window_seconds);
+    assert!(service::verify_blockchain(&paths).unwrap().ok);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn finalized_offline_timeout_slashes_bond_and_vesting_to_treasury() {
     let root = temp_root("offline-slash");
     let paths = DataPaths::new(Some(root.clone())).unwrap();

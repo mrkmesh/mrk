@@ -167,6 +167,7 @@ EncryptedStream: AsyncRead + AsyncWrite
 - `AsyncWrite` 自动按 Relay 在 `WELCOME.max_message_size` 公布的上限拆块；每个密文块都计入严格递增的方向序号和累计流量哈希。
 - 成员凭证由本地固定的 Network Owner 公钥验证。双方用成员 Ed25519 密钥认证临时 X25519 握手，并通过 HKDF-SHA256 派生两个独立的 AES-256-GCM 方向密钥。
 - 加密上下文绑定 Ledger、Node、Channel、Authorization、Session、双方 Member ID 和握手 transcript；Relay 修改、重排、重放或跨通道替换密文都会认证失败。
+- 付款 checkpoint 使用双窗口流水线。Node 在单方向达到授权快照中的时间或字节边界时对最新累计前缀出账；默认边界为 30 秒或 32 MiB。第一张账单等待 ReceiverReceipt 期间，客户端可继续发送一个新窗口。只有第二窗口也达到边界才背压，且任一方向未取得 receipt 的累计流量严格不超过两个协商窗口（默认 64 MiB）。receipt 只推进到其签名 checkpoint 的累计位置，不会把已经在第二窗口发送的数据提前视为已支付。
 - `AsyncWrite::shutdown()` 发送认证 FIN 和最终累计 Checkpoint，并等待 Receipt；Relay 在认证 FIN 完成前关闭通道属于截断错误。
 - `mrk pipe` 第一次收到 Ctrl+C 时停止读取 stdin，发送加密 FIN 和 `CloseIntent`；Node 返回 final `CheckpointRequest`，双方签出普通 final receipt。Node 持久化双方 final receipt 后两侧即可退出，并在后台完成结算终局和未消费 reservation 释放。第二次 Ctrl+C 强制退出。
 - 客户端崩溃或网络中断时，运行中的 Node 只把未签尾部保留在内存，并持久化不含 DATA、Sequence、字节数和 Transcript 的小型 authorization hold。重连后的 `mrk pipe` 先恢复匹配会话，仅在 Node 报告的双向增量总和不超过本次 `--max-auto-recovery-bytes` 时补签；默认值为 0，该参数不上链。SIGINT/SIGTERM 会让 Node 停止接收新 Relay channel，并通知现有 channel 在当前付款边界立即交换 FIN、最终 checkpoint 和 receipt；全部 receipt 落盘后才退出。第二次信号或 30 秒超时会强制退出。此类非优雅退出后精确尾部已经丢失，Node 下次启动时直接提交 Owner 签名的 abandon 操作清理对应 hold，不再要求客户端恢复一个不存在的尾部；已落盘、待上链的双签 receipt 不会被放弃。运行中断线会话的自动放弃仍按 Network 和 Member 做 24 小时累计审计。
@@ -320,11 +321,11 @@ CLI 只提供余额/历史查询和治理提案，不提供国库密钥或直接
 
 Owner 先向 `NetworkEscrow` 充值并维护可随时更新或停用的 `NetworkSpendingPolicy`。默认允许 Active Member 使用共享 Fund，但每个会话必须由发起 Member 签署 `ReserveSession`，并受单会话额度、单 Member 并发预留、Node 最高报价和最长会话时间约束。状态机创建绑定 Node、双方 Member、随机 Session ID、策略 revision、固定 `price_per_gib`、限额和有效期的 `PaymentAuthorization`。授权必须最终确认后才能打开 Relay Channel，限额在创建时原子预留，但不会预付给 Node；策略更新只影响后续预留。
 
-每个方向独立累计 DATA Sequence、真实 Payload 字节和 Transcript Hash。达到 16 MiB 或自首个 DATA 起 15 秒后，Node 暂停该方向并发送包含精确计量状态的 `CheckpointRequest`；发送方与内存状态一致时才签署 `SenderCheckpoint`，接收方核对本地已收到的相同前缀后签署 `ReceiverReceipt`。Node 只有验证并持久化双签名回执后才继续该方向。正常关闭通过 `CloseIntent` 请求不足一个窗口的 Final Checkpoint。计费不包含 WSS/TLS/TCP 头、Padding 或控制帧。
+每个方向独立累计 DATA Sequence、真实 Payload 字节和 Transcript Hash。达到授权的付款窗口边界后，Node 发送包含精确计量状态的 `CheckpointRequest`；发送方与内存状态一致时才签署 `SenderCheckpoint`，接收方核对本地已收到的相同前缀后签署 `ReceiverReceipt`。账单交换期间仍可发送一个额外窗口，第二窗口到达边界后才背压。正常关闭通过 `CloseIntent` 请求不足一个窗口的 Final Checkpoint。计费不包含 WSS/TLS/TCP 头、Padding 或控制帧。
 
 Node 在本地 redb 只保留每个授权、每个方向最新的累计回执，默认每 5 分钟批量提交，重启后恢复。链上用“新累计总价减该方向已结算金额”计算增量，避免按窗口向上取整造成重复收费。双方各自签署并回签 Final Checkpoint 后，未消费预留立即退回 Network Fund；未正常关闭的授权到期后仍有 7 天领取期，之后由下一次成员预留确定性回收。
 
-客户端根据自己的累计发送量和报价复算金额后才签名。未按时更新凭证时，Relay 暂停该连接的 `DATA` 转发；最大信用风险限制为一个计费步长。
+客户端根据自己的累计发送量和报价复算金额后才签名。账单未及时取得回执时，Relay 在第二个付款窗口边界暂停该方向的 `DATA` 转发；最大信用风险限制为两个授权窗口。
 
 Relay 最终只需向 MSL 提交每个连接最新的凭证。状态机保存已结算的最高 `sequence` 和累计金额，防止重复领取；多个最终凭证可以合并为一个结算批次操作。
 
@@ -504,7 +505,7 @@ Block、Operation 正文与终局状态、账户历史链接以及账户、Netwo
 
 Node 初始化时分别生成 Owner 冷钥、Relay 热钥和 Reward Key。节点奖励领取到 Reward Key；使用账户 CLI 的 `--account node:default` 可以查询和转移该余额，不需要动用 Node Owner 冷钥。
 
-Relay 流量采用押币后的累计交付结算。Network Owner 先从 Network Escrow 锁定 `PaymentAuthorization.max_amount`；每个方向连续转发到 `16 MiB` 或 `15 秒`边界后，Node 暂停新 DATA 并发送 `CheckpointRequest`。发送方和接收方在正常会话中只对与内存状态一致的累计前缀签名；异常进程重启后的有界补签必须显式配置。Node 持久化完整双签名回执后才打开下一窗口，并可稍后仅用最新累计回执结算。未签流量状态不写盘。链按照接收方确认的真实 DATA Payload 与授权时固定的 `price_per_gib`释放已有 MRK；Padding、协议开销和控制流量不计费。无回执不付款，未使用押币在 7 天 Claim Window 后退回，流量永不触发增发。
+Relay 流量采用押币后的累计交付结算。Network Owner 先从 Network Escrow 锁定 `PaymentAuthorization.max_amount`；每个方向达到授权中的付款窗口边界后，Node 发送 `CheckpointRequest`，第一张账单在途期间仍允许一个额外窗口。发送方和接收方在正常会话中只对与内存状态一致的累计前缀签名；异常进程重启后的有界补签必须显式配置。Node 持久化完整双签名回执后把对应累计前缀视为已支付，并可稍后仅用最新累计回执结算。未签流量状态不写盘。链按照接收方确认的真实 DATA Payload 与授权时固定的 `price_per_gib`释放已有 MRK；Padding、协议开销和控制流量不计费。无回执不付款，未使用押币在 7 天 Claim Window 后退回，流量永不触发增发。Node 在链上登记带 revision 的付款窗口能力（默认 32 MiB/30 秒，允许 1–64 MiB/5–300 秒）；WELCOME、终局 Registry 与新授权快照必须一致，双窗口数量固定为 2。
 
 `mrk node backup` 由持有 redb 的守护进程在一致读事务上生成逻辑备份，默认写入 `~/.mrk/backups/`，权限为 `0600`，包含完整 Ledger、Height、State Root 和全 Payload Checksum，并拒绝覆盖已有路径。`backup-verify` 离线校验 Checksum、元数据、完整链和可选的可信 State Root。`restore` 必须先停止守护进程，并强制从独立可信渠道提供 `--expected-state-root`；验证通过后在单个 redb 写事务中替换 Ledger，随后必须运行 `mrk node doctor` 再重启。Validator 运维必须把备份复制到异机并定期演练恢复。
 

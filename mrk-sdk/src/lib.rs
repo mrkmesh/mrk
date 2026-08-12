@@ -44,12 +44,11 @@ use mrk_core::{
     },
     relay::{
         ChallengePayload, CheckpointRequest, CloseIntent, FrameType, HelloPayload, IncomingPayload,
-        OpenPayload, RELAY_CHECKPOINT_FINAL_FLAG, RELAY_PAYMENT_WINDOW_BYTES,
-        RELAY_PAYMENT_WINDOW_SECONDS, ReceiverReceipt, RelayFrame, SenderCheckpoint,
+        OpenPayload, RELAY_CHECKPOINT_FINAL_FLAG, ReceiverReceipt, RelayFrame, SenderCheckpoint,
         WelcomePayload, WsMessage, credential_signing_bytes, hello_signing_bytes,
         read_ws_message_async, receiver_receipt_signing_bytes, relay_transcript_initial_hash,
         relay_transcript_next_hash, sender_checkpoint_hash, sender_checkpoint_signing_bytes,
-        write_ws_message_async,
+        validate_relay_payment_window, write_ws_message_async,
     },
     relay_client::{BoxedIo, connect_websocket, rpc_call},
     service::{self, RelayAuthorizationView},
@@ -375,6 +374,8 @@ impl RelayClient {
         }
         let welcome: WelcomePayload = serde_json::from_slice(&welcome_frame.payload)
             .map_err(|error| RelayError::Protocol(error.to_string()))?;
+        validate_relay_payment_window(welcome.payment_window_bytes, welcome.payment_window_seconds)
+            .map_err(|error| RelayError::Protocol(error.to_string()))?;
         if welcome.max_message_size as usize <= AEAD_OVERHEAD {
             return Err(RelayError::Protocol(
                 "Relay frame limit is too small for encrypted streams".to_owned(),
@@ -391,6 +392,9 @@ impl RelayClient {
             open_lock: Mutex::new(()),
             node_id: challenge.node_id,
             max_payload: welcome.max_message_size as usize,
+            relay_capability_revision: welcome.relay_capability_revision,
+            payment_window_bytes: welcome.payment_window_bytes,
+            payment_window_seconds: welcome.payment_window_seconds,
             state,
         });
         tokio::spawn(async move {
@@ -428,6 +432,9 @@ struct ConnectionInner {
     open_lock: Mutex<()>,
     node_id: u64,
     max_payload: usize,
+    relay_capability_revision: u64,
+    payment_window_bytes: u64,
+    payment_window_seconds: i64,
     state: watch::Receiver<ConnectionState>,
 }
 
@@ -685,6 +692,14 @@ impl RelayConnection {
             .price_per_gib_base_units
             .parse::<u128>()
             .map_err(|_| RelayError::Authorization("invalid Relay Node price".to_owned()))?;
+        if relay.relay_capability_revision != self.inner.relay_capability_revision
+            || relay.payment_window_bytes != self.inner.payment_window_bytes
+            || relay.payment_window_seconds != self.inner.payment_window_seconds
+        {
+            return Err(RelayError::Authorization(
+                "Relay WELCOME capabilities do not match the finalized Node registry".to_owned(),
+            ));
+        }
         if expected_price_per_gib > network.spending_policy.max_node_price_per_gib {
             return Err(RelayError::Authorization(
                 "Relay Node price exceeds the Network policy".to_owned(),
@@ -729,6 +744,9 @@ impl RelayConnection {
             "authorization_valid_until": valid_until,
             "spending_policy_revision": network.spending_policy.revision,
             "expected_price_per_gib_base_units": expected_price_per_gib.to_string(),
+            "relay_capability_revision": relay.relay_capability_revision,
+            "payment_window_bytes": relay.payment_window_bytes,
+            "payment_window_seconds": relay.payment_window_seconds,
         });
         let fee_quote = self
             .rpc(
@@ -1487,6 +1505,7 @@ struct DirectionState {
     transcript_hash: String,
     window_started_at: Option<i64>,
     window_started_bytes: u64,
+    receipted_bytes: u64,
     awaiting_receipt: bool,
     pending_checkpoint: Option<SenderCheckpoint>,
 }
@@ -1712,6 +1731,7 @@ fn initial_direction(view: &RelayAuthorizationView, direction: RelayDirection) -
         transcript_hash,
         window_started_at: None,
         window_started_bytes: settled.settled_payload_bytes,
+        receipted_bytes: settled.settled_payload_bytes,
         awaiting_receipt: false,
         pending_checkpoint: None,
     }
@@ -2496,12 +2516,13 @@ async fn run_stream_loop(
     let mut local_fin_receipted = false;
     let mut remote_fin_receipted = false;
     let mut drain_requested = false;
+    let mut local_close_requested = false;
     loop {
-        let window_remaining = RELAY_PAYMENT_WINDOW_BYTES.saturating_sub(
-            channel
-                .outgoing
-                .cumulative_bytes
-                .saturating_sub(channel.outgoing.window_started_bytes),
+        let window_remaining = outgoing_write_allowance(
+            &channel.outgoing,
+            view.authorization.payment_window_bytes,
+            view.authorization.payment_window_seconds,
+            Utc::now().timestamp(),
         );
         let read_capacity = input.len().min(
             window_remaining
@@ -2531,8 +2552,10 @@ async fn run_stream_loop(
                 .await?;
             return Ok(());
         }
-        if drain_requested && !local_fin && !channel.outgoing.awaiting_receipt {
-            sdk_debug("Relay Node drain reached a payment boundary; sending authenticated FIN");
+        if local_close_requested && !local_fin && !channel.outgoing.awaiting_receipt {
+            if drain_requested {
+                sdk_debug("Relay Node drain reached a payment boundary; sending authenticated FIN");
+            }
             send_encrypted_record(
                 &channel.transport,
                 &channel.cipher,
@@ -2553,32 +2576,14 @@ async fn run_stream_loop(
             continue;
         }
         tokio::select! {
-            input_result = application_input.read(&mut input[..read_capacity]), if !drain_requested
+            input_result = application_input.read(&mut input[..read_capacity]), if !local_close_requested
                 && !local_fin
-                && !channel.outgoing.awaiting_receipt
                 && read_capacity > 0
-                && channel.outgoing.window_started_at.is_none_or(|started| {
-                    Utc::now().timestamp().saturating_sub(started)
-                        < RELAY_PAYMENT_WINDOW_SECONDS
-                }) => {
+                => {
                 let size = input_result.map_err(|error| RelayError::Transport(error.to_string()))?;
                 if size == 0 {
-                    sdk_debug("local application write half closed; sending authenticated FIN");
-                    send_encrypted_record(
-                        &channel.transport,
-                        &channel.cipher,
-                        channel.outgoing_direction,
-                        &mut channel.outgoing,
-                        RECORD_FIN,
-                        &[],
-                    ).await?;
-                    local_fin = true;
-                    send_close_intent(
-                        &channel.transport,
-                        view,
-                        channel.outgoing_direction,
-                        &channel.outgoing,
-                    ).await?;
+                    sdk_debug("local application write half closed; finishing the current payment boundary");
+                    local_close_requested = true;
                     continue;
                 }
                 send_encrypted_record(
@@ -2666,7 +2671,8 @@ async fn run_stream_loop(
                                 .map_err(|error| RelayError::Protocol(error.to_string()))?,
                         }).await?;
                         channel.incoming.window_started_at = None;
-                        channel.incoming.window_started_bytes = channel.incoming.cumulative_bytes;
+                        channel.incoming.window_started_bytes = checkpoint.cumulative_sent_bytes;
+                        channel.incoming.receipted_bytes = checkpoint.cumulative_sent_bytes;
                         if remote_fin && frame.flags & RELAY_CHECKPOINT_FINAL_FLAG != 0 {
                             remote_fin_receipted = true;
                         }
@@ -2681,8 +2687,7 @@ async fn run_stream_loop(
                             channel.outgoing_direction,
                             &channel.outgoing,
                         )?;
-                        channel.outgoing.window_started_at = None;
-                        channel.outgoing.window_started_bytes = channel.outgoing.cumulative_bytes;
+                        channel.outgoing.receipted_bytes = receipt.cumulative_received_bytes;
                         channel.outgoing.awaiting_receipt = false;
                         channel.outgoing.pending_checkpoint = None;
                         if local_fin {
@@ -2698,6 +2703,7 @@ async fn run_stream_loop(
                         }
                         sdk_debug("Relay Node is draining; stopping application input");
                         drain_requested = true;
+                        local_close_requested = true;
                     }
                     FrameType::Close => {
                         if !channel.initiator
@@ -2724,25 +2730,11 @@ async fn run_stream_loop(
                     }
                 }
             }
-            _ = payment_timer.tick(), if !local_fin && !channel.outgoing.awaiting_receipt => {
+            _ = payment_timer.tick(), if !local_fin => {
                 let authorization_expiring = Utc::now().timestamp()
                     >= view.authorization.valid_until.saturating_sub(5);
                 if authorization_expiring {
-                    send_encrypted_record(
-                        &channel.transport,
-                        &channel.cipher,
-                        channel.outgoing_direction,
-                        &mut channel.outgoing,
-                        RECORD_FIN,
-                        &[],
-                    ).await?;
-                    local_fin = true;
-                    send_close_intent(
-                        &channel.transport,
-                        view,
-                        channel.outgoing_direction,
-                        &channel.outgoing,
-                    ).await?;
+                    local_close_requested = true;
                 }
             }
         }
@@ -2774,6 +2766,32 @@ async fn send_close_intent(
                 .map_err(|error| RelayError::Protocol(error.to_string()))?,
         })
         .await
+}
+
+fn outgoing_write_allowance(
+    state: &DirectionState,
+    payment_window_bytes: u64,
+    payment_window_seconds: i64,
+    now: i64,
+) -> u64 {
+    let risk_remaining = payment_window_bytes
+        .saturating_mul(2)
+        .saturating_sub(state.cumulative_bytes.saturating_sub(state.receipted_bytes));
+    if !state.awaiting_receipt {
+        return risk_remaining;
+    }
+    if state
+        .window_started_at
+        .is_some_and(|started| now.saturating_sub(started) >= payment_window_seconds)
+    {
+        return 0;
+    }
+    let active_window_remaining = payment_window_bytes.saturating_sub(
+        state
+            .cumulative_bytes
+            .saturating_sub(state.window_started_bytes),
+    );
+    risk_remaining.min(active_window_remaining)
 }
 
 async fn send_checkpoint(
@@ -2824,6 +2842,8 @@ async fn send_checkpoint(
                 .map_err(|error| RelayError::Protocol(error.to_string()))?,
         })
         .await?;
+    state.window_started_at = None;
+    state.window_started_bytes = checkpoint.cumulative_sent_bytes;
     state.awaiting_receipt = true;
     state.pending_checkpoint = Some(checkpoint);
     Ok(())
@@ -2961,6 +2981,7 @@ fn validate_outgoing_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mrk_core::relay::{RELAY_PAYMENT_WINDOW_BYTES, RELAY_PAYMENT_WINDOW_SECONDS};
 
     const SHARED_SECRET: [u8; 32] = [0x5a; 32];
 
@@ -3047,6 +3068,7 @@ mod tests {
             transcript_hash: "new-transcript".to_owned(),
             window_started_at: None,
             window_started_bytes: 0,
+            receipted_bytes: 0,
             awaiting_receipt: false,
             pending_checkpoint: None,
         };
@@ -3058,6 +3080,64 @@ mod tests {
         request.cumulative_sent_bytes = state.cumulative_bytes;
         request.transcript_hash = state.transcript_hash.clone();
         assert!(checkpoint_request_matches_outgoing_state(&request, &state));
+    }
+
+    #[test]
+    fn pending_receipt_allows_exactly_one_additional_payment_window() {
+        let now = 100;
+        let mut state = DirectionState {
+            sequence: 1,
+            cumulative_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            transcript_hash: "transcript".to_owned(),
+            window_started_at: None,
+            window_started_bytes: RELAY_PAYMENT_WINDOW_BYTES,
+            receipted_bytes: 0,
+            awaiting_receipt: true,
+            pending_checkpoint: None,
+        };
+
+        assert_eq!(
+            outgoing_write_allowance(
+                &state,
+                RELAY_PAYMENT_WINDOW_BYTES,
+                RELAY_PAYMENT_WINDOW_SECONDS,
+                now,
+            ),
+            RELAY_PAYMENT_WINDOW_BYTES
+        );
+        state.cumulative_bytes = 2 * RELAY_PAYMENT_WINDOW_BYTES;
+        assert_eq!(
+            outgoing_write_allowance(
+                &state,
+                RELAY_PAYMENT_WINDOW_BYTES,
+                RELAY_PAYMENT_WINDOW_SECONDS,
+                now,
+            ),
+            0
+        );
+
+        state.cumulative_bytes = RELAY_PAYMENT_WINDOW_BYTES;
+        state.window_started_at = Some(now);
+        assert_eq!(
+            outgoing_write_allowance(
+                &state,
+                RELAY_PAYMENT_WINDOW_BYTES,
+                RELAY_PAYMENT_WINDOW_SECONDS,
+                now + RELAY_PAYMENT_WINDOW_SECONDS,
+            ),
+            0
+        );
+
+        state.awaiting_receipt = false;
+        assert_eq!(
+            outgoing_write_allowance(
+                &state,
+                RELAY_PAYMENT_WINDOW_BYTES,
+                RELAY_PAYMENT_WINDOW_SECONDS,
+                now + RELAY_PAYMENT_WINDOW_SECONDS,
+            ),
+            RELAY_PAYMENT_WINDOW_BYTES
+        );
     }
 
     #[test]

@@ -365,11 +365,13 @@ ReceiverReceipt {
 }
 ```
 
-Network Owner 向 Network Fund 充值并维护带 revision 的 `NetworkSpendingPolicy`，可随时更新或停用成员自动消费。Active Member 使用自己的 Member Key 签署 `ReserveSession`；状态机验证发起者、公钥、对端成员、Node 状态与报价，并按照策略的单会话额度、单 Member 并发预留上限和 Fund 可用余额原子确定 `max_amount`。最终 `PaymentAuthorization` 固定 Node、双方 Member、Session、报价、策略 revision 和过期时间；策略更新不追溯修改已经最终确认的授权。Node Owner 可通过 `mrk node update-price --price-per-gib <MRK>` 签署 `NodeRegistry.UpdatePrice`；新报价仅供后续 `ReserveSession` 读取，不改写任何已创建授权中的 `price_per_gib`，也不触发 Warmup 或 Probe 重置。`ReserveSession` 必须签署当时看到的 `expected_price_per_gib_base_units`；状态机执行时发现 Node 报价已变化会直接拒绝，由客户端刷新报价后重试。
+Network Owner 向 Network Fund 充值并维护带 revision 的 `NetworkSpendingPolicy`，可随时更新或停用成员自动消费。Active Member 使用自己的 Member Key 签署 `ReserveSession`；状态机验证发起者、公钥、对端成员、Node 状态、报价和 Relay 能力，并按照策略的单会话额度、单 Member 并发预留上限和 Fund 可用余额原子确定 `max_amount`。最终 `PaymentAuthorization` 固定 Node、双方 Member、Session、报价、策略 revision、Relay 能力 revision、付款窗口和过期时间；策略或 Node 能力更新不追溯修改已经最终确认的授权。Node Owner 可通过 `mrk node update-price --price-per-gib <MRK>` 签署 `NodeRegistry.UpdatePrice`；新报价仅供后续 `ReserveSession` 读取，不改写任何已创建授权中的 `price_per_gib`，也不触发 Warmup 或 Probe 重置。`ReserveSession` 必须签署当时看到的报价与能力快照；状态机执行时发现任一项已变化会直接拒绝，由客户端刷新后重试。
+
+Node 注册时在链上发布 revision 1 的 Relay 能力，默认付款窗口为 `32 MiB` 或 `30 秒`。Owner 可签署 `NodeRegistry.UpdateRelayCapabilities`，通过 `mrk node update-relay-capabilities --payment-window-bytes <BYTES> --payment-window-seconds <SECONDS>` 把窗口调整到 `1–64 MiB`、`5–300 秒`范围内；每次更新必须严格递增 revision。Relay `WELCOME` 同时公布 revision 和窗口，SDK 在预留前要求它们与终局 Registry 完全一致。双窗口数量固定为 2，不由 Node 自定义。
 
 `mrk node join` 的 `--price-per-gib` 是可选参数。省略时只统计当前 `ACTIVE`、IP Slot 有效且 Probe 新鲜的 Node 报价：奇数样本取中间值，偶数样本取中间两个基础单位的平均值并向下取整，没有样本时使用 `10MRK/GiB`。本地在签署 `RegisterNode` 前完成计算，Operation 始终包含明确的 `price_per_gib_base_units`，因此各节点重放不需重新计算中位数。
 
-每个方向独立维护累计 Sequence、真实 Payload 字节数和 Transcript Hash。窗口从第一个 DATA 开始，在累计 `16 MiB` 或经过 `15 秒`时结束，以先发生者为准；完全空闲不产生窗口和费用。到达边界后只暂停该方向的新 DATA，控制帧继续通行：Node 主动发送 `CheckpointRequest`，发送方签署 `SenderCheckpoint`，接收方校验同一累计前缀后签署 `ReceiverReceipt`。Node 验证并持久化完整双签名回执后才打开下一窗口。
+每个方向独立维护累计 Sequence、真实 Payload 字节数和 Transcript Hash。窗口从第一个 DATA 开始，在达到授权快照中的字节数或秒数时结束，以先发生者为准；完全空闲不产生窗口和费用。Node 主动发送 `CheckpointRequest`，发送方签署 `SenderCheckpoint`，接收方校验同一累计前缀后签署 `ReceiverReceipt`。第一张账单在途时第二窗口可继续发送；第二窗口也到达边界而 receipt 仍未返回时才暂停该方向的新 DATA，控制帧始终继续通行。
 
 窗口消息在链下交换。Node 把每个方向的最新完整回执覆盖写入本地 redb，默认每 5 分钟尝试提交一次；在此期间多个窗口自然聚合为一个累计前缀，崩溃重启后继续提交。`TrafficSettlement` 按链上已结算累计值计算增量：
 
@@ -384,9 +386,9 @@ amount = total_owed - settled_amount_for_direction
 
 - Node 自报字节数没有结算效力；只有发送方 Checkpoint 与接收方 Receipt 的 Sequence、累计字节和 Transcript Hash 完全一致时才能结算；
 - Node 不能领取超过 `PaymentAuthorization.max_amount` 的 MRK；每个方向只接受严格递增且不回退的累计前缀；
-- 没有完整回执时 Node 必须拒绝该方向进入下一窗口，最大未结算风险被限制为每方向 `16 MiB` 或 `15 秒`；
+- 付款窗口采用一张在途账单加一个活动窗口的流水线：第一个协商窗口出账后，客户端无需等待 ReceiverReceipt 即可进入第二窗口；只有第二窗口也达到边界时才背压。每方向尚未取得 receipt 的累计流量严格限制为两个授权窗口（默认 `64 MiB`），receipt 只确认其签名的累计前缀；
 - Node 不服务时无法取得接收方签名，未使用押币不会释放给 Node；
-- Session 正常关闭时，两个方向分别为尾部发送带签名的 Final Checkpoint 并取得对端 Receipt；两方向都最终确认后，剩余预留立即退回 Network Fund。异常断线时 Node 最多损失当前未回执窗口；
+- Session 正常关闭时，两个方向分别为尾部发送带签名的 Final Checkpoint 并取得对端 Receipt；两方向都最终确认后，剩余预留立即退回 Network Fund。异常断线时 Node 每方向最多损失两个未回执窗口；
 - Node 把每个方向最新的完整双签名回执写入本地 redb，并以覆盖方式聚合；后台默认每 5 分钟提交，重启后继续领取。结算操作最终确认前不得删除本地回执；
 - 未签尾部只存在于 Node 和客户端进程内存，不持久化。客户端进程重启后只能在本次 `mrk pipe` 或 `payment settle` 显式给出的 `max_auto_recovery_bytes` 范围内接受仍在运行的 Node 报告并补签；该参数不是链上 Network policy。Node 收到 SIGINT/SIGTERM 时会停止新会话并要求现有会话在当前窗口边界立即生成双签最终 receipt。强制退出导致精确尾部丢失时，下次启动由 Node Owner 自动签署 abandon 操作清理 hold；已经持久化的双签 receipt 继续正常结算，不会被清理；
 - 授权到期后保留 7 天 Relay Claim Window，随后由下一次自动预留回收未使用余额；
